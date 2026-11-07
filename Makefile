@@ -194,3 +194,7 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+test-ios-jit:
+	bash ios/scripts/check_jit.sh
+.PHONY: test-ios-jit

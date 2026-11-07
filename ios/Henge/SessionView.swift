@@ -510,6 +510,10 @@ struct SessionView: View {
     }
 
     private func run() async {
+        guard JITBootstrap.ready else {
+            error = JITBootstrap.lastFailure ?? "Henge's JIT code region is not ready. Tap Turn On JIT in Henge, then try again."
+            return
+        }
         let ram = GuestMemory.prepare(mac)
         HengeLog.log("session", "available memory \(henge_available_memory() >> 20) MB")
         guard ram >= 1024 else {

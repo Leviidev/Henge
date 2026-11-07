@@ -16,19 +16,28 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("JIT") {
-                    LabeledContent("Status", value: JITBootstrap.ready ? "On" : "Off")
+                    LabeledContent("Status", value: jit.ready ? "On" : JITBootstrap.debuggedFlag ? "Code region not ready" : "Off")
                     Picker("Method", selection: $jit.method) {
                         ForEach(JITMethod.allCases) { Text($0.title).tag($0) }
                     }
                     Text(jit.method == .automatic ? jit.automaticDescription : "Henge uses \(jit.method.title).")
                         .font(.footnote).foregroundStyle(.secondary)
                     Button("Set up JIT") { jit.showSetup = true }
+                    if !jit.ready {
+                        Button(jit.busy ? "Preparing JIT…" : "Turn On JIT") { jit.enable() }
+                            .disabled(jit.busy)
+                        if let message = jit.error ?? (jit.busy ? jit.status : nil) ?? JITBootstrap.lastFailure {
+                            Text(message).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
                     Toggle("Turn on JIT when Henge opens", isOn: $jitAtLaunch)
                     if jitAtLaunch {
                         Text("Henge connects LocalDevVPN first when it is off, and comes back.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    LabeledContent("Code region", value: "\(JITBootstrap.jitBytes >> 20) MB, claimed once per launch")
+                    LabeledContent("Code region", value: jit.ready
+                        ? "\(JITBootstrap.jitBytes >> 20) MB, ready"
+                        : "Not allocated (\(JITBootstrap.jitBytes >> 20) MB)")
                 }
                 .listRowBackground(Desk.card)
                 Section("Memory") {

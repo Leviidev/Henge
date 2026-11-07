@@ -65,14 +65,12 @@ struct RootView: View {
         }
         .preferredColorScheme(.dark)
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            jit.scenePhaseChanged(phase)
             guard phase == .active else { return }
-            // Back from StikDebug or TrollStore: claim the JIT region while the debugger is there.
-            JITBootstrap.prewarm()
             machines.collectImports()
             jit.enableAtLaunchIfAsked()
         }
-        .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarm() } // the built-in helper attached
     }
 }
 

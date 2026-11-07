@@ -81,6 +81,10 @@ final class Installer: NSObject, ObservableObject {
 
     func start(_ release: MacOSRelease, name: String, ramMB: Int, cpus: Int, keepImage: Bool) {
         guard !busy else { return }
+        guard JITBootstrap.ready else {
+            phase = .failed(JITBootstrap.lastFailure ?? "Prepare JIT using Turn On JIT in Henge before installing macOS.")
+            return
+        }
         machineName = name
         UIApplication.shared.isIdleTimerDisabled = true // the screen locking would suspend the download and the restore
         Task {
@@ -187,7 +191,9 @@ final class Installer: NSObject, ObservableObject {
     // MARK: The restore
 
     private func install(_ mac: VirtualMac, ipsw: URL, cpus: Int) async throws {
-        guard JITBootstrap.ready else { throw message("Turn on JIT first: the installer runs the Mac's own restore system, which needs it.") }
+        guard JITBootstrap.ready else {
+            throw message(JITBootstrap.lastFailure ?? "Henge's JIT code region is not ready. Tap Turn On JIT in Henge, then try again.")
+        }
         // The restore needs 2 GB, whatever the Mac is set to use afterwards.
         var restoring = mac
         restoring.ramMB = max(mac.ramMB, 2048)

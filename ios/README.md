@@ -18,6 +18,11 @@ the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/pac
   on-device pairing on iOS 27). The app claims one 1 GB region per launch
   (`JITBootstrap.jitBytes`) and the engine writes through a `vm_remap`'d alias
   (`host/jit_region.c`, split mode).
+  For StikDebug, tap **Turn On JIT** in Henge, confirm **Enable and Run Script**
+  in StikDebug, and return to Henge. On TXM devices, the status becomes On only
+  after the region passes its execute self-test. A failed preparation can be retried in the same
+  launch; time spent confirming the script does not consume the preparation
+  timeout after returning. A new app process needs JIT enabled again.
 - **Memory**: `increased-memory-limit` is recommended, not required. Once a
   debugger has attached, guest RAM is kept out of the app's memory limit, and if
   iOS refuses that it comes from a file on free storage instead.
@@ -62,6 +67,16 @@ the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/pac
   `henge.log`, to tune scrolling from a real device.
 - **Chips**: the virtual CPU offers Armv8.5 instructions (`core/sysreg.c`), which
   macOS uses and which run as they are, so Henge needs an A14 or M1 or newer.
+
+Run `make test-ios-jit` on an Apple Silicon Mac for acquisition regressions:
+the production Swift coordinator and native allocator run with a simulated
+debugserver and app switching. The allocator executes generated code through
+its real RW/RX aliases. The tests cover a stale debugger flag, a delayed script,
+allocation failure followed by retry, duplicate requests and reuse after detach;
+JavaScriptCore also checks the bundled script's probe and mapping register writes.
+`bash ios/scripts/check_jit.sh --delayed-return` additionally waits over a minute
+in the simulated external app before returning. These host tests do not establish
+physical iOS/TXM permissions; validate the same sequence on a signed device build.
 
 Code from Husk (GPL-2.0-or-later): `Henge/JIT/*`, `Henge/HengeLog.swift`,
 `Henge/Native/henge-ios-jit.*`, `henge-brk.S`, `HengeJITHelper/`. StikJIT is
