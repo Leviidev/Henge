@@ -98,9 +98,8 @@ final class JITCoordinator: ObservableObject {
     /// Bumped only after the code region has been prepared and tested.
     @Published private(set) var attachGeneration = 0
 
-    private var waitingForStikDebugReturn = false
-    private var leftForStikDebug = false
-    private var stikDebugReadiness: Timer?
+    private var stikDebugReadiness: Task<Void, Never>?
+    private var externalReadiness: Task<Void, Never>?
 
     var hasPairing: Bool { pairingSource != nil }
 
@@ -149,19 +148,29 @@ final class JITCoordinator: ObservableObject {
 
     private func log(_ line: String) { HengeLog.log("jit", line) }
 
-    /// A return from another app may be a manual debugger attach. During an
-    /// enable request, its readiness timer owns preparation instead, so a stale
-    /// CS_DEBUGGED flag cannot complete the request before the hand-off.
+    /// Foreground notifications refresh the UI, but an explicit enable request
+    /// must also work when SwiftUI does not report the hand-off's scene phases.
     func scenePhaseChanged(_ phase: ScenePhase) {
-        if waitingForStikDebugReturn && phase != .active { leftForStikDebug = true }
         guard phase == .active else { return }
-        if waitingForStikDebugReturn && leftForStikDebug {
-            // Time spent confirming the script in StikDebug is not time spent
-            // waiting for executable memory in Henge.
-            waitForStikDebugRegion()
-        }
+        refreshReadiness()
+        monitorExternalJIT()
+    }
+
+    func refreshReadiness() {
         if !busy { JITBootstrap.prewarm() }
         ready = JITBootstrap.ready
+    }
+
+    /// StikDebug's app list can launch Henge before its assigned script attaches.
+    /// Watch that attach without opening another URL or disabling the manual button.
+    func monitorExternalJIT() {
+        ready = JITBootstrap.ready
+        guard !ready, !busy, externalReadiness == nil else { return }
+        externalReadiness = Self.waitForJIT(timeout: 60) { [weak self] prepared in
+            guard let self else { return }
+            externalReadiness = nil
+            if prepared { enabled("external debugger") }
+        }
     }
 
     private func enabled(_ source: String) {
@@ -228,6 +237,8 @@ final class JITCoordinator: ObservableObject {
 
     func enable() {
         guard !busy, !JITBootstrap.ready else { return }
+        externalReadiness?.cancel()
+        externalReadiness = nil
         error = nil
         JITBootstrap.lastFailure = nil
         connectionProblem = nil
@@ -290,33 +301,22 @@ final class JITCoordinator: ObservableObject {
         }
     }
 
-    /// Wait for the app to return and the script to provide a tested region;
-    /// neither URL acceptance nor a previously set debugged flag proves that.
+    /// An accepted URL or an existing debugger flag is not a prepared region.
     private func awaitStikDebug() {
         busy = true
-        waitingForStikDebugReturn = true
-        leftForStikDebug = false
-        status = "Confirm Enable and Run Script in StikDebug, then return to Henge."
+        status = "Confirm Enable and Run Script in StikDebug. Henge is waiting for its code region."
         log("waiting for StikDebug's JIT script")
-        waitForStikDebugRegion()
-    }
-
-    private func waitForStikDebugRegion() {
-        stikDebugReadiness?.invalidate()
-        if leftForStikDebug { status = "Waiting for StikDebug to prepare JIT…" }
-        stikDebugReadiness = Self.waitForJIT(timeout: 60, mayPrepare: { [weak self] in
-            self?.leftForStikDebug == true
-        }) { [weak self] prepared in
+        stikDebugReadiness?.cancel()
+        stikDebugReadiness = Self.waitForJIT(timeout: 60) { [weak self] prepared in
             guard let self else { return }
             stikDebugReadiness = nil
-            waitingForStikDebugReturn = false
             busy = false
             if prepared {
                 enabled("StikDebug")
             } else {
                 status = nil
-                error = JITBootstrap.lastFailure ?? "StikDebug did not prepare JIT within a minute. Make sure it's installed and try again."
-                log("StikDebug did not prepare a JIT code region within a minute")
+                error = JITBootstrap.lastFailure ?? "StikDebug did not prepare JIT. Confirm Enable and Run Script in StikDebug, then try again."
+                log("StikDebug did not prepare a JIT code region")
                 showSetup = true
             }
         }
@@ -382,6 +382,8 @@ final class JITCoordinator: ObservableObject {
 
     func enableBuiltIn(attempt: Int = 1) {
         guard !JITBootstrap.ready, attempt > 1 || !busy else { return }
+        externalReadiness?.cancel()
+        externalReadiness = nil
         guard let pairing = builtInPairing() else { return }
         guard let script = JITBootstrap.scriptBase64 else {
             error = "Henge's JIT script is missing from this installation. Reinstall Henge."
@@ -395,12 +397,12 @@ final class JITCoordinator: ObservableObject {
         advice = nil
         if attempt == 1 { status = "Starting Henge's JIT helper…" }
         log("enabling JIT with the built-in helper" + (attempt > 1 ? " (attempt \(attempt))" : ""))
-        var readiness: Timer?
+        var readiness: Task<Void, Never>?
         var finished = false
         let finish: (String?) -> Void = { [weak self] failure in
             guard let self, !finished else { return }
             finished = true
-            readiness?.invalidate()
+            readiness?.cancel()
             busy = false
             if let failure {
                 status = nil
@@ -419,7 +421,7 @@ final class JITCoordinator: ObservableObject {
                     if attempt == 1 { self?.status = "Waiting for the helper to prepare JIT…" }
                     readiness = Self.waitForJIT { prepared in
                         finish(prepared ? nil : JITBootstrap.lastFailure
-                            ?? "The helper did not prepare JIT within 90 seconds. "
+                            ?? "The helper did not prepare JIT. "
                              + "Check that LocalDevVPN is connected, then try again.")
                     }
                 },
@@ -436,7 +438,7 @@ final class JITCoordinator: ObservableObject {
                                retryIfAdvised(helperMessage: response.message, attempt: attempt,
                                               retry: { [weak self] in self?.enableBuiltIn(attempt: $0) }) {
                                 finished = true
-                                readiness?.invalidate()
+                                readiness?.cancel()
                                 return
                             }
                             finish(helperFailure(response.message))
@@ -505,29 +507,29 @@ final class JITCoordinator: ObservableObject {
         return true
     }
 
-    /// The debugger flag can precede the script, or remain set after detach.
-    /// Retry explicit preparation while an enable request is in progress, and
-    /// report success only once HengeVM's actual code region is usable.
+    /// The flag can precede the script or remain set after detach. Retry the
+    /// actual allocation, without requiring a scene-phase callback or an active
+    /// UIKit state first: either may be absent while a visible app changes focus.
+    /// Count scheduled polls instead of a wall-clock deadline, so suspension
+    /// while the user confirms the script does not consume the entire wait.
     private static func waitForJIT(timeout: TimeInterval = 90,
-                                   mayPrepare: @escaping () -> Bool = { true },
-                                   completion: @escaping (Bool) -> Void) -> Timer {
-        let deadline = Date().addingTimeInterval(timeout)
-        let timer = Timer(timeInterval: 0.5, repeats: true) { timer in
-            guard UIApplication.shared.applicationState == .active else { return }
-            if JITBootstrap.ready {
-                timer.invalidate()
-                completion(true)
-            } else if Date() >= deadline {
-                timer.invalidate()
-                completion(false)
-            } else if mayPrepare(), JITBootstrap.debuggedFlag,
-                      JITBootstrap.prewarm(), JITBootstrap.ready {
-                timer.invalidate()
-                completion(true)
+                                   completion: @escaping (Bool) -> Void) -> Task<Void, Never> {
+        Task { @MainActor in
+            let polls = max(1, Int((timeout / 0.5).rounded(.up)))
+            for poll in 0..<polls {
+                do { try await Task.sleep(nanoseconds: 500_000_000) }
+                catch { return }
+                guard !Task.isCancelled else { return }
+                if poll == 0 {
+                    HengeLog.log("jit", "checking code region; UIKit state \(UIApplication.shared.applicationState.rawValue), CS_DEBUGGED \(JITBootstrap.debuggedFlag)")
+                }
+                if JITBootstrap.ready || (JITBootstrap.debuggedFlag && JITBootstrap.prewarm() && JITBootstrap.ready) {
+                    completion(true)
+                    return
+                }
             }
+            completion(false)
         }
-        RunLoop.main.add(timer, forMode: .common)
-        return timer
     }
 }
 

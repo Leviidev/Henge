@@ -65,6 +65,13 @@ struct RootView: View {
         }
         .preferredColorScheme(.dark)
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
+        .task {
+            // A first appearance also needs a refresh when no active phase is delivered.
+            jit.refreshReadiness()
+            jit.monitorExternalJIT()
+            machines.collectImports()
+            jit.enableAtLaunchIfAsked()
+        }
         .onChange(of: scenePhase, initial: true) { _, phase in
             jit.scenePhaseChanged(phase)
             guard phase == .active else { return }

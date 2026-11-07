@@ -16,13 +16,22 @@ the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/pac
   memory. Henge uses the same machinery as Husk: StikDebug, TrollStore, a
   jailbreak, or the built-in StikJIT helper (`HengeJITHelper.appex`, with
   on-device pairing on iOS 27). The app claims one 1 GB region per launch
-  (`JITBootstrap.jitBytes`) and the engine writes through a `vm_remap`'d alias
+  (or 1.5 GB when selected in Performance settings, `JITBootstrap.jitBytes`)
+  and the engine writes through a `vm_remap`'d alias
   (`host/jit_region.c`, split mode).
   For StikDebug, tap **Turn On JIT** in Henge, confirm **Enable and Run Script**
   in StikDebug, and return to Henge. On TXM devices, the status becomes On only
-  after the region passes its execute self-test. A failed preparation can be retried in the same
-  launch; time spent confirming the script does not consume the preparation
-  timeout after returning. A new app process needs JIT enabled again.
+  after the region passes its execute self-test. A failed preparation can be
+  retried in the same launch. Explicit preparation does not require a foreground
+  scene notification; suspension while confirming the script does not exhaust
+  the wait.
+  Alternatively, launch Henge from StikDebug's app list. On TXM devices, first
+  enable StikDebug's advanced options if needed, long-press Henge, choose
+  **Assign Script**, and select the bundled **universal.js** (StikDebug 3.2.1).
+  This assignment is per bundle ID and only needs doing once. Henge waits for
+  the assigned script at launch, prepares and tests the region automatically,
+  and does not send a second enable-JIT URL. A new app process needs JIT
+  enabled again.
 - **Memory**: `increased-memory-limit` is recommended, not required. Once a
   debugger has attached, guest RAM is kept out of the app's memory limit, and if
   iOS refuses that it comes from a file on free storage instead.
@@ -70,12 +79,16 @@ the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/pac
 
 Run `make test-ios-jit` on an Apple Silicon Mac for acquisition regressions:
 the production Swift coordinator and native allocator run with a simulated
-debugserver and app switching. The allocator executes generated code through
+debugserver and app switching, including omitted scene notifications and an
+inactive UIKit state. The allocator executes generated code through
 its real RW/RX aliases. The tests cover a stale debugger flag, a delayed script,
 allocation failure followed by retry, duplicate requests and reuse after detach;
 JavaScriptCore also checks the bundled script's probe and mapping register writes.
-`bash ios/scripts/check_jit.sh --delayed-return` additionally waits over a minute
-in the simulated external app before returning. These host tests do not establish
+`bash ios/scripts/check_jit.sh --external-launch` checks direct app-list launch
+with a delayed debugger and the legacy probe response used by `universal.js`,
+without a button press, foreground callback or outgoing URL.
+`bash ios/scripts/check_jit.sh --delayed-return` additionally simulates over a
+minute of suspension in the external app before returning. These host tests do not establish
 physical iOS/TXM permissions; validate the same sequence on a signed device build.
 
 Code from Husk (GPL-2.0-or-later): `Henge/JIT/*`, `Henge/HengeLog.swift`,

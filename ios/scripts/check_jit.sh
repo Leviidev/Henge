@@ -8,6 +8,7 @@ APP="$OUT/JITTests.app/Contents"
 mkdir -p "$APP/MacOS" "$APP/Resources" "$OUT/modules"
 export CLANG_MODULE_CACHE_PATH="$OUT/modules"
 export SWIFT_MODULECACHE_PATH="$OUT/modules"
+COORDINATOR_SOURCE="${HENGE_JIT_COORDINATOR_SOURCE:-ios/Henge/JIT/JITSetup.swift}"
 
 xcrun --sdk macosx clang -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter \
   -Itests/support \
@@ -20,7 +21,7 @@ xcrun --sdk macosx swiftc -emit-library -emit-module -module-name UIKit \
   -emit-module-path "$OUT/UIKit.swiftmodule"
 xcrun --sdk macosx swiftc -swift-version 5 -I "$OUT" -L "$OUT" -lUIKit \
   -import-objc-header tests/support/ios_jit_runtime.h \
-  ios/Henge/JIT/JITBootstrap.swift ios/Henge/JIT/JITSetup.swift ios/Henge/JIT/JITNetworkAdvice.swift \
+  ios/Henge/JIT/JITBootstrap.swift "$COORDINATOR_SOURCE" ios/Henge/JIT/JITNetworkAdvice.swift \
   ios/HengeJITHelper/HengeJITMessages.swift tests/support/ios_jit_services.swift \
   tests/test_ios_jit.swift "$OUT/allocator.o" "$OUT/runtime.o" \
   -Xlinker -rpath -Xlinker "$OUT" -o "$APP/MacOS/JITTests"

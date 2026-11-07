@@ -4,6 +4,7 @@
 void henge_test_debugged(bool value);
 void henge_test_service_traps(bool value);
 void henge_test_allow_allocation(bool value);
+void henge_test_probe_value(uint64_t value);
 unsigned henge_test_probe_count(void);
 unsigned henge_test_allocation_count(void);
 unsigned henge_test_detach_count(void);

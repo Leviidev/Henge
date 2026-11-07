@@ -7,12 +7,14 @@
 
 static bool debugged, servicing, allow_allocation;
 static unsigned probes, allocations, detaches, selftests;
+static uint64_t probe_value = 0xE0000069ull;
 
 size_t os_proc_available_memory(void) { return (size_t)8 << 30; }
 
 void henge_test_debugged(bool value) { debugged = value; }
 void henge_test_service_traps(bool value) { servicing = value; }
 void henge_test_allow_allocation(bool value) { allow_allocation = value; }
+void henge_test_probe_value(uint64_t value) { probe_value = value; }
 unsigned henge_test_probe_count(void) { return probes; }
 unsigned henge_test_allocation_count(void) { return allocations; }
 unsigned henge_test_detach_count(void) { return detaches; }
@@ -27,7 +29,7 @@ int csops(int pid, unsigned ops, void *status, size_t size) {
 
 uint64_t henge_brk_probe(void) {
     probes++;
-    return servicing ? 0xE0000069ull : 0;
+    return servicing ? probe_value : 0;
 }
 
 void *henge_brk_get_jit_mapping(void *address, size_t bytes) {

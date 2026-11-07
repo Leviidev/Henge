@@ -3,7 +3,7 @@ import Foundation
 /// Only app switching is simulated. SwiftUI, timers, the coordinator and the
 /// native allocator run as compiled production code on the Mac.
 public final class UIApplication {
-    public enum State { case active, inactive, background }
+    public enum State: Int { case active, inactive, background }
     public static let shared = UIApplication()
     public var applicationState: State = .active
     public private(set) var openedURLs: [URL] = []

@@ -23,7 +23,7 @@ struct HomeView: View {
                 VStack(spacing: 14) {
                     notices
                     if let mac {
-                        MacHero(mac: mac, jitReady: jit.ready, start: { running = mac }, turnOnJIT: { jit.enable() },
+                        MacHero(mac: mac, jitReady: jit.ready, jitBusy: jit.busy, start: { running = mac }, turnOnJIT: { jit.enable() },
                                 jitNote: jit.ready ? nil : (jit.error ?? (jit.busy ? jit.status : nil) ?? JITBootstrap.lastFailure ?? jit.automaticDescription))
                         HStack(spacing: 10) {
                             FactTile(title: "Disk", value: ByteText.string(UInt64(max(mac.bytesUsed, 0))))
@@ -146,6 +146,7 @@ extension VirtualMac {
 private struct MacHero: View {
     let mac: VirtualMac
     let jitReady: Bool
+    let jitBusy: Bool
     let start: () -> Void
     let turnOnJIT: () -> Void
     let jitNote: String?
@@ -191,8 +192,9 @@ private struct MacHero: View {
                         .padding(.horizontal, 5)
                         .padding(.top, 10)
                 }
-                Button("Turn On JIT", action: turnOnJIT)
-                    .buttonStyle(DeskButtonStyle())
+                Button(jitBusy ? "Preparing JIT…" : "Turn On JIT", action: turnOnJIT)
+                    .buttonStyle(DeskButtonStyle(enabled: !jitBusy))
+                    .disabled(jitBusy)
                     .padding(.top, 15)
             }
         }
