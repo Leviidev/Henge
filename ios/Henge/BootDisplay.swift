@@ -42,19 +42,28 @@ struct BootDisplay: View {
             }
         }
         .task {
+            var generation = henge_vm_generation()
             // Keep watching the lifecycle after the GPU takes over. Removing
             // GPUScreen clears its last frame on both device and external screens.
             while !Task.isCancelled {
-                if henge_vm_state() == 2 {
+                let next = henge_vm_generation(), state = henge_vm_state()
+                if next != generation {
+                    generation = next
+                    gpuLive = false
+                    image = nil
+                }
+                if state == 2 || state == 3 {
                     stopped = true
                     image = nil
-                    break
+                    gpuLive = false
+                } else {
+                    stopped = false
+                    if !gpuLive && henge_vm_gpu_frames() > 0 {
+                        gpuLive = true
+                        image = nil
+                    }
+                    if !gpuLive { image = Self.snapshot() ?? image }
                 }
-                if !gpuLive && henge_vm_gpu_frames() > 0 {
-                    gpuLive = true
-                    image = nil
-                }
-                if !gpuLive { image = Self.snapshot() ?? image }
                 try? await Task.sleep(nanoseconds: gpuLive ? 250_000_000 : 100_000_000)
             }
         }
@@ -64,6 +73,7 @@ struct BootDisplay: View {
         var px: UnsafePointer<UInt8>?
         var w: Int32 = 0, h: Int32 = 0, stride: Int32 = 0
         guard henge_vm_boot_display(&px, &w, &h, &stride) == 0, let px else { return nil }
+        defer { henge_vm_free_display(px) }
         let bytes = Int(stride) * Int(h)
         let data = Data(bytes: px, count: bytes) // a copy: the guest keeps drawing
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }

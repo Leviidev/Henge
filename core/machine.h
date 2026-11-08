@@ -194,6 +194,7 @@ typedef struct HvPerCpu {
 #define HV_REQ_IJC_RESET 2u /* drop the branch cache (code changed) */
 
 typedef struct HvMachine {
+    int locks_initialized;
     HvRam ram[HV_MAX_RAM];
     int nram;
     HvRam *main_ram;     /* the largest region: guest RAM */

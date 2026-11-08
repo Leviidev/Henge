@@ -1,10 +1,10 @@
 import SwiftUI
 
-/// A stopped guest must not look like a frozen desktop. Restarting the engine
-/// still requires a new app launch; keep that limitation explicit here.
+/// Terminal state after the engine has released the previous guest.
 struct StoppedMacView: View {
     let outcome: Int32
     let reason: String
+    var start: (() -> Void)? = nil
     let close: () -> Void
 
     private var title: String {
@@ -17,10 +17,10 @@ struct StoppedMacView: View {
     }
 
     private var detail: String {
-        let next = "Quit Henge and open it again to start this Mac."
+        let next = "You can start this Mac again or return to your Macs."
         switch outcome {
         case Int32(HENGE_VM_OUTCOME_SHUTDOWN.rawValue), Int32(HENGE_VM_OUTCOME_HOST_STOP.rawValue): return next
-        case Int32(HENGE_VM_OUTCOME_RESTART.rawValue): return "Automatic restart is not available yet. " + next
+        case Int32(HENGE_VM_OUTCOME_RESTART.rawValue): return "The Mac is ready to start again."
         default: return "The Mac stopped: \(reason). " + next
         }
     }
@@ -31,7 +31,8 @@ struct StoppedMacView: View {
             Text(title).font(.headline)
             Text(detail).font(.subheadline).foregroundStyle(.white.opacity(0.7))
                 .multilineTextAlignment(.center)
-            Button("Close", action: close).buttonStyle(.borderedProminent)
+            if let start { Button("Start Mac", action: start).buttonStyle(.borderedProminent) }
+            Button("Close", action: close).buttonStyle(.bordered)
         }
         .foregroundStyle(.white)
         .padding(24)

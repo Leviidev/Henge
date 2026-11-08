@@ -87,6 +87,17 @@ $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 	$(CC) $(CFLAGS) $^ -o $@
 
+# Native app lifecycle with real devices and networking; no restore assets.
+$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/share.o $(B)/usb_host.o
+	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -o $@
+
+test-vm-lifecycle: $(B)/test_vm_lifecycle
+	$(B)/test_vm_lifecycle
+.PHONY: test-vm-lifecycle
+
+$(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV)
+	$(CC) $(CFLAGS) -fobjc-arc $^ $(METAL_LIBS) -o $@
+
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
 
