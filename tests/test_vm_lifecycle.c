@@ -20,6 +20,8 @@ static HengeDualMapping mapping;
 static int failures;
 static _Atomic int reader_done;
 HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
+/* The lifecycle check runs on macOS; the app-only iOS memory budget is unused. */
+size_t os_proc_available_memory(void) { return 0; }
 void hv_prof_ios_start(void) {}
 int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
                      HvInstallProgress progress, void *user) {

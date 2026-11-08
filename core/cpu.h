@@ -94,6 +94,12 @@ typedef struct HvCpu {
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
     uint64_t helper_came_from; /* 0x510: where hv_helper_entry was called from, to tell if it goes back there */
+    uint64_t apflags;          /* 0x518: Apple PF/AF, NZCV bit positions */
+    uint64_t actlr_el1;        /* 0x520: tested inline by Rosetta translations */
+    uint64_t aspsr_el1;        /* 0x528: exception-saved APSTATE (P/A in bits 1/2) */
+    uint64_t afpcr_el0;        /* 0x530: Apple DAZ/FTZ */
+    uint64_t fpcr_native;      /* 0x538: effective AFP controls on the host */
+    uint64_t rosetta_mode;     /* 0x540: fixed for this machine */
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
@@ -125,7 +131,6 @@ typedef struct HvCpu {
     uint64_t mdscr_el1;
     uint64_t csselr_el1;
     uint64_t cntkctl_el1;
-    uint64_t actlr_el1;
     uint64_t sctlr_seen;     /* MMU/FP state the current TLB contents were filled under */
     uint64_t timer_due;      /* host time this CPU's timer next fires (the dispatcher's last tick said), 0: none */
     /* TLB slots (table << HV_TLB_BITS | index) filled with user addresses since the
@@ -214,6 +219,10 @@ typedef struct HvCpu {
 #define HV_CPU_SP_EL1      0x398
 #define HV_CPU_IJC_TAB     0x440
 #define HV_CPU_TLB         0x580
+#define HV_CPU_APFLAGS     0x518
+#define HV_CPU_ACTLR       0x520
+#define HV_CPU_FPCR_NATIVE 0x538
+#define HV_CPU_ROSETTA     0x540
 #define HV_CPU_RET_SALT    0x500
 #define HV_CPU_GADDEND     0x4c0
 #define HV_CPU_XJUMP_THUNK 0x4e0
@@ -225,6 +234,10 @@ typedef struct HvCpu {
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      32 /* between a slot's tables */
 
+_Static_assert(offsetof(HvCpu, apflags) == HV_CPU_APFLAGS, "AP flags layout");
+_Static_assert(offsetof(HvCpu, actlr_el1) == HV_CPU_ACTLR, "ACTLR layout");
+_Static_assert(offsetof(HvCpu, fpcr_native) == HV_CPU_FPCR_NATIVE, "AFP layout");
+_Static_assert(offsetof(HvCpu, rosetta_mode) == HV_CPU_ROSETTA, "Rosetta layout");
 _Static_assert(offsetof(HvCpu, sp) == HV_CPU_SP, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, pc) == HV_CPU_PC, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, nzcv) == HV_CPU_NZCV, "HvCpu layout");

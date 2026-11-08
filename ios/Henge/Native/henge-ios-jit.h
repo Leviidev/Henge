@@ -85,6 +85,8 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes);
  */
 HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes);
 HENGE_EXPORT bool henge_ios_jit_prewarm_self(size_t bytes);
+/* NULL until a usable region is held. Failed prewarms can be retried after attaching again. */
+HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
 
 /*
  * The native runtime shares the prewarmed region with QEMU: it takes bytes from the bottom, QEMU the top. Call before

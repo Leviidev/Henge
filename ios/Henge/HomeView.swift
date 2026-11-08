@@ -9,7 +9,6 @@ struct HomeView: View {
     @Binding var running: VirtualMac?
     @Binding var tab: RootView.Tab
     @State private var picking = false
-    @State private var jitReady = JITBootstrap.ready
     @State private var chosen: UUID?
 
     /// The Mac on show: the one picked, or the one used last.
@@ -24,8 +23,8 @@ struct HomeView: View {
                 VStack(spacing: 14) {
                     notices
                     if let mac {
-                        MacHero(mac: mac, jitReady: jitReady, start: { running = mac }, turnOnJIT: { jit.enable() },
-                                jitNote: jitReady ? nil : (JITBootstrap.lastFailure ?? jit.automaticDescription))
+                        MacHero(mac: mac, jitReady: jit.ready, start: { running = mac }, turnOnJIT: { jit.enable() },
+                                jitNote: jit.ready ? nil : (jit.error ?? JITBootstrap.lastFailure ?? jit.automaticDescription))
                         HStack(spacing: 10) {
                             FactTile(title: "Disk", value: ByteText.string(UInt64(max(mac.bytesUsed, 0))))
                             FactTile(title: "Last used", value: mac.lastUsedText)
@@ -55,12 +54,6 @@ struct HomeView: View {
             }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 if case let .success(url) = result { machines.importFolder(url) }
-            }
-            .task {
-                while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
-                    jitReady = JITBootstrap.ready
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                }
             }
         }
     }

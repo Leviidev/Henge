@@ -2,13 +2,14 @@
 
 #include <mach/mach_time.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "exception.h"
 #include "machine.h"
 #include "memop.h"
 #include "mmu.h"
-#include <stdlib.h>
+#include "rosetta.h"
 
 /* System registers are named by op0:op1:CRn:CRm:op2, which is bits 20..5 of MRS/MSR. */
 #define R(op0, op1, crn, crm, op2) ((op0) << 14 | (op1) << 11 | (crn) << 7 | (crm) << 3 | (op2))
@@ -16,7 +17,7 @@
 /* ID registers: only features the translator handles. Host features are a
    superset (Apple M1 and later), so copied instructions always exist. */
 #define ID_AA64PFR0  0x1100000001110011ull /* EL0/EL1 AArch64, FP+AdvSIMD with FP16, GICv3 sysregs, CSV2, CSV3 */
-#define ID_AA64ISAR0 0x0011100110212120ull /* AES+PMULL, SHA1, SHA2/512, CRC32, LSE, RDM, SHA3, DotProd, FHM, FlagM */
+#define ID_AA64ISAR0 0x0021100110212120ull /* AES+PMULL, SHA1, SHA2/512, CRC32, LSE, RDM, SHA3, DotProd, FHM, FlagM2 */
 #define ID_AA64ISAR1 0x0000001110211011ull /* DPB, PAuth (no-op), JSCVT, FCMA, LRCPC2, PACGA, FRINTTS, SB */
 #define ID_AA64MMFR0 0x0000000000100025ull /* 48-bit PA, 16-bit ASID, 4K/16K/64K granules */
 #define ID_AA64MMFR1 0x0000000000111000ull /* HPDS, LOR, PAN */
@@ -72,7 +73,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     uint64_t now = counter();
     HvMachine *m = cpu->m;
     switch (reg) {
-    case R(3, 3, 4, 2, 0): *v = cpu->nzcv & 0xf0000000; return 0;
+    case R(3, 3, 4, 2, 0): *v = (cpu->nzcv & 0xf0000000) | ((cpu->el == 0 && (cpu->actlr_el1 & 16)) ? cpu->apflags : 0); return 0;
     case R(3, 3, 4, 2, 1): *v = cpu->daif; return 0;
     case R(3, 0, 4, 2, 2): *v = (uint64_t)cpu->el << 2; return 0;      /* CurrentEL */
     case R(3, 0, 4, 2, 0): *v = cpu->spsel; return 0;
@@ -81,7 +82,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 3, 4, 2, 5): *v = cpu->pstate_extra & (1u << 24); return 0; /* DIT */
     case R(3, 3, 4, 2, 6): *v = cpu->pstate_extra & (1u << 12); return 0; /* SSBS */
     /* FPCR/FPSR live in the host registers while the guest runs (hv_fp_enter). */
-    case R(3, 3, 4, 4, 0): __asm__ volatile("mrs %0, fpcr" : "=r"(*v)); return 0;
+    case R(3, 3, 4, 4, 0): if (m->rosetta) *v = cpu->fpcr; else __asm__ volatile("mrs %0, fpcr" : "=r"(*v)); return 0;
     case R(3, 3, 4, 4, 1): __asm__ volatile("mrs %0, fpsr" : "=r"(*v)); return 0;
     case R(3, 0, 4, 1, 0): *v = cpu->spsel ? cpu->sp_el0 : cpu->sp; return 0; /* SP_EL0 */
     case R(3, 0, 4, 0, 0): *v = cpu->spsr_el1; return 0;
@@ -121,11 +122,17 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 0, 0, 6, 0): *v = ID_AA64ISAR0; return 0;
     case R(3, 0, 0, 6, 1): *v = ID_AA64ISAR1; return 0;
     case R(3, 0, 0, 7, 0): *v = ID_AA64MMFR0; return 0;
-    case R(3, 0, 0, 7, 1): *v = ID_AA64MMFR1; return 0;
+    case R(3, 0, 0, 7, 1): *v = ID_AA64MMFR1 | (m->rosetta ? 1ull << 44 : 0); return 0;
     case R(3, 3, 0, 0, 1): *v = CTR_EL0; return 0;
     case R(3, 3, 0, 0, 7): *v = 4; return 0;                             /* DCZID: 64-byte DC ZVA */
     case R(3, 1, 0, 0, 1): *v = CLIDR; return 0;
-    case R(3, 1, 0, 0, 7): *v = 0; return 0;                             /* AIDR */
+    /* Apple's AIDR.TSO is bit 9. Only expose it with the software ordering
+       implementation: the normal CPU model remains unchanged. */
+    case R(3, 1, 0, 0, 7):
+        *v = (m->software_tso ? 1ull << 9 : 0) | (m->rosetta ? 1ull << 19 : 0);
+        return 0;
+    case R(3, 6, 15, 8, 3): *v = cpu->aspsr_el1; return 0;
+    case R(3, 6, 15, 2, 5): *v = cpu->afpcr_el0; return 0;
     case R(3, 1, 0, 0, 0):                                               /* CCSIDR for CSSELR's level */
         *v = (cpu->csselr_el1 >> 1) == 0 ? (127u << 13 | 7u << 3 | 2) : (2047u << 13 | 15u << 3 | 2);
         return 0;
@@ -170,14 +177,25 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
 static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     HvMachine *m = cpu->m;
     switch (reg) {
-    case R(3, 3, 4, 2, 0): cpu->nzcv = v & 0xf0000000; return 0;
+    case R(3, 3, 4, 2, 0):
+        cpu->nzcv = v & 0xf0000000;
+        cpu->apflags = cpu->el == 0 && (cpu->actlr_el1 & 16) ? v & HV_APFLAGS_MASK : 0;
+        return 0;
     case R(3, 3, 4, 2, 1): cpu->daif = v & HV_PSTATE_DAIF; return 0;
     case R(3, 0, 4, 2, 0): hv_sp_switch(cpu, cpu->el, v & 1); return 0;
     case R(3, 0, 4, 2, 3): hv_pstate_set(cpu, (hv_pstate_get(cpu) & ~(1ull << 22)) | (v & (1u << 22))); return 0;
     case R(3, 0, 4, 2, 4): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 23)) | (v & (1u << 23)); return 0;
     case R(3, 3, 4, 2, 5): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 24)) | (v & (1u << 24)); return 0;
     case R(3, 3, 4, 2, 6): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 12)) | (v & (1u << 12)); return 0;
-    case R(3, 3, 4, 4, 0): v &= 0x07ff9f00; __asm__ volatile("msr fpcr, %0" ::"r"(v)); return 0;
+    case R(3, 3, 4, 4, 0):
+        if (m->rosetta) {
+            cpu->fpcr = v & 0x07ff9f07;
+            hv_rosetta_fp_apply(cpu);
+        } else {
+            v &= 0x07ff9f00;
+            __asm__ volatile("msr fpcr, %0" ::"r"(v));
+        }
+        return 0;
     case R(3, 3, 4, 4, 1): v &= 0xf800009f; __asm__ volatile("msr fpsr, %0" ::"r"(v)); return 0;
     case R(3, 0, 4, 1, 0):
         if (!cpu->spsel) return -1; /* SP_EL0 is not accessible as a sysreg while it is the SP */
@@ -195,7 +213,18 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
         }
         return 0;
     }
-    case R(3, 0, 1, 0, 1): cpu->actlr_el1 = v; return 0;
+    /* ACTLR.EnTSO (bit 1) is readable/writable. Experimental software TSO
+       fences accesses even when this bit is clear, so changing it cannot
+       enter a block compiled with weaker ordering or leave writes pending. */
+    case R(3, 0, 1, 0, 1):
+        cpu->actlr_el1 = v;
+        hv_rosetta_fp_apply(cpu);
+        return 0;
+    case R(3, 6, 15, 8, 3): cpu->aspsr_el1 = v & 7; return 0;
+    case R(3, 6, 15, 2, 5):
+        cpu->afpcr_el0 = v & 3;
+        hv_rosetta_fp_apply(cpu);
+        return 0;
     case R(3, 0, 1, 0, 2): cpu->cpacr_el1 = v; return 0;
     case R(3, 0, 2, 0, 0): { /* a process switch */
         uint64_t old = cpu->ttbr0_el1;

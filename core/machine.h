@@ -225,6 +225,10 @@ typedef struct HvMachine {
     int trace;           /* print every block entered */
     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
+    /* Fixed before translating: 0 off, 1 software TSO, 2 full-barrier reference.
+       Guest ordering is implemented without changing privileged host modes. */
+    int software_tso;
+    int rosetta;         /* 0 off, 1 inline AP flags, 2 C reference; requires host AFP */
     uint64_t stat_slow_mem; /* hv_mem_emulate calls */
     uint64_t access_pc;  /* guest PC of the load/store being emulated, for logs */
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */

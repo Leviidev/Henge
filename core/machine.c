@@ -9,6 +9,7 @@
 
 #include "mmu.h"
 #include "sysreg.h"
+#include "rosetta.h"
 
 extern void hv_exit(void);
 extern void hv_helper_entry(void);
@@ -72,6 +73,16 @@ static int init_rest(HvMachine *m) {
     /* The TLB layout (cpu.h): HV_TLBT from the environment here too, so the Mac tool and the tests can pick it. */
     hv_knob[HV_K_TLBT] = getenv("HV_TLBT") ? atoi(getenv("HV_TLBT")) : 1; /* table-major unless asked: 9-20% faster in 5 of 6 paired rounds of the mix */
     hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
+    m->rosetta = getenv("HV_ROSETTA") ? atoi(getenv("HV_ROSETTA")) : 0;
+    if (m->rosetta && m->rosetta != 2) m->rosetta = 1;
+    if (m->rosetta && !hv_rosetta_host_supported()) {
+        fprintf(stderr, "hengevm: Rosetta mode requires a host with FEAT_AFP\n");
+        hv_jit_region_close(&m->jit);
+        return -1;
+    }
+    const char *tso = getenv("HV_SOFTWARE_TSO");
+    m->software_tso = tso && atoi(tso) != 0 ? (atoi(tso) == 2 ? 2 : 1) : 0;
+    if (m->rosetta && !m->software_tso) m->software_tso = 1;
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -532,6 +543,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     memset((char *)cpu + a + sizeof cpu->m, 0, b - a - sizeof cpu->m);
     memset((char *)cpu + b + sizeof cpu->pc_state, 0, sizeof *cpu - b - sizeof cpu->pc_state);
     cpu->m = m;
+    cpu->rosetta_mode = m->rosetta;
     cpu->index = index;
     cpu->pc_state = &m->percpu[index];
     m->cpus[index] = cpu;

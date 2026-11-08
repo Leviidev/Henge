@@ -14,6 +14,7 @@
 #include "mmu.h"
 #include "sysreg.h"
 #include "translate.h"
+#include "rosetta.h"
 
 void hv_flush_blocks(HvMachine *m) {
     /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
@@ -39,7 +40,10 @@ void hv_flush_blocks(HvMachine *m) {
     m->nslots = 0;
     m->nxchained = 0;
     hv_jit_reset(&m->jit);
-    m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
+    /* The MB knob may reset its own limit; retain the sub-MB capacity used by
+       the small-cache regression when no knob overrides it. */
+    if (hv_knob[HV_K_JITCAP] > 0 || m->jit.limit >= (1u << 20) / sizeof(uint32_t))
+        m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0;
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
     static int poison = -1;
     if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
@@ -352,6 +356,11 @@ static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in) {
     if (cpu->m->stats_interval && (info->op == HV_OP_MRS || info->op == HV_OP_MSR || info->op == HV_OP_SYS))
         reg_hist[(info->insn >> 5) & 0xffff] += info->op == HV_OP_MRS ? 1 : 1ull << 32;
     switch (info->op) {
+    case HV_OP_APFLAGS:
+        return hv_rosetta_alu(cpu, info->insn, info->pc);
+    case HV_OP_APFCMP:
+        cpu->apflags = (cpu->nzcv >> 28 & 1) << 26;
+        return 0;
     case HV_OP_MEM:
         cpu->m->stat_slow_mem++;
         if (cpu->m->stats_interval) { /* --stats: which kinds of access take the slow path */
@@ -861,6 +870,7 @@ static void stop_the_world(HvCpu *cpu) {
 
 int hv_run(HvCpu *cpu) {
     hv_big_lock(cpu->m);
+    hv_rosetta_fp_apply(cpu);
     hv_fp_enter(cpu);
     int r = run(cpu, 0);
     hv_fp_leave(cpu);
@@ -870,6 +880,7 @@ int hv_run(HvCpu *cpu) {
 
 int hv_run_one(HvCpu *cpu) {
     hv_big_lock(cpu->m);
+    hv_rosetta_fp_apply(cpu);
     hv_fp_enter(cpu);
     int r = run(cpu, 1);
     hv_fp_leave(cpu);

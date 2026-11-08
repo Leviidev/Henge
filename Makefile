@@ -4,7 +4,7 @@ CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices
 B = build
 
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
-       $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
+       $(B)/exception.o $(B)/sysreg.o $(B)/rosetta.o $(B)/machine.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o
@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_tso $(B)/test_devices $(B)/test_rosetta $(B)/test_shutdown
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -63,6 +63,17 @@ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
+# Experimental iOS Simulator frontend. Supply a simulator CC and simulator-built
+# SLIRP_CFLAGS/SLIRP_LIBS; the device dependencies cannot be linked here.
+$(B)/simulator_lab: tools/simulator_lab.m $(ENGINE) $(DEV) $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o build/simulator-restore/libhengerestore.a
+	$(CC) $(CFLAGS) -fobjc-arc $^ $(SLIRP_LIBS) -lz -liconv -lresolv \
+	    -framework Foundation -framework UIKit -framework CFNetwork -framework Security -framework SystemConfiguration \
+	    -framework AudioToolbox -framework Metal -framework IOSurface -framework QuartzCore \
+	    -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -o $@
+
+build/simulator-restore/libhengerestore.a: tools/build_ios_restore.sh host/libusb_shim.c host/install.c host/curl_shim.m
+	tools/build_ios_restore.sh simulator
+
 # mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
 $(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
@@ -87,9 +98,13 @@ $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 	$(CC) $(CFLAGS) $^ -o $@
 
+# Use the same pinned lifecycle bridge that both production frameworks build.
+$(B)/mainline-native-bridge.c: ios/engine-mainline.txt | $(B)
+	git show "$$(cat $<):ios/Henge/Native/henge-vm.c" > $@
+
 # Native app lifecycle with real devices and networking; no restore assets.
-$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/share.o $(B)/usb_host.o
-	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -o $@
+$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c $(B)/mainline-native-bridge.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/share.o $(B)/usb_host.o
+	$(CC) $(CFLAGS) -Itests/support -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -o $@
 
 test-vm-lifecycle: $(B)/test_vm_lifecycle
 	$(B)/test_vm_lifecycle
@@ -108,7 +123,8 @@ $(B)/test_%: tests/test_%.c tests/%_programs.S tests/harness.S tests/harness.h $
 	$(CC) $(CFLAGS) -Itests tests/test_$*.c tests/$*_programs.S tests/harness.S $(ENGINE) -o $@
 
 test: all
-	@ulimit -s 65520; for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done # a test keeps a whole HvCpu (2 MB of TLB and more) on its stack
+	@ulimit -s 65520; for t in $(TESTS); do echo "== $$t"; $$t; rc=$$?; [ $$rc -eq 0 ] || [ $$rc -eq 77 ] || exit $$rc; done
+	@$(B)/test_rosetta reference; rc=$$?; [ $$rc -eq 0 ] || [ $$rc -eq 77 ]
 
 $(B):
 	mkdir -p $(B)
@@ -209,3 +225,6 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+test-ios-jit:
+	bash ios/scripts/check_jit.sh
+.PHONY: test-ios-jit
