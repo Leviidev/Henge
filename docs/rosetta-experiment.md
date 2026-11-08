@@ -90,8 +90,9 @@ Register references: [Apple ACTLR definitions](https://github.com/apple-oss-dist
 Bean 3.3.4 (Intel 64-bit) opens and can be used on a physical device with Rosetta
 enabled. **Performance is very slow.** This is user-confirmed testing of the
 Rosetta test build, not a claim that other applications or devices are supported.
-This feedback predates the 4 KB cache change; the new cache still needs physical
-device comparison with the previous Rosetta build.
+The Bean result predates the 4 KB cache change. After trying the 4 KB cache build
+on a physical device, the user reports that it feels slightly faster. No timed
+comparison was collected, and Intel application performance remains very slow.
 
 The [official Bean 3.3.4 download](https://www.bean-osx.com/releases/Bean-Install-3-3-4.zip)
 contains an x86_64-only executable and is about 3.5 MB.
