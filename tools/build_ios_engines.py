@@ -78,9 +78,10 @@ def main():
     for rosetta, name, source in [(0, 'HengeMainlineEngine', pristine), (1, 'HengeRosettaEngine', ROOT)]:
         objects = dest / 'objects' / name
         run('make', '-C', source, '-j8', f'IB={objects}', f'IOS_DEPS={deps}',
-            f'IOS_CC={shlex.join(cc)}', 'ios-lib')
+            f'IOS_CC={shlex.join(cc)}', f'ROSETTA_4K_CACHE={rosetta}', 'ios-lib')
         flags = ['-std=c11', '-O2', '-fvisibility=hidden', '-Wall', '-Wextra',
-                 f'-DHENGE_ENGINE_ROSETTA={rosetta}', f'-DHENGE_MAINLINE_REVISION="{revision}"']
+                 f'-DHENGE_ENGINE_ROSETTA={rosetta}', f'-DHENGE_ROSETTA_4K_CACHE={rosetta}',
+                 f'-DHENGE_MAINLINE_REVISION="{revision}"']
         flags += [f'-I{p}' for p in [adapter, native, source / 'core', source / 'host', source / 'devices']]
         # Share the exact mainline lifecycle bridge, including shutdown/restart
         # cleanup. Only the Rosetta engine's CPU implementation differs.
@@ -104,7 +105,8 @@ def main():
                  'CFBundleName': name, 'CFBundlePackageType': 'FMWK', 'CFBundleInfoDictionaryVersion': '6.0',
                  'CFBundleShortVersionString': '1.0', 'CFBundleVersion': '1', 'MinimumOSVersion': '17.0',
                  'CFBundleSupportedPlatforms': ['iPhoneSimulator' if simulator else 'iPhoneOS'],
-                 'HengeMainlineRevision': revision, 'HengeRosettaEngine': bool(rosetta)}
+                 'HengeMainlineRevision': revision, 'HengeRosettaEngine': bool(rosetta),
+                 'HengeSoftwareTLBPageBytes': 4096 if rosetta else 16384}
         (bundle / 'Info.plist').write_bytes(plistlib.dumps(plist))
         exports = output('xcrun', 'nm', '-gUj', binary).splitlines()
         if exports != ['_henge_engine_get_api']:
@@ -117,7 +119,8 @@ def main():
             shutil.rmtree(bundle)
             run('ditto', '--norsrc', '--noextattr', clean, bundle)
         manifest['engines'][name] = {'binary_sha256': sha(binary), 'rosetta': bool(rosetta),
-                                      'backend_sha256': sha(backend), 'exports': exports}
+                                      'backend_sha256': sha(backend), 'exports': exports,
+                                      'software_tlb_page_bytes': 4096 if rosetta else 16384}
         print(f'Built {name}: {binary.stat().st_size:,} bytes', flush=True)
     (dest / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 

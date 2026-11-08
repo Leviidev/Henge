@@ -55,11 +55,29 @@ when mainline CPU internals change.
 - Inline handling for common arithmetic flags and NZCV access, avoiding a C
   helper call in these cases. This does not make Intel applications fast.
 
-Guest mappings smaller than 16 KB, including 4 KB pages used by Intel workloads,
-still take the slow MMU path instead of filling Henge's fast translation cache.
-This remains a performance limitation; the Rosetta changes do not fix it.
+The Rosetta framework additionally builds with `ROSETTA_4K_CACHE=1`. Its software
+translation cache uses 4 KB entries, so the 4 KB guest mappings used by Intel
+workloads can use cached data access, instruction fetch and branch targets.
+Larger guest mappings use several entries. Cross-page accesses still check each
+mapping and its permissions; invalidation covers every fragment of the guest
+granule. This changes neither the guest's page tables nor the host's page size.
 
-The experimental command-line frontend uses `HV_ROSETTA=1`. The setting is fixed
+The option defaults to **off** in the Makefile and is enabled only for the
+Rosetta framework by `tools/build_ios_engines.py`. The mainline framework still
+builds from its pristine pin with its original 16 KB cache. The build manifest
+and framework metadata record the software cache page size; a Rosetta boot also
+logs `Rosetta 4 KB software translation cache enabled`.
+
+This is an experimental performance change, not a measured Intel-app speedup.
+It retains the entry count, reducing cache coverage from 256 MB to 64 MB per
+table. Per-physical-page code metadata grows by four times (about 17.25 MiB versus
+4.3 MiB of virtual allocation per GiB of guest RAM; only touched host pages
+become resident). Shared single-address invalidations use the receiving CPU's
+page size and may need more synchronization. Native workloads within this engine
+can therefore have different memory and performance costs.
+
+The experimental command-line frontend uses `HV_ROSETTA=1`; compile it with
+`make ROSETTA_4K_CACHE=1` to opt into the new cache. The setting is fixed
 when a machine is created. `HV_ROSETTA=2` selects the C arithmetic reference;
 `HV_SOFTWARE_TSO=2` selects full memory barriers for comparison. The app's router
 sets these modes itself, so environment variables cannot override its switch.
@@ -72,6 +90,8 @@ Register references: [Apple ACTLR definitions](https://github.com/apple-oss-dist
 Bean 3.3.4 (Intel 64-bit) opens and can be used on a physical device with Rosetta
 enabled. **Performance is very slow.** This is user-confirmed testing of the
 Rosetta test build, not a claim that other applications or devices are supported.
+This feedback predates the 4 KB cache change; the new cache still needs physical
+device comparison with the previous Rosetta build.
 
 The [official Bean 3.3.4 download](https://www.bean-osx.com/releases/Bean-Install-3-3-4.zip)
 contains an x86_64-only executable and is about 3.5 MB.
@@ -83,6 +103,14 @@ ordering. `tests/test_vm_lifecycle.c` exercises repeated shutdown, restart,
 failed boot and JIT reuse through the same lifecycle bridge as the engines.
 The engine-selection checks cover separate loading, pending setting changes,
 missing frameworks, wrong mode metadata and incompatible ABI versions.
+
+`tests/test_rosetta_4k.c` covers noncontiguous pages, cross-page scalar/SIMD access,
+permissions, atomic alignment, modified code and writable aliases, guest-granule
+and range invalidation, address-space switches and a two-CPU invalidation with
+different page sizes. Its `--bench N G` mode is a synthetic memory/indirect-branch
+workload with `N` iterations and a guest page size of `2^G`; it does not measure
+Bean, Steam or end-to-end Intel application performance. Build it in separate
+directories with `ROSETTA_4K_CACHE=0` and `ROSETTA_4K_CACHE=1` for comparison.
 
 Build both iOS engines with `python3 tools/build_ios_engines.py`. CPU and
 lifecycle checks use the existing Makefile targets; `make test-ios-jit` checks

@@ -93,7 +93,7 @@ typedef struct {
     uint32_t pool_at;    /* where the literal pool is, in the cold part */
     uint32_t flags;
     int slow_mem;
-    uint64_t page;       /* guest VA of the 16 KB page the block is in */
+    uint64_t page;       /* guest VA of the software page the block is in */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
@@ -313,7 +313,7 @@ static void put_exit(Emit *e, uint64_t target) {
     put(e, BR_X(1));
 }
 
-/* A direct branch to target. Within the block's own 16 KB page the exit is
+/* A direct branch to target. Within the block's own software page the exit is
    chainable: it jumps to the block whose entry the dispatcher stored in this
    exit's slot (plain data, so chaining never rewrites code), as long as nobody
    has asked the CPU to leave. The hit path touches only the free scratch
@@ -1086,11 +1086,11 @@ static void translate_mem_inner(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
     put(e, SUB_X(U, addr, U));
     if (op.align && op.bytes > 1) {
-        /* and U, U, #~(0x3fff & ~(bytes-1)) after taking the adjustment back off:
+        /* and U, U, #~(page_mask & ~(bytes-1)) after taking the adjustment back off:
            zero only if same page and aligned */
         uint32_t k = __builtin_ctz(op.bytes);
         put(e, 0xd1000000u | HV_TLB_ADJ << 10 | U << 5 | U); /* sub U, U, #ADJ */
-        put(e, 0x92400000u | 50u << 16 | (49u + k) << 10 | U << 5 | U);
+        put(e, 0x92400000u | (64u - HV_TLB_PAGE_BITS) << 16 | (63u - HV_TLB_PAGE_BITS + k) << 10 | U << 5 | U);
     } else {
         if (op.bytes > HV_TLB_ADJ + 1) put_add_imm(e, U, U, op.bytes - 1 - HV_TLB_ADJ);
         put(e, UBFM_X(U, U, HV_TLB_PAGE_BITS, 63));

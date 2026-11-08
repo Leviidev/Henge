@@ -80,6 +80,9 @@ static int init_rest(HvMachine *m) {
         hv_jit_region_close(&m->jit);
         return -1;
     }
+#if HENGE_ROSETTA_4K_CACHE
+    if (m->rosetta) fprintf(stderr, "hengevm: Rosetta 4 KB software translation cache enabled\n");
+#endif
     const char *tso = getenv("HV_SOFTWARE_TSO");
     m->software_tso = tso && atoi(tso) != 0 ? (atoi(tso) == 2 ? 2 : 1) : 0;
     if (m->rosetta && !m->software_tso) m->software_tso = 1;

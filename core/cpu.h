@@ -11,10 +11,10 @@ enum HvHaltReason {
 };
 
 /* One software TLB entry. host = guest VA + addend. The exec tag is the guest
-   VA of the 16 KB page. The read and write tags are that minus HV_TLB_ADJ, so
+   VA of the software page. The read and write tags are that minus HV_TLB_ADJ, so
    translated code checks "same page, and the access ends in it" for any access
    of up to 16 bytes with one subtract and shift: VA - tag = offset + 15 must
-   be below 16 KB. (An access in a page's last 15 bytes takes the slow path.)
+   be below the software page size. (The last 15 bytes take the slow path.)
    Invalid tags are HV_TLB_INVALID, which no address minus it brings near 0. */
 typedef struct HvTlbEntry {
     uint64_t read_tag;
@@ -29,10 +29,20 @@ static inline uint64_t hv_exec_key(uint64_t page_va, int64_t addend) {
     return page_va ^ ((uint64_t)addend >> 20 | (uint64_t)addend << 44);
 }
 
+/* Only the independently built Rosetta engine opts in. Guest page tables and
+   host VM allocation sizes are unchanged; larger guest pages are cached as
+   several software pages, each with its own mapping and permissions. */
+#ifndef HENGE_ROSETTA_4K_CACHE
+#define HENGE_ROSETTA_4K_CACHE 0
+#endif
+#if HENGE_ROSETTA_4K_CACHE
+#define HV_TLB_PAGE_BITS 12
+#else
 #define HV_TLB_PAGE_BITS 14
+#endif
 #define HV_TLB_ADJ 15
 #define HV_TLB_INVALID 0x8080808080808080ull /* what memset(0x80) leaves */
-#define HV_TLB_BITS 14 /* 16384 entries per EL: 256 MB of 16 KB pages (xnu's working set overflowed 64 MB) */
+#define HV_TLB_BITS 14 /* 16384 entries per EL; keep the CPU/JIT layout unchanged */
 #define HV_TLB_SIZE (1u << HV_TLB_BITS)
 #define HV_IJC_TABLES 16
 #define HV_RET_BITS 13 /* entries in a return table */

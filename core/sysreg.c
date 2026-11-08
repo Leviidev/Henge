@@ -404,7 +404,10 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
     if (by_va) {
         uint64_t va = (uint64_t)((int64_t)((xt & 0xfffffffffffull) << 20) >> 8);
         int all_asids = op2 == 3 || op2 == 7; /* VAAE1, VAALE1 */
-        hv_tlb_flush_va_page(cpu, va, all_asids ? -1 : (int)(xt >> 48));
+        uint64_t size = 1ull << hv_tlbi_page_bits(cpu, va);
+        uint64_t first = va & ~(size - 1);
+        for (uint64_t off = 0; off < size; off += 1ull << HV_TLB_PAGE_BITS)
+            hv_tlb_flush_va_page(cpu, first + off, all_asids ? -1 : (int)(xt >> 48));
     } else if (by_asid) {
         hv_tlb_flush_user(cpu);
         hv_tlb_stash_drop(cpu, (int)(xt >> 48));
@@ -511,10 +514,17 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
             if (by_range && ((xt >> 46) & 3) == 2) { /* 16 KB granule, as xnu uses */
                 npages = (((xt >> 39) & 31) + 1) << (5 * ((xt >> 44) & 3) + 1);
                 va = (uint64_t)((int64_t)((xt & 0x1fffffffffull) << (64 - 37)) >> (64 - 37 - 14));
+                npages <<= 14 - HV_TLB_PAGE_BITS;
                 if (npages > 32) npages = 0;
             } else if (by_va) {
                 npages = 1;
             }
+#if HENGE_ROSETTA_4K_CACHE
+            /* A peer may be running another TCR granule (Rosetta's 4 KB user
+               space versus a native 16 KB one). Let that CPU expand a by-VA
+               invalidation under its own TCR and acknowledge it before use. */
+            if (by_va) npages = 0;
+#endif
             uint64_t seq[HV_MAX_CPUS] = {0};
             for (int i = 0; i < m->ncpus; i++) {
                 HvCpu *c = m->cpus[i];

@@ -404,8 +404,8 @@ void hv_tlb_protect_code(HvCpu *cpu, const uint8_t *host_page) {
         }
 }
 
-/* Forget one salt's cached targets in one 16 KB page. A page's 4096 possible
-   targets have 4096 known slots in each table, so only those are looked at. */
+/* Forget one salt's cached targets in one software page. Each 256-byte piece
+   names 64 instruction slots; the hint is relative to this page's base. */
 /* local: cpu itself (it may empty the page's hint slot afterwards). */
 static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt, int local) {
     HvPerCpu *m = cpu->pc_state;
@@ -418,7 +418,7 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt,
     for (int t = kernel; t < HV_IJC_TABLES; t += 2) {
         if (!(m->ijc_tables_used >> t & 1)) continue;
         uint64_t *tab = m->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8);
-        for (uint32_t piece = 0; piece < 64; piece++) {
+        for (uint32_t piece = 0; piece < (1u << (HV_TLB_PAGE_BITS - 8)); piece++) {
             if (!(bits >> piece & 1)) continue;
             for (uint32_t o = piece * 64; o < piece * 64 + 64; o++) {
                 uint64_t tag = (page | (uint64_t)o << 2) ^ salt;
@@ -591,7 +591,7 @@ static void write_guard(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code, HvTl
 }
 
 /* HV_KVA_HIST (measuring, for a kernel fastmem window): which kernel VAs get TLB fills, per GB from the bottom of xnu's
-   kernel VA space, and how many distinct 16 KB pages. hv_kva_hist_dump writes it out. */
+   kernel VA space, and how many distinct software pages. hv_kva_hist_dump writes it out. */
 #define KVA_GBS 2048 /* buckets: 2048 of 1 GB from 0xfffffe0000000000 by default; HV_KVA_BASE (hex) and HV_KVA_SHIFT move and widen them */
 static uint64_t KVA_BASE = 0xfffffe0000000000ull;
 static int kva_shift = 30;
@@ -703,7 +703,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
         HvTlbEntry *e = hv_tlb_ent(target, idx, t);
         uint64_t x = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
-        if (x != HV_TLB_INVALID && ((hv_exec_key(x, e->addend) ^ va) & 0x00ffffffffffc000ull) == 0) fetched = 1;
+        if (x != HV_TLB_INVALID && ((hv_exec_key(x, e->addend) ^ va) & 0x00ffffffffffffffull & ~PAGE_MASK) == 0) fetched = 1;
         __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
         __atomic_store_n(&e->write_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
         __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
@@ -807,7 +807,8 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     ent[1] = (uint64_t)(uintptr_t)b->code;
     pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
     {   /* the page's hint: which piece has a target now */
-        uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1, bit = 1ull << ((b->va >> 8) & 63);
+        uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1;
+        uint64_t bit = 1ull << ((b->va & PAGE_MASK) >> 8);
         __typeof__(pcs->ijc_hint[0][0]) *h = &pcs->ijc_hint[kernel][hint_slot(key)];
         if (h->key == key) h->bits |= bit;
         else if (!h->key) h->bits = bit, __atomic_store_n(&h->key, key, __ATOMIC_RELEASE);

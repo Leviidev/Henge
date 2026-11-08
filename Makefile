@@ -1,6 +1,8 @@
 # Light build: one clang call per file, no parallel jobs needed.
 CC = clang
-CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices
+ROSETTA_4K_CACHE ?= 0
+CACHE_CFLAGS = -DHENGE_ROSETTA_4K_CACHE=$(ROSETTA_4K_CACHE)
+CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices $(CACHE_CFLAGS)
 B = build
 
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
@@ -12,7 +14,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_tso $(B)/test_devices $(B)/test_rosetta $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_tso $(B)/test_devices $(B)/test_rosetta $(B)/test_shutdown $(B)/test_rosetta_4k
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -27,7 +29,7 @@ $(B)/hengevm-ref: host/hvf_ref.c host/hvf_ref.entitlements $(ENGINE) $(DEV)
 $(B)/pvg_metal.o: devices/pvg_metal.m devices/*.h core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations -c $< -o $@
 $(B)/pvg_mac.o: devices/pvg_mac.m devices/*.h core/*.h host/*.h | $(B)
-	$(CC) -fobjc-arc -O2 -g -Wall -mmacosx-version-min=15.2 -Icore -Ihost -Idevices -c $< -o $@
+	$(CC) $(CFLAGS) -fobjc-arc -mmacosx-version-min=15.2 -c $< -o $@
 
 # User-mode NAT for the NIC: Homebrew's libslirp (brew install libslirp).
 SLIRP_CFLAGS = $(shell pkg-config --cflags slirp)
@@ -95,6 +97,9 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
 
+$(B)/test_rosetta_4k: tests/test_rosetta_4k.c tests/rosetta_4k_programs.S $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+
 $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 	$(CC) $(CFLAGS) $^ -o $@
 
@@ -141,11 +146,24 @@ IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
 # ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
-IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp $(CACHE_CFLAGS)
 IB = build/ios
 IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
+
+# Rebuild all users of the software page size when changing a build directory's
+# setting. A stale object must not mix 4 KB and 16 KB cache assumptions.
+CACHE_STAMPS = $(B)/.rosetta-4k-$(ROSETTA_4K_CACHE) $(IB)/.rosetta-4k-$(ROSETTA_4K_CACHE)
+# A missing stamp is phony for this invocation: switches within one filesystem
+# timestamp tick must also rebuild, even if touching the stamp gives a tie.
+.PHONY: $(filter-out $(wildcard $(CACHE_STAMPS)),$(CACHE_STAMPS))
+$(CACHE_STAMPS):
+	@mkdir -p $(dir $@)
+	@rm -f $(dir $@).rosetta-4k-*
+	@touch $@
+$(CORE) $(HOST) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/vm.o $(B)/share.o $(B)/audio_mac.o $(B)/usb_host.o: $(B)/.rosetta-4k-$(ROSETTA_4K_CACHE)
+$(IOS_OBJ): $(IB)/.rosetta-4k-$(ROSETTA_4K_CACHE)
 
 $(IB)/core/mmu.o: core/mmu.c core/*.h host/*.h devices/*.h
 	@mkdir -p $(dir $@)
