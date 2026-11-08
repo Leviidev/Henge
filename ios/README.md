@@ -15,30 +15,12 @@ the packager as an environment variable (`HENGE_ENTITLEMENTS=... ios/scripts/pac
 - **JIT**: on iOS 26+ (TXM) only an attached debugger can grant executable
   memory. Henge uses the same machinery as Husk: StikDebug, TrollStore, a
   jailbreak, or the built-in StikJIT helper (`HengeJITHelper.appex`, with
-  on-device pairing on iOS 27). The app claims one 1 or 1.5 GB region per launch
+  on-device pairing on iOS 27). The app claims one 1 GB region per launch
   (`JITBootstrap.jitBytes`) and the engine writes through a `vm_remap`'d alias
   (`host/jit_region.c`, split mode).
-  Status becomes **On** only after the held region passes its execute test.
-  If another tool has enabled the debugger flag without preparing the region,
-  tap **Turn On JIT** in Henge's Settings or Install tab: Henge sends its bundled
-  script to StikDebug and waits for usable memory. Failed claims can be retried
-  in the same launch; a successful region is retained after detach.
-  `make test-ios-jit` covers the stale flag, delayed script, failed allocation,
-  retry, script register writes and detach with a simulated debugserver on the
-  Mac, executing generated code through the real allocator's RW/RX mappings.
-  It also compiles the native handoff against the iOS SDK; physical iOS/TXM
-  behavior still requires a device test.
 - **Memory**: `increased-memory-limit` is recommended, not required. Once a
   debugger has attached, guest RAM is kept out of the app's memory limit, and if
   iOS refuses that it comes from a file on free storage instead.
-- **Intel applications (experimental, very slow)**: use **Settings → Applications
-  → Rosetta (Intel apps)**, then quit and reopen Henge. Off loads the pristine,
-  pinned mainline engine; on loads the separate Rosetta engine. Only one framework
-  loads per launch. Install Rosetta inside macOS. The Rosetta engine enables
-  software TSO, Apple arithmetic flags and alternate floating-point controls.
-  Hosts without FEAT_AFP cannot enable it. Device feedback confirms that Bean
-  3.3.4 (Intel 64-bit) opens and is usable, with very slow performance.
-  [Implementation and limits](../docs/rosetta-experiment.md).
 - **Machines** are installed on the iPhone from Apple's restore image
   (`Installer.swift`, [docs/architecture.md](../docs/architecture.md)). A machine
   can also be exported from the app, or made on a Mac with

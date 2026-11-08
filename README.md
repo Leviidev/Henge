@@ -52,14 +52,6 @@ Then a Henge folder in the Mac's home folder is the same folder as Files › Hen
 
 ## Known limits
 
-**Rosetta support is experimental, and Intel applications run very slowly.**
-Enable it in **Settings → Applications → Rosetta (Intel apps)**, then quit and
-reopen Henge and install Apple's Rosetta inside macOS. Off uses the pinned
-mainline engine; on uses the separate Rosetta engine. Device feedback confirms
-that Bean 3.3.4 (Intel 64-bit) opens and is usable, with very slow performance.
-The feature requires host FEAT_AFP and does not establish compatibility with
-other Intel applications. See [Rosetta support](docs/rosetta-experiment.md).
-
 - Signing in to an Apple Account inside macOS fails with a verification error.
 - Graphics are tested on macOS's own apps, Chrome, Firefox, VS Code and Discord. Other apps may draw wrongly.
 - For the first few minutes after you log in, macOS is busy starting up in the background, so apps open more slowly.
@@ -90,7 +82,8 @@ On a Mac with Xcode 27 or later and `xcodegen`. Henge takes StikJIT, on-device p
 
 ```bash
 ios/scripts/fetch_deps.sh
-python3 tools/build_ios_engines.py
+tools/build_ios_restore.sh
+make ios-lib
 ios/scripts/package_ipa.sh
 ```
 
