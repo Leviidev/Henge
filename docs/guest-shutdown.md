@@ -105,5 +105,6 @@ Base: upstream `ba9392e7ce13c6e80f2a635cf4a10336f27c0964`.
   texture implementation rejected the production renderer's storage mode.
   The device package retains normal graphics. These tests validate real guest
   power requests and the production session's repeated-boot UI, while the
-  separate Metal test exercises completion cleanup. Physical-device graphics,
-  JIT setup and the new package still need the user's device test.
+  separate Metal test exercises completion cleanup.
+- The user subsequently verified normal guest shutdown and restart on iPhone
+  Duo running with iOS 27.3 Beta 1.
