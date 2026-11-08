@@ -59,52 +59,15 @@ are bounded, with cleanup to release threads even when the regression fails.
 
 `make test-vm-lifecycle` additionally needs the app's libslirp development
 dependencies. It links the production native bridge and engine, supplies a
-test JIT mapping, and uses a tiny synthetic ROM. It covers 12 alternating guest
-shutdown, guest reset and host stop cycles, three failed boots, concurrent UI
-reads, retained JIT memory, and returned file/thread counts. It needs no Apple
-ROM or guest disk. The test was run with the iOS Simulator dependency build.
+test JIT mapping, and uses a tiny synthetic ROM. It covers guest shutdown,
+restart, host stop, failed-boot recovery and concurrent UI reads. It needs no
+Apple ROM or guest disk.
 
 `make build/test_pvg_lifecycle` builds a Metal lifecycle test for Apple Silicon.
-Run `build/test_pvg_lifecycle` to queue 384 command completions over six renderer
-creations and destructions, checking that teardown drains the callbacks before
-freeing the board. These empty commands do not test guest image rendering.
+Run `build/test_pvg_lifecycle` to check that teardown drains pending GPU work
+before freeing the board. This test does not cover guest image rendering.
 
-## Validation on 2026-11-08
+## Validation
 
-Base: upstream `ba9392e7ce13c6e80f2a635cf4a10336f27c0964`.
-
-- Before the fix, the four parked-CPU power-request cases produced eight
-  failures: parked threads remained asleep. After the fix, all shutdown tests
-  passed on macOS and iOS Simulator.
-- Exception tests: 52 checks passed on macOS and iOS Simulator. Device tests:
-  97 checks passed on macOS. JIT tests (10 programs, two seeds), memory tests
-  (12 cases in three modes plus MMIO) and MMU tests (72 checks) also passed.
-  The complete Swift app and both renderer targets compiled, and the existing
-  display checks passed.
-- The native lifecycle test completed all 12 power cycles and three failed
-  boots with zero failures in iOS Simulator, including concurrent UI readers.
-  The Metal lifecycle test completed all six cycles on the Mac's M3 Max GPU.
-- A separate iOS Simulator harness linked the production engine, native
-  bridge, `BootDisplay` and `StoppedMacView`. A real macOS 15.6.1 (24G90) guest
-  with four software CPUs and 6 GB RAM completed three boots in one app
-  process: shutdown, restart request, then shutdown. All used the same JIT
-  address; each stopped with zero active guest CPUs and 11 file descriptors.
-- A second harness used the production **SessionView** and its normal boot
-  preparation. An XCTest UI test completed four real guest boots in process
-  16315 with the same JIT address, 4507533312: guest shutdown, tap **Start
-  Mac**, guest-requested restart with automatic next boot, another shutdown,
-  then **Close** and **Open Mac** followed by a final shutdown. The UI test
-  passed with zero failures. Its saved screenshot shows "Mac shut down",
-  **Start Mac** and **Close**, with the old guest frame removed. At the final
-  stopped state, active guest CPUs were zero and file descriptors were 11.
-- Test adapters replace the physical device's debugger handoff and use a
-  shorter Unix socket path for file sharing inside the simulator. The latter
-  avoids the simulator container path exceeding the socket address limit;
-  production file-sharing paths were not changed.
-- Simulator guest Metal rendering was disabled because its buffer-backed
-  texture implementation rejected the production renderer's storage mode.
-  The device package retains normal graphics. These tests validate real guest
-  power requests and the production session's repeated-boot UI, while the
-  separate Metal test exercises completion cleanup.
-- The user subsequently verified normal guest shutdown and restart on iPhone
-  Duo running with iOS 27.3 Beta 1.
+Tested: On iPhone Duo running with iOS 27.3 Beta 1, the guest now shuts down and
+restarts normally from inside macOS.
