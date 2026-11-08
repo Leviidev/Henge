@@ -20,13 +20,22 @@
 
 HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
 
-static volatile int state;
-static volatile int exit_reason;
+static _Atomic int state;
+static int exit_reason, exit_outcome;
 
 static void on_exit(int reason) {
     exit_reason = reason;
+    int halt = hv_vm_cpu(0)->halted;
+    exit_outcome = HENGE_VM_OUTCOME_ERROR;
+    if (reason == HV_EXIT_HALT) switch (halt) {
+    case HV_HALT_SHUTDOWN: exit_outcome = HENGE_VM_OUTCOME_SHUTDOWN; break;
+    case HV_HALT_RESET: exit_outcome = HENGE_VM_OUTCOME_RESTART; break;
+    case HV_HALT_HOST: exit_outcome = HENGE_VM_OUTCOME_HOST_STOP; break;
+    case HV_HALT_PANIC: exit_outcome = HENGE_VM_OUTCOME_PANIC; break;
+    }
     state = 2;
-    fprintf(stderr, "henge: the machine stopped (%s)\n", hv_vm_reason_name(reason));
+    fprintf(stderr, "henge: the machine stopped (%s, halt reason %d); CPU threads ended, disks flushed\n",
+            henge_vm_exit_reason(), halt);
 }
 
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
@@ -108,7 +117,17 @@ int henge_make_aux(const char *path) {
 }
 
 int henge_vm_state(void) { return state; }
-const char *henge_vm_exit_reason(void) { return hv_vm_reason_name(exit_reason); }
+int henge_vm_exit_outcome(void) { return state == 2 ? exit_outcome : HENGE_VM_OUTCOME_ERROR; }
+const char *henge_vm_exit_reason(void) {
+    if (state != 2) return "running";
+    switch (exit_outcome) {
+    case HENGE_VM_OUTCOME_SHUTDOWN: return "guest shut down";
+    case HENGE_VM_OUTCOME_RESTART: return "guest requested a restart";
+    case HENGE_VM_OUTCOME_HOST_STOP: return "stopped by host";
+    case HENGE_VM_OUTCOME_PANIC: return "guest panic";
+    default: return hv_vm_reason_name(exit_reason);
+    }
+}
 void henge_vm_stop(void) { if (state == 1) hv_vm_stop(); }
 
 /* Testing (Autopilot.swift): a translation knob, as "knob NAME VALUE" in the Mac tool's input file. */
@@ -118,10 +137,11 @@ uint64_t henge_vm_blocks(void) { return state ? hv_vm_machine()->stats.blocks : 
 uint64_t henge_vm_net_frames(int sent) { return sent ? hv_net_tx_frames : hv_net_rx_frames; }
 
 int henge_vm_cpus_on(void) {
+    if (state != 1) return 0;
     int n = 0;
     for (int i = 0; i < hv_vm_ncpus(); i++)
-        if (!hv_vm_cpu(i)->off) n++;
-    return state ? n : 0;
+        if (!hv_vm_cpu(i)->off && !hv_vm_cpu(i)->halted) n++;
+    return n;
 }
 
 int henge_vm_guest_el0(void) {

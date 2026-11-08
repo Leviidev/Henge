@@ -2,6 +2,7 @@
 
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -279,6 +280,22 @@ void hv_machine_kick_all(HvMachine *m) {
     for (int i = 0; i < m->ncpus; i++)
         if (m->cpus[i]) __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_SEQ_CST);
     __asm__ volatile("sev" ::: "memory");
+}
+
+void hv_machine_halt(HvMachine *m, enum HvHaltReason reason) {
+    for (int i = 0; i < m->ncpus; i++) if (m->cpus[i]) {
+        /* CPU_ON resets a parked CPU under this lock. It must not erase a
+           terminal halt while another CPU is shutting the machine down. */
+        HvPerCpu *p = m->cpus[i]->pc_state;
+        pthread_mutex_lock(&p->wake_mu);
+        int running = HV_HALT_NONE;
+        atomic_compare_exchange_strong(&m->cpus[i]->halted, &running, reason);
+        pthread_mutex_unlock(&p->wake_mu);
+    }
+    /* CPU_OFF sleeps on wake_cv without a timeout. exit_req/SEV alone only
+       interrupts translated code and cannot release that condition wait. */
+    for (int i = 0; i < m->ncpus; i++)
+        if (m->cpus[i]) hv_cpu_wake(m->cpus[i]);
 }
 
 /* Device work is for CPU 0, which polls the devices. */

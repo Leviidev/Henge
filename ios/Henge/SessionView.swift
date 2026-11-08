@@ -59,7 +59,7 @@ struct SessionView: View {
                 BootDisplay(display: display, role: .device)
                     .opacity(display.isExternal ? 0 : 1)
                     .overlay {
-                        if display.isExternal {
+                        if display.isExternal && state != 2 {
                             VStack(spacing: 8) {
                                 Image(systemName: "display").font(.largeTitle)
                                 Text("Mac on external display").font(.headline)
@@ -80,45 +80,52 @@ struct SessionView: View {
                         }
                     }
                     .position(x: layout.screen.midX, y: layout.screen.midY)
-                Trackpad()
-                    .frame(width: layout.touch.width, height: layout.touch.height)
-                    .position(x: layout.touch.midX, y: layout.touch.midY)
-                if !layout.fillsPhone {
-                    uprightControls(layout)
-                } else {
-                    floatingControls(layout)
+                if state != 2 {
+                    Trackpad()
+                        .frame(width: layout.touch.width, height: layout.touch.height)
+                        .position(x: layout.touch.midX, y: layout.touch.midY)
+                    if !layout.fillsPhone {
+                        uprightControls(layout)
+                    } else {
+                        floatingControls(layout)
+                    }
+                    if pointerRefused && !showRevealHint {
+                        Label("Make Henge full screen to use the trackpad or mouse as the Mac's", systemImage: "cursorarrow.rays")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 18).padding(.vertical, 12)
+                            .deskGlass(in: Capsule())
+                            .position(x: full.width / 2, y: insets.top + 40)
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                    }
+                    if showRevealHint {
+                        Label("Tap with three fingers to show the controls", systemImage: "hand.tap")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 18).padding(.vertical, 12)
+                            .deskGlass(in: Capsule())
+                            .position(x: full.width / 2, y: insets.top + 40)
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                    }
+                    if showWallpaperTip && !showRevealHint && !pointerRefused {
+                        Label("For more speed, give this Mac a still wallpaper and set its screen saver to Never in System Settings.", systemImage: "speedometer")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: min(full.width - 40, 520))
+                            .padding(.horizontal, 18).padding(.vertical, 12)
+                            .deskGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                            .position(x: full.width / 2, y: insets.top + 56)
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                    }
                 }
-                if pointerRefused && !showRevealHint {
-                    Label("Make Henge full screen to use the trackpad or mouse as the Mac's", systemImage: "cursorarrow.rays")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 18).padding(.vertical, 12)
-                        .deskGlass(in: Capsule())
-                        .position(x: full.width / 2, y: insets.top + 40)
-                        .transition(.opacity)
-                        .allowsHitTesting(false)
-                }
-                if showRevealHint {
-                    Label("Tap with three fingers to show the controls", systemImage: "hand.tap")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 18).padding(.vertical, 12)
-                        .deskGlass(in: Capsule())
-                        .position(x: full.width / 2, y: insets.top + 40)
-                        .transition(.opacity)
-                        .allowsHitTesting(false)
-                }
-                if showWallpaperTip && !showRevealHint && !pointerRefused {
-                    Label("For more speed, give this Mac a still wallpaper and set its screen saver to Never in System Settings.", systemImage: "speedometer")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: min(full.width - 40, 520))
-                        .padding(.horizontal, 18).padding(.vertical, 12)
-                        .deskGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-                        .position(x: full.width / 2, y: insets.top + 56)
-                        .transition(.opacity)
-                        .allowsHitTesting(false)
+                if state == 2 {
+                    StoppedMacView(outcome: henge_vm_exit_outcome(), reason: String(cString: henge_vm_exit_reason()), close: close)
+                        .frame(width: min(layout.touch.width - 32, 360))
+                        .position(x: layout.touch.midX, y: layout.fillsPhone ? layout.touch.midY : layout.pad.midY)
                 }
                 if let error { errorCard(error, layout) }
                 KeyboardCatcher(active: $typing).frame(width: 0, height: 0)
@@ -188,7 +195,7 @@ struct SessionView: View {
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
-    private var pointerNeeded: Bool { showDetails || confirmStop || error != nil }
+    private var pointerNeeded: Bool { state == 2 || showDetails || confirmStop || error != nil }
 
     // MARK: Layout
 
@@ -573,7 +580,18 @@ struct SessionView: View {
                 thermalState = heat
                 HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
             }
-            if state == 2 { break }
+            if state == 2 {
+                typing = false
+                showDetails = false
+                confirmStop = false
+                zoomFollowing?.cancel()
+                StickyKeys.shared.releaseAll()
+                HardwareKeys.releaseAll()
+                HardwareMouse.shared.stop()
+                UIApplication.shared.isIdleTimerDisabled = false
+                HengeLog.log("session", "showing stopped Mac: \(String(cString: henge_vm_exit_reason()))")
+                break
+            }
             tick += 1
             if tick % 10 == 0 {
                 let gpuFrames = henge_vm_gpu_frames()

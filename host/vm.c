@@ -34,6 +34,9 @@ static HvDisk disk, aux;
 static int net_on;
 static void (*extra_poll)(void);
 static void (*exit_cb)(int);
+static pthread_t secondary_threads[HV_MAX_CPUS], kicker;
+static int secondary_started[HV_MAX_CPUS], kicker_started;
+static _Atomic int kicker_stopped;
 
 HvMachine *hv_vm_machine(void) { return &m; }
 HvVmapple *hv_vm_board(void) { return &board; }
@@ -271,7 +274,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
 
 static void *kicker_thread(void *unused) {
     (void)unused;
-    for (;;) {
+    while (!atomic_load(&kicker_stopped)) {
         usleep(1000);
         hv_machine_kick_all(&m);
     }
@@ -335,6 +338,13 @@ static void *cpu0_thread(void *unused) {
     (void)unused;
     hv_vm_cpu_qos();
     int r = hv_vm_run_cpu0();
+    /* Finish CPU activity before flushing or telling the UI the Mac stopped.
+       CPU 0 can also leave for a fatal execution error. */
+    hv_machine_halt(&m, HV_HALT_HOST);
+    atomic_store(&kicker_stopped, 1);
+    for (int i = 1; i < ncpus; i++)
+        if (secondary_started[i]) pthread_join(secondary_threads[i], NULL);
+    if (kicker_started) pthread_join(kicker, NULL);
     hv_vm_flush_disks();
     if (exit_cb) exit_cb(r);
     return NULL;
@@ -345,16 +355,18 @@ void hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
+    atomic_store(&kicker_stopped, 0);
+    /* Publish all join handles before CPU 0 can reach its exit callback. */
+    for (int i = 1; i < ncpus; i++)
+        secondary_started[i] = pthread_create(&secondary_threads[i], &attr, secondary_thread, &cpus[i]) == 0;
+    kicker_started = pthread_create(&kicker, NULL, kicker_thread, NULL) == 0;
     pthread_t t;
-    if (cpu0) pthread_create(&t, &attr, cpu0_thread, NULL);
-    for (int i = 1; i < ncpus; i++) pthread_create(&t, &attr, secondary_thread, &cpus[i]);
-    pthread_create(&t, NULL, kicker_thread, NULL);
+    if (cpu0 && pthread_create(&t, &attr, cpu0_thread, NULL) == 0) pthread_detach(t);
+    pthread_attr_destroy(&attr);
 }
 
 void hv_vm_stop(void) {
-    for (int i = 0; i < ncpus; i++) cpus[i].halted = 3; /* the dispatchers stop at the next block */
-    hv_machine_kick_all(&m);
-    for (int i = 0; i < ncpus; i++) hv_cpu_wake(&cpus[i]);
+    hv_machine_halt(&m, HV_HALT_HOST);
 }
 
 void hv_vm_key(uint16_t code, int down) {
