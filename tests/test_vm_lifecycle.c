@@ -42,6 +42,17 @@ static unsigned threads(void) {
     vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof *list);
     return n;
 }
+static unsigned dead_ports(void) {
+    mach_port_name_array_t names;
+    mach_port_type_array_t types;
+    mach_msg_type_number_t n, nt;
+    if (mach_port_names(mach_task_self(), &names, &n, &types, &nt) != KERN_SUCCESS) exit(1);
+    unsigned dead = 0;
+    for (unsigned i = 0; i < nt; i++) if (types[i] & MACH_PORT_TYPE_DEAD_NAME) dead++;
+    vm_deallocate(mach_task_self(), (vm_address_t)names, n * sizeof *names);
+    vm_deallocate(mach_task_self(), (vm_address_t)types, nt * sizeof *types);
+    return dead;
+}
 static void write_file(const char *path, const void *data, size_t bytes) {
     int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
     if (fd < 0 || (data && write(fd, data, bytes) != (ssize_t)bytes) || ftruncate(fd, bytes)) exit(1);
@@ -86,6 +97,7 @@ int main(void) {
     usleep(100000);
     int initial_fds = fds();
     unsigned initial_threads = threads();
+    unsigned initial_dead_ports = dead_ports();
     /* Missing ROM fails after disks, RAM and device workers were created. */
     for (int i = 0; i < 3; i++) {
         check("failed boot reports an error", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
@@ -124,6 +136,7 @@ int main(void) {
         /* The last CPU thread can still be returning from its callback. */
         for (int n = 0; n < 1000 && threads() > initial_threads; n++) usleep(1000);
         check("no CPU, disk or network worker leak", threads() == initial_threads);
+        check("no leaked CPU thread ports", dead_ports() == initial_dead_ports);
     }
     hv_vm_destroy();
     atomic_store(&reader_done, 1);

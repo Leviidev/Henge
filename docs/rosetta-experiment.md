@@ -23,8 +23,8 @@ Hosts without `hw.optional.arm.FEAT_AFP` cannot enable Rosetta in this version.
 ## Isolation and maintenance
 
 The mainline pin is
-[`8805af960882521790ff0ff89dac98c5124f67d9`](https://github.com/liukaixiang817/Henge/commit/8805af960882521790ff0ff89dac98c5124f67d9).
-It contains upstream `17e9ed9` plus the guest shutdown, restart and resource
+[`6aefa0351297e81e1b16e67dcb3e65d6a435f105`](https://github.com/liukaixiang817/Henge/commit/6aefa0351297e81e1b16e67dcb3e65d6a435f105).
+It contains upstream `a47f5e1` plus the guest shutdown, restart and resource
 cleanup from [PR #50](https://github.com/Leviidev/Henge/pull/50). Both engines
 use that exact lifecycle bridge, including JIT reuse.
 
@@ -71,8 +71,8 @@ logs `Rosetta 4 KB software translation cache enabled`.
 
 This is an experimental performance change, not a measured Intel-app speedup.
 It retains the entry count, reducing cache coverage from 256 MB to 64 MB per
-table. Per-physical-page code metadata grows by four times (about 19.25 MiB versus
-4.81 MiB of virtual allocation per GiB of guest RAM; only touched host pages
+table. Per-physical-page code metadata grows by four times (about 20.25 MiB versus
+5.06 MiB of virtual allocation per GiB of guest RAM; only touched host pages
 become resident). Shared single-address invalidations use the receiving CPU's
 page size and may need more synchronization. Native workloads within this engine
 can therefore have different memory and performance costs.

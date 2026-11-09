@@ -39,6 +39,7 @@ void hv_flush_blocks(HvMachine *m) {
     m->nblocks = 0;
     m->nslots = 0;
     m->nxchained = 0;
+    for (int i = 0; i < m->nram; i++) memset(m->ram[i].xhead, 0, m->ram[i].npages * sizeof *m->ram[i].xhead); /* slots restart from 0 */
     hv_jit_reset(&m->jit);
     /* The MB knob may reset its own limit; retain the sub-MB capacity used by
        the small-cache regression when no knob overrides it. */
@@ -671,6 +672,15 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  new code pages %.0f/s; waits: tlbi acks %.0f/s %.1f%%, device lock %.0f/s %.1f%%, translation lock %.0f/s %.1f%% (of one CPU)\n",
                 RATE(code_protects), RATE(syncs), RATE(sync_ticks) / 240000.0, RATE(dev_waits), RATE(dev_wait_ticks) / 240000.0,
                 RATE(tr_waits), RATE(tr_wait_ticks) / 240000.0);
+        {
+            double l = RATE(syncs) + 1e-9;
+            fprintf(stderr, "  tlbi ack waits by length/s: <10us %.0f (%.1f%%), <100us %.0f (%.1f%%), <1ms %.0f (%.1f%%), longer %.0f (%.1f%%); "
+                            "at 100 us the CPU waited for was: off a core %.0f, on one %.0f (mid walk %.0f, mid cache fill %.0f)\n",
+                    RATE(sync_len[0]), RATE(sync_len_ticks[0]) / 240000.0, RATE(sync_len[1]), RATE(sync_len_ticks[1]) / 240000.0,
+                    RATE(sync_len[2]), RATE(sync_len_ticks[2]) / 240000.0, RATE(sync_len[3]), RATE(sync_len_ticks[3]) / 240000.0,
+                    RATE(sync_probe[0]), RATE(sync_probe[1]), RATE(sync_probe[2]), RATE(sync_probe[3]));
+            (void)l;
+        }
         fprintf(stderr, "  light lookups failed/s: odd %.0f, filters full %.0f, no mapping %.0f, no block yet %.0f; walked %.0fK/s\n",
                 RATE(light_fail[0]), RATE(light_fail[1]), RATE(light_fail[2]), RATE(light_fail[3]), RATE(light_walks) / 1e3);
         fprintf(stderr, "  big user-range TLBIs/s: %.0f TLB only in the range, %.0f with no cached targets to drop; big kernel ranges %.0f\n",
@@ -777,14 +787,16 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             return;
         }
         m->slot_xpa[idx] = page_pa | 1;
-        m->xchained[m->nxchained++] = idx;
+        m->slot_xnext[idx] = b->ram->xhead[b->pg]; /* on the target page's list (hv_invalidate_code) */
+        b->ram->xhead[b->pg] = idx + 1;
+        m->nxchained++;
         __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
         uint32_t *site = m->slot_site[idx];
         int64_t off = site ? b->code - site : 0;
         if (site && off >= -(1 << 25) && off < (1 << 25)) {
             uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
             hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
+            hv_jit_finish_branch(&m->jit, site); /* B to B; the stub follows the slot meanwhile */
         }
         m->stats.chained++;
         if (m->stats_interval) m->stats.xchained++;
@@ -798,7 +810,7 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     if (site && off >= -(1 << 25) && off < (1 << 25)) {
         uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
         hv_jit_write(&m->jit, site, &insn, 4);
-        hv_jit_finish(&m->jit, site, 1);
+        hv_jit_finish_branch(&m->jit, site); /* B to B; the stub follows the slot meanwhile */
     }
     uint32_t *cond = m->slot_cond[idx];
     if (cond) { /* the conditional branch to that stub, too */
@@ -876,6 +888,7 @@ static void stop_the_world(HvCpu *cpu) {
 }
 
 int hv_run(HvCpu *cpu) {
+    if (cpu->pc_state) cpu->pc_state->thread = mach_thread_self();
     hv_big_lock(cpu->m);
     hv_rosetta_fp_apply(cpu);
     hv_fp_enter(cpu);

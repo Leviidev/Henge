@@ -221,7 +221,14 @@ final class JITCoordinator: ObservableObject {
     }
 
     func enable() {
-        guard !busy, !JITBootstrap.ready else { return }
+        guard !JITBootstrap.ready else { return }
+        // Turn On JIT while JIT is already being turned on (at launch, by itself) started a second helper, which attached
+        // once the first let go and then stayed: with a debugger on, every trap stops Henge until it answers, and the
+        // phone ran process spawns 2x and a shell loop 1.5x slower (2026-11-09).
+        guard !busy else {
+            log("Turn On JIT: JIT is being turned on already; nothing more to do")
+            return
+        }
         error = nil
         JITBootstrap.lastFailure = nil
         connectionProblem = nil
@@ -376,6 +383,7 @@ final class JITCoordinator: ObservableObject {
         }
 
         busy = true
+        JITBootstrap.helperMayBeAttached = true
         error = nil
         JITBootstrap.lastFailure = nil
         connectionProblem = nil
