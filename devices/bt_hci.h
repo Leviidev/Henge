@@ -37,6 +37,16 @@
 #define HV_BT_MAX_PACKET 1056
 #define HV_BT_QUEUE 64
 
+/* LE extended advertising model: the number of advertising sets
+   this core tracks concurrently (the capacity LE Read Number of
+   Supported Advertising Sets 0x203B reports) and the maximum total
+   advertising / scan-response / periodic data length a set can hold,
+   assembled across fragments (the value LE Read Maximum Advertising
+   Data Length 0x203A reports; the guest daemon's own cap, proven in
+   the advertising enumeration). */
+#define HV_BT_MAX_ADV_SETS 8
+#define HV_BT_MAX_ADV_DATA_LEN 1650
+
 typedef enum HvBtPersonality {
     HV_BT_PERS_CSR = 0,
     HV_BT_PERS_BCM20702 = 1,
@@ -70,6 +80,49 @@ typedef struct HvBtPacket {
    delivered here (CoreBluetooth bridge on device, mock in the harness). */
 typedef void (*HvBtAclSink)(void *ctx, const uint8_t *pkt, uint32_t len);
 
+/* One LE advertising set, keyed by its host-chosen handle. All state
+   is written only by the extended/periodic advertising setters and
+   read back only through the shaped completions that carry return
+   bytes (0x2036 Selected_TX_Power, 0x203A, 0x203B); no event of any
+   kind is ever synthesized from this state. */
+typedef struct HvBtAdvSet {
+    int in_use;
+    uint8_t handle;
+    /* LE Set Extended Advertising Parameters (0x2036), verbatim. */
+    int params_set;
+    uint8_t params[25];
+    uint16_t properties;
+    uint32_t interval_min, interval_max;
+    uint8_t channel_map, sid, primary_phy, secondary_phy;
+    int8_t tx_power_request, tx_power_selected;
+    /* LE Set Advertising Set Random Address (0x2035). */
+    int random_addr_set;
+    uint8_t random_addr[6];
+    /* Advertising data / scan response data (0x2037 / 0x2038),
+       assembled across fragments; frag_assembling is 1 between a
+       First fragment and its Last/Complete terminator. */
+    uint8_t adv_data[HV_BT_MAX_ADV_DATA_LEN];
+    uint16_t adv_data_len;
+    int adv_assembling;
+    uint8_t adv_frag_pref;
+    uint8_t scan_rsp_data[HV_BT_MAX_ADV_DATA_LEN];
+    uint16_t scan_rsp_len;
+    int scan_assembling;
+    uint8_t scan_frag_pref;
+    /* LE Set Extended Advertising Enable (0x2039), per set. */
+    int enabled;
+    uint16_t enable_duration; /* units of 10 ms; 0 = no limit */
+    uint8_t enable_max_events; /* 0 = no limit */
+    /* Periodic advertising (0x203E / 0x203F / 0x2040). */
+    int per_params_set;
+    uint8_t per_params[7];
+    uint16_t per_interval_min, per_interval_max, per_properties;
+    uint8_t per_data[HV_BT_MAX_ADV_DATA_LEN];
+    uint16_t per_data_len;
+    int per_assembling;
+    int per_enabled;
+} HvBtAdvSet;
+
 typedef struct HvBtHci {
     HvBtPacket events[HV_BT_QUEUE];
     uint32_t ev_head, ev_tail;
@@ -101,6 +154,13 @@ typedef struct HvBtHci {
     uint8_t le_random_addr[6]; /* LE Set Random Address (0x2005) stored address */
     HvBtAclSink acl_sink;
     void *acl_sink_ctx;
+    /* LE extended advertising sets (model above). Zeroed at init
+       and by HCI Reset, like the rest of the controller state this
+       core tracks. Deliberately LAST in the struct: every field above
+       keeps its offset, so the extended postinit harness can be
+       relinked against a core without this field under this header and
+       the layout still matches (the harness reproduction discipline). */
+    HvBtAdvSet adv_sets[HV_BT_MAX_ADV_SETS];
 } HvBtHci;
 
 void hv_bt_init(HvBtHci *bt);

@@ -1,5 +1,6 @@
 /* Certification test: FULL POST-INIT alignment + the scan
- * residuals (disco state sync + LE extended scan).
+ * residuals (disco state sync + LE extended scan) + the LE
+ * EXTENDED ADVERTISING family modeled per-set.
  *
  * An earlier version of this harness certified the name + EIR steps of the
  * Server.Core post-init chain; a guest boot then died one step later, inside the
@@ -68,6 +69,41 @@
  * le_scan_enabled never moves, which the two state assertions
  * capture: the gate refusal and the missing state are guest-visible
  * arithmetic, which is what these checks capture.
+ * Extended advertising: the whole setter/reader family is
+ * replayed at real plen through the real TRB path against the core's
+ * tracked per-set model: LE Read Maximum Advertising Data Length
+ * 0x203A (status + uint16 1650, the shape callback 0x100227ec4
+ * consumes by value), LE Read Number of Supported Advertising Sets
+ * 0x203B (status + the 1-byte capacity), LE Set Extended Advertising
+ * Parameters 0x2036 (fixed plen 25; completion status + the 1
+ * Selected_TX_Power byte callback 0x10022a2e4 appends as AD type
+ * 0x0A; 0x7F request selects 0 dBm, a concrete request is selected
+ * verbatim), LE Set Advertising Set Random Address 0x2035 (plen 7),
+ * advertising data (0x2037) and scan response data (0x2038) stored
+ * verbatim per set with fragment assembly (First / Intermediate /
+ * Last / Complete) across three wire commands, LE Set Extended
+ * Advertising Enable 0x2039 (per-set entries and the Number_of_Sets
+ * 0 all-sets form, duration / max-events stored), LE Remove
+ * Advertising Set 0x203C and LE Clear Advertising Sets 0x203D
+ * lifecycle (a removed set rejects further data with the spec error
+ * 0x42), the periodic trio 0x203E (plen 7) / 0x203F (fragmented
+ * data shape without the fragment-preference byte) / 0x2040
+ * (plen 2), the capacity error (9th distinct set -> 0x07), and HCI
+ * Reset clearing the model. Octet 36 -> 0xFE and octet 37 -> 0x7F
+ * are deliberate claim changes vs the scan-fix state, annotated here;
+ * octet 36 bit 0x01 (LE Transmitter Test v2
+ * 0x2034, an RF test mode) and octet 37 bit 0x80 (LE Extended
+ * Create Connection 0x2043) stay CLEAR by named disposition.
+ *
+ * On the pre-advertising code this harness fails with exactly the advertising defect
+ * signature: whole-octet 36 reads 0x00 not 0xFE, octet 37 reads
+ * 0x60 not 0x7F, the twelve family pass-gates read clear, the
+ * 0x203A / 0x203B / 0x2036 drives return the unshaped 6-byte
+ * default Command Complete instead of 8 / 7 / 7, every adv_sets
+ * state assertion reads zero (no model exists), the error-path
+ * drives return status 0 where 0x42 / 0x07 are expected, and
+ * le_advertising_enabled never moves on 0x2039. No check outside
+ * the advertising surface moves.
  * Build (per tree): clang -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost
  *   -Idevices tests/test_bt_hci_postinit.c <ENGINE+DEV objects except
  *   xhci.o> <METAL_LIBS> -o test_bt_hci_postinit  (the xhci-suite build pattern).
@@ -192,6 +228,36 @@ static uint32_t drive(const char *name, const uint8_t *cmd, uint32_t len,
     return n;
 }
 
+static uint32_t drive_st(const char *name, const uint8_t *cmd, uint32_t len,
+                         uint16_t opcode, long want_status) {
+    char lbl[96];
+    send21(x, cmd, len);
+    snprintf(lbl, sizeof lbl, "core saw %s", name);
+    check(lbl, (long)x->bt.commands_seen, ++seen);
+    memset(ev, 0, sizeof ev);
+    uint32_t n = poll_event(x, ev, sizeof ev);
+    snprintf(lbl, sizeof lbl, "%s CC len", name);
+    check(lbl, (long)n, 6);
+    snprintf(lbl, sizeof lbl, "%s CC opcode echo", name);
+    check(lbl, ev[3] | ev[4] << 8, opcode);
+    snprintf(lbl, sizeof lbl, "%s CC status", name);
+    check(lbl, ev[5], want_status);
+    return n;
+}
+
+static HvBtAdvSet *adv_get(int handle) {
+    for (int i = 0; i < HV_BT_MAX_ADV_SETS; i++)
+        if (x->bt.adv_sets[i].in_use && x->bt.adv_sets[i].handle == handle)
+            return &x->bt.adv_sets[i];
+    return NULL;
+}
+static long adv_count(void) {
+    long n = 0;
+    for (int i = 0; i < HV_BT_MAX_ADV_SETS; i++)
+        if (x->bt.adv_sets[i].in_use) n++;
+    return n;
+}
+
 int main(void) {
     setenv("HV_BT_PERSONALITY", "bcm20702", 1);
     if (hv_machine_init(&m, 4 << 20) != 0) return 2;
@@ -221,7 +287,8 @@ int main(void) {
     check("mask octet 0 = 0x23 (Inquiry + Inquiry Cancel + Disconnect claimed)", mask[0], 0x23);
     check("mask octet 7 = 0xC3 (name pair + Write Scan Enable + Read Scan Enable)", mask[7], 0xc3);
     check("mask octet 11 = 0x10 (Write Current IAC LAP claimed, disco policy head)", mask[11], 0x10);
-    check("mask octet 37 = 0x60 (LE Set Extended Scan Parameters + Enable claimed, Option A)", mask[37], 0x60);
+    check("mask octet 37 = 0x7F (scan pair + periodic/remove/clear family claimed)", mask[37], 0x7f);
+    check("mask octet 36 = 0xFE (extended advertising family claimed, 0x2034 test mode clear)", mask[36], 0xfe);
     check("mask octet 9 = 0x02 (Write Class of Device claimed, fix)", mask[9], 0x02);
     check("mask octet 17 = 0x42 (Write EIR claimed over the prior 0x40)", mask[17], 0x42);
 
@@ -240,6 +307,18 @@ int main(void) {
         {"0x2042 LE Set Extended Scan Enable (claim, Option A)", 37, 0x40},
         {"0x0401 Inquiry (long claimed, real case)", 0, 0x01},
         {"0x0402 Inquiry Cancel (claim, discovery state machine)", 0, 0x02},
+        {"0x2035 LE Set Advertising Set Random Address (claim)", 36, 0x02},
+        {"0x2036 LE Set Extended Advertising Parameters (claim, shaped return)", 36, 0x04},
+        {"0x2037 LE Set Extended Advertising Data (claim)", 36, 0x08},
+        {"0x2038 LE Set Extended Advertising Scan Response Data (claim)", 36, 0x10},
+        {"0x2039 LE Set Extended Advertising Enable (claim)", 36, 0x20},
+        {"0x203A LE Read Maximum Advertising Data Length (claim, shaped return)", 36, 0x40},
+        {"0x203B LE Read Number of Supported Advertising Sets (claim, shaped return)", 36, 0x80},
+        {"0x203C LE Remove Advertising Set (claim)", 37, 0x01},
+        {"0x203D LE Clear Advertising Sets (claim)", 37, 0x02},
+        {"0x203E LE Set Periodic Advertising Parameters (claim)", 37, 0x04},
+        {"0x203F LE Set Periodic Advertising Data (claim)", 37, 0x08},
+        {"0x2040 LE Set Periodic Advertising Enable (claim)", 37, 0x10},
     };
     for (size_t i = 0; i < sizeof pass_gates / sizeof pass_gates[0]; i++) {
         char lbl[96];
@@ -269,6 +348,8 @@ int main(void) {
         {"0x0C49 Write AFH Channel Assessment Mode (tolerated)", 13, 0x08},
         {"0x080D link-settings write (event-driven, log-only failure)", 5, 0x04},
         {"0x0C37 Write Link Supervision Timeout setter (log-only failure)", 11, 0x02},
+        {"0x2034 LE Transmitter Test v2 (RF test mode, not advertising; disposition)", 36, 0x01},
+        {"0x2043 LE Extended Create Connection (initiating, would fabricate a peer; disposition)", 37, 0x80},
     };
     for (size_t i = 0; i < sizeof clear_gates / sizeof clear_gates[0]; i++) {
         char lbl[96];
@@ -399,6 +480,175 @@ int main(void) {
         check("Inquiry second event code 0x01 (Inquiry Complete)", ev[0], 0x01);
         check("Inquiry Complete status 0", ev[2], 0);
         check("no third event from Inquiry", hv_bt_event_pending(&x->bt), 0);
+    }
+
+
+    /* ---- LE extended advertising family, per-set model ---- */
+    {
+        printf("scenario: Read Maximum Advertising Data Length, plen 0, shaped uint16 return\n");
+        static const uint8_t maxlen_cmd[3] = {0x3a, 0x20, 0x00};
+        drive("LE Read Maximum Advertising Data Length", maxlen_cmd, 3, 0x203a, 8);
+        check("max advertising data length low byte 0x72 (1650)", ev[6], 0x72);
+        check("max advertising data length high byte 0x06 (1650)", ev[7], 0x06);
+
+        printf("scenario: Read Number of Supported Advertising Sets, plen 0, shaped 1-byte return\n");
+        static const uint8_t nsets_cmd[3] = {0x3b, 0x20, 0x00};
+        drive("LE Read Number of Supported Advertising Sets", nsets_cmd, 3, 0x203b, 7);
+        check("supported advertising sets byte is the model capacity 8", ev[6], 8);
+
+        printf("scenario: Set Extended Advertising Parameters, plen 25, handle 0, TX 0x7F\n");
+        static const uint8_t p36_cmd[28] = {0x36, 0x20, 25,
+            0x00,             /* handle 0 */
+            0x13, 0x00,       /* event properties */
+            0x30, 0x00, 0x00, /* interval min 0x30 */
+            0x60, 0x00, 0x00, /* interval max 0x60 */
+            0x07,             /* channel map */
+            0x00, 0x00,       /* own / peer addr type */
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, /* peer addr */
+            0x00,             /* filter policy */
+            0x7f,             /* TX power: no preference */
+            0x01, 0x00, 0x02, /* primary PHY, skip, secondary PHY */
+            0x05,             /* SID 5 */
+            0x00};            /* scan request notifications off */
+        drive("LE Set Extended Advertising Parameters (h0)", p36_cmd, 28, 0x2036, 7);
+        check("selected TX power byte is 0 dBm for the 0x7F request", ev[6], 0x00);
+        check("adv set 0 exists after params", adv_get(0) != NULL, 1);
+        check("adv set 0 SID stored", adv_get(0) ? adv_get(0)->sid : -1, 5);
+        check("adv set 0 interval min stored", adv_get(0) ? (long)adv_get(0)->interval_min : -1, 0x30);
+        check("adv set 0 interval max stored", adv_get(0) ? (long)adv_get(0)->interval_max : -1, 0x60);
+
+        printf("scenario: Set Extended Advertising Parameters, handle 1, TX -4\n");
+        uint8_t p36b_cmd[28];
+        memcpy(p36b_cmd, p36_cmd, sizeof p36b_cmd);
+        p36b_cmd[3] = 0x01;  /* handle 1 */
+        p36b_cmd[22] = 0xfc; /* TX power -4 */
+        p36b_cmd[26] = 0x06; /* SID 6 */
+        drive("LE Set Extended Advertising Parameters (h1)", p36b_cmd, 28, 0x2036, 7);
+        check("selected TX power byte echoes the concrete request -4", ev[6], 0xfc);
+
+        printf("scenario: Set Advertising Set Random Address, plen 7, handle 0\n");
+        static const uint8_t rnd_cmd[10] = {0x35, 0x20, 0x07, 0x00, 1, 2, 3, 4, 5, 6};
+        drive("LE Set Advertising Set Random Address", rnd_cmd, 10, 0x2035, 6);
+        check("adv set 0 random address marked set", adv_get(0) ? adv_get(0)->random_addr_set : -1, 1);
+        check("adv set 0 random address stored verbatim", adv_get(0) ? memcmp(adv_get(0)->random_addr, rnd_cmd + 4, 6) : -1, 0);
+
+        printf("scenario: Set Extended Advertising Data, Complete, handle 0\n");
+        static const uint8_t data_cmd[12] = {0x37, 0x20, 0x09, 0x00, 0x03, 0x01, 0x05,
+                                             'H', 'E', 'L', 'L', 'O'};
+        drive("LE Set Extended Advertising Data (complete h0)", data_cmd, 12, 0x2037, 6);
+        check("adv set 0 adv data length 5", adv_get(0) ? adv_get(0)->adv_data_len : -1, 5);
+        check("adv set 0 adv data stored verbatim", adv_get(0) ? memcmp(adv_get(0)->adv_data, "HELLO", 5) : -1, 0);
+
+        printf("scenario: Set Extended Advertising Data, fragmented, handle 1 (100 + 100 + 50)\n");
+        uint8_t frag_cmd[3 + 4 + 100];
+        frag_cmd[0] = 0x37; frag_cmd[1] = 0x20; frag_cmd[2] = 104;
+        frag_cmd[3] = 0x01; frag_cmd[4] = 0x01; frag_cmd[5] = 0x01; frag_cmd[6] = 100;
+        for (int i = 0; i < 100; i++) frag_cmd[7 + i] = (uint8_t)i;
+        drive("LE Set Extended Advertising Data (first h1)", frag_cmd, sizeof frag_cmd, 0x2037, 6);
+        frag_cmd[4] = 0x00; /* Intermediate */
+        drive("LE Set Extended Advertising Data (intermediate h1)", frag_cmd, sizeof frag_cmd, 0x2037, 6);
+        frag_cmd[2] = 54; frag_cmd[4] = 0x02; frag_cmd[6] = 50; /* Last, 50 bytes */
+        drive("LE Set Extended Advertising Data (last h1)", frag_cmd, 3 + 4 + 50, 0x2037, 6);
+        check("adv set 1 assembled adv data length 250", adv_get(1) ? adv_get(1)->adv_data_len : -1, 250);
+        check("assembled byte 0 from first fragment", adv_get(1) ? adv_get(1)->adv_data[0] : -1, 0);
+        check("assembled byte 99 from first fragment", adv_get(1) ? adv_get(1)->adv_data[99] : -1, 99);
+        check("assembled byte 100 from intermediate fragment", adv_get(1) ? adv_get(1)->adv_data[100] : -1, 0);
+        check("assembled byte 249 from last fragment", adv_get(1) ? adv_get(1)->adv_data[249] : -1, 49);
+        check("adv set 0 data untouched by handle 1 assembly", adv_get(0) ? adv_get(0)->adv_data_len : -1, 5);
+
+        printf("scenario: Set Extended Advertising Scan Response Data, Complete, handle 0\n");
+        static const uint8_t scan_cmd[11] = {0x38, 0x20, 0x08, 0x00, 0x03, 0x01, 0x04,
+                                             'S', 'C', 'A', 'N'};
+        drive("LE Set Extended Advertising Scan Response Data", scan_cmd, 11, 0x2038, 6);
+        check("adv set 0 scan response length 4", adv_get(0) ? adv_get(0)->scan_rsp_len : -1, 4);
+        check("adv set 0 scan response stored verbatim", adv_get(0) ? memcmp(adv_get(0)->scan_rsp_data, "SCAN", 4) : -1, 0);
+
+        printf("scenario: Set Extended Advertising Enable, per-set entry with duration/events\n");
+        static const uint8_t en_cmd[9] = {0x39, 0x20, 0x06, 0x01, 0x01, 0x00, 0x64, 0x00, 0x05};
+        drive("LE Set Extended Advertising Enable (h0)", en_cmd, 9, 0x2039, 6);
+        check("adv set 0 enabled", adv_get(0) ? adv_get(0)->enabled : -1, 1);
+        check("adv set 0 enable duration stored 100", adv_get(0) ? adv_get(0)->enable_duration : -1, 100);
+        check("adv set 0 enable max events stored 5", adv_get(0) ? adv_get(0)->enable_max_events : -1, 5);
+        check("le_advertising_enabled tracks any enabled set", x->bt.le_advertising_enabled, 1);
+
+        printf("scenario: Set Extended Advertising Enable, disable handle 0\n");
+        static const uint8_t dis_cmd[9] = {0x39, 0x20, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+        drive("LE Set Extended Advertising Enable (disable h0)", dis_cmd, 9, 0x2039, 6);
+        check("adv set 0 disabled", adv_get(0) ? adv_get(0)->enabled : -1, 0);
+        check("le_advertising_enabled clears when no set is enabled", x->bt.le_advertising_enabled, 0);
+
+        printf("scenario: Set Extended Advertising Enable, Number_of_Sets 0 (all sets)\n");
+        static const uint8_t enall_cmd[5] = {0x39, 0x20, 0x02, 0x01, 0x00};
+        drive("LE Set Extended Advertising Enable (all)", enall_cmd, 5, 0x2039, 6);
+        check("adv set 0 enabled by the all-sets form", adv_get(0) ? adv_get(0)->enabled : -1, 1);
+        check("adv set 1 enabled by the all-sets form", adv_get(1) ? adv_get(1)->enabled : -1, 1);
+        static const uint8_t disall_cmd[5] = {0x39, 0x20, 0x02, 0x00, 0x00};
+        drive("LE Set Extended Advertising Enable (disable all)", disall_cmd, 5, 0x2039, 6);
+        check("adv set 0 disabled by the all-sets form", adv_get(0) ? adv_get(0)->enabled : -1, 0);
+        check("adv set 1 disabled by the all-sets form", adv_get(1) ? adv_get(1)->enabled : -1, 0);
+        check("le_advertising_enabled 0 after disable-all", x->bt.le_advertising_enabled, 0);
+
+        printf("scenario: Set Periodic Advertising Parameters, plen 7, handle 0\n");
+        static const uint8_t perpar_cmd[10] = {0x3e, 0x20, 0x07, 0x00, 0x20, 0x00, 0x40, 0x00, 0x00, 0x00};
+        drive("LE Set Periodic Advertising Parameters", perpar_cmd, 10, 0x203e, 6);
+        check("adv set 0 periodic interval min stored 0x20", adv_get(0) ? adv_get(0)->per_interval_min : -1, 0x20);
+        check("adv set 0 periodic interval max stored 0x40", adv_get(0) ? adv_get(0)->per_interval_max : -1, 0x40);
+
+        printf("scenario: Set Periodic Advertising Data, Complete, handle 0\n");
+        static const uint8_t perdata_cmd[12] = {0x3f, 0x20, 0x09, 0x00, 0x03, 0x06,
+                                                'P', 'E', 'R', 'I', 'O', 'D'};
+        drive("LE Set Periodic Advertising Data", perdata_cmd, 12, 0x203f, 6);
+        check("adv set 0 periodic data length 6", adv_get(0) ? adv_get(0)->per_data_len : -1, 6);
+        check("adv set 0 periodic data stored verbatim", adv_get(0) ? memcmp(adv_get(0)->per_data, "PERIOD", 6) : -1, 0);
+
+        printf("scenario: Set Periodic Advertising Enable, plen 2, handle 0\n");
+        static const uint8_t peren_cmd[5] = {0x40, 0x20, 0x02, 0x01, 0x00};
+        drive("LE Set Periodic Advertising Enable (on)", peren_cmd, 5, 0x2040, 6);
+        check("adv set 0 periodic enabled", adv_get(0) ? adv_get(0)->per_enabled : -1, 1);
+        static const uint8_t perdis_cmd[5] = {0x40, 0x20, 0x02, 0x00, 0x00};
+        drive("LE Set Periodic Advertising Enable (off)", perdis_cmd, 5, 0x2040, 6);
+        check("adv set 0 periodic disabled", adv_get(0) ? adv_get(0)->per_enabled : -1, 0);
+
+        printf("scenario: error paths and Remove lifecycle\n");
+        static const uint8_t ghost_cmd[7] = {0x37, 0x20, 0x04, 0x07, 0x03, 0x01, 0x00};
+        drive_st("LE Set Extended Advertising Data (nonexistent h7)", ghost_cmd, 7, 0x2037, 0x42);
+        static const uint8_t remove_cmd[4] = {0x3c, 0x20, 0x01, 0x01};
+        drive("LE Remove Advertising Set (h1)", remove_cmd, 4, 0x203c, 6);
+        check("adv set 1 gone after Remove", adv_get(1) == NULL, 1);
+        uint8_t ghost2_cmd[7];
+        memcpy(ghost2_cmd, ghost_cmd, sizeof ghost2_cmd);
+        ghost2_cmd[3] = 0x01; /* the removed handle 1 */
+        drive_st("LE Set Extended Advertising Data (removed h1)", ghost2_cmd, 7, 0x2037, 0x42);
+
+        printf("scenario: Clear Advertising Sets, plen 0\n");
+        static const uint8_t clear_cmd[3] = {0x3d, 0x20, 0x00};
+        drive("LE Clear Advertising Sets", clear_cmd, 3, 0x203d, 6);
+        check("no adv sets remain after Clear", adv_count(), 0);
+        check("le_advertising_enabled 0 after Clear", x->bt.le_advertising_enabled, 0);
+
+        printf("scenario: HCI Reset clears the adv set model\n");
+        uint8_t p36c_cmd[28];
+        memcpy(p36c_cmd, p36_cmd, sizeof p36c_cmd);
+        p36c_cmd[3] = 0x02; /* handle 2 */
+        drive("LE Set Extended Advertising Parameters (h2)", p36c_cmd, 28, 0x2036, 7);
+        drive("HCI Reset", reset_cmd, 3, 0x0c03, 6);
+        check("no adv sets remain after HCI Reset", adv_count(), 0);
+
+        printf("scenario: capacity: 8 sets live, the 9th is refused 0x07, then Clear\n");
+        for (int h = 0; h < 8; h++) {
+            uint8_t cap_cmd[28];
+            memcpy(cap_cmd, p36_cmd, sizeof cap_cmd);
+            cap_cmd[3] = (uint8_t)h;
+            char nm[64];
+            snprintf(nm, sizeof nm, "LE Set Extended Advertising Parameters (capacity h%d)", h);
+            drive(nm, cap_cmd, 28, 0x2036, 7);
+        }
+        uint8_t cap9_cmd[28];
+        memcpy(cap9_cmd, p36_cmd, sizeof cap9_cmd);
+        cap9_cmd[3] = 0x09;
+        drive_st("LE Set Extended Advertising Parameters (9th set)", cap9_cmd, 28, 0x2036, 0x07);
+        drive("LE Clear Advertising Sets (final)", clear_cmd, 3, 0x203d, 6);
+        check("no adv sets remain after final Clear", adv_count(), 0);
     }
 
     printf("test_bt_hci_postinit: %d checks, %d failures\n", checks, failures);

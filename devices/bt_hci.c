@@ -200,6 +200,7 @@ void hv_bt_reset(HvBtHci *bt) {
        HCI Reset that follows Launch RAM, which is the whole point of
        the download flow. */
     bt->scan_enable = 0;
+    memset(bt->adv_sets, 0, sizeof bt->adv_sets);
     bt->le_scan_enabled = 0;
     bt->le_advertising_enabled = 0;
     bt->le_conn_handle = 0;
@@ -246,6 +247,83 @@ static void vendor_command(HvBtHci *bt, uint16_t opcode, const uint8_t *par, uin
         break;
     }
     command_complete(bt, opcode, 0, NULL, 0);
+}
+
+
+/* ---- LE extended advertising model -------------------------------------
+   Per-set state lives in bt->adv_sets (bt_hci.h). A set is created by
+   LE Set Extended Advertising Parameters (0x2036) and destroyed by LE
+   Remove Advertising Set (0x203C), LE Clear Advertising Sets (0x203D),
+   or HCI Reset. Error semantics are the spec's silicon errors, never
+   invented paths: 0x42 Unknown Advertising Identifier for operations
+   on a set that does not exist, 0x12 Invalid HCI Command Parameters
+   for malformed lengths / fragment sequences / oversized assembled
+   data, 0x0C Command Disallowed for re-parameterizing or removing a
+   set while it is enabled, 0x07 Memory Capacity Exceeded when all
+   HV_BT_MAX_ADV_SETS slots hold live sets. Enable with an empty set
+   list (Number_of_Sets 0) applies to every existing set; disabling a
+   set that does not exist is a tolerated no-op (the daemon's stop
+   paths use NULL completions and do not wait on the result), while
+   enabling one is 0x42. Duration / max-events from 0x2039 are stored,
+   not timed: this core synthesizes no Advertising Set Terminated
+   event, ever. */
+
+static HvBtAdvSet *adv_find(HvBtHci *bt, uint8_t handle) {
+    for (int i = 0; i < HV_BT_MAX_ADV_SETS; i++)
+        if (bt->adv_sets[i].in_use && bt->adv_sets[i].handle == handle)
+            return &bt->adv_sets[i];
+    return NULL;
+}
+
+static HvBtAdvSet *adv_alloc(HvBtHci *bt, uint8_t handle) {
+    HvBtAdvSet *s = adv_find(bt, handle);
+    if (s) return s;
+    for (int i = 0; i < HV_BT_MAX_ADV_SETS; i++)
+        if (!bt->adv_sets[i].in_use) {
+            memset(&bt->adv_sets[i], 0, sizeof bt->adv_sets[i]);
+            bt->adv_sets[i].in_use = 1;
+            bt->adv_sets[i].handle = handle;
+            return &bt->adv_sets[i];
+        }
+    return NULL;
+}
+
+static void adv_recompute_legacy_flag(HvBtHci *bt) {
+    int any = 0;
+    for (int i = 0; i < HV_BT_MAX_ADV_SETS; i++)
+        if (bt->adv_sets[i].in_use && bt->adv_sets[i].enabled) any = 1;
+    bt->le_advertising_enabled = any;
+}
+
+/* Fragment assembly for 0x2037 / 0x2038 / 0x203F. Operation: 0x00
+   Intermediate, 0x01 First, 0x02 Last, 0x03 Complete. Returns 0 or
+   the HCI status 0x12; on error the stored data is untouched. */
+static uint8_t adv_assemble(uint8_t *buf, uint16_t *len, int *assembling,
+                            uint8_t op, const uint8_t *data, uint32_t dlen) {
+    switch (op) {
+    case 0x03: /* Complete: replaces any prior content */
+        if (dlen > HV_BT_MAX_ADV_DATA_LEN) return 0x12;
+        if (dlen) memcpy(buf, data, dlen);
+        *len = (uint16_t)dlen;
+        *assembling = 0;
+        return 0;
+    case 0x01: /* First fragment */
+        if (dlen > HV_BT_MAX_ADV_DATA_LEN) return 0x12;
+        if (dlen) memcpy(buf, data, dlen);
+        *len = (uint16_t)dlen;
+        *assembling = 1;
+        return 0;
+    case 0x00: /* Intermediate fragment */
+    case 0x02: /* Last fragment */
+        if (!*assembling) return 0x12;
+        if ((uint32_t)*len + dlen > HV_BT_MAX_ADV_DATA_LEN) return 0x12;
+        if (dlen) memcpy(buf + *len, data, dlen);
+        *len = (uint16_t)(*len + dlen);
+        if (op == 0x02) *assembling = 0;
+        return 0;
+    default:
+        return 0x12;
+    }
 }
 
 void hv_bt_command(HvBtHci *bt, const uint8_t *pkt, uint32_t len) {
@@ -359,18 +437,45 @@ void hv_bt_command(HvBtHci *bt, const uint8_t *pkt, uint32_t len) {
                       real case below tracking le_scan_enabled from
                       its Enable byte, mirroring 0x200C, so the
                       advertising-report injector gate stays truthful.
-                      No scan result is ever fabricated. The extended
-                      ADVERTISING setters (octet 36 and the rest of
-                      octet 37) stay unclaimed: no advertising-set
-                      command crossed the wire and their
-                      parameter state is real payload this core does
-                      not model. */
+                      No scan result is ever fabricated.
+                      The extended advertising family is
+                      modeled per-set and claimed (the full enumeration
+                      corrects an earlier opcode shorthand against the
+                      spec map and the daemon's descriptor table):
+                      octet 36 bits 0x02..0x80
+                      (LE Set Advertising Set Random Address 0x2035,
+                      LE Set Extended Advertising Parameters 0x2036,
+                      Data 0x2037, Scan Response Data 0x2038, Enable
+                      0x2039, LE Read Maximum Advertising Data Length
+                      0x203A, LE Read Number of Supported Advertising
+                      Sets 0x203B) -> octet 36 = 0xFE, and octet 37
+                      bits 0x01..0x10 (LE Remove Advertising Set
+                      0x203C, LE Clear Advertising Sets 0x203D, LE Set
+                      Periodic Advertising Parameters 0x203E, Data
+                      0x203F, Enable 0x2040) join the scan claims
+                      -> octet 37 = 0x7F. Every setter is a state
+                      write against the tracked HvBtAdvSet table; the
+                      three reads/returns are shaped exactly as the
+                      daemon's parsers require (0x2036 returns status
+                      + the 1 Selected_TX_Power byte its callback
+                      appends as AD type 0x0A, 0x203A returns status
+                      + the uint16 1650 the daemon clamps to its own
+                      0x672 cap, 0x203B returns status + the 1-byte
+                      set capacity). Octet 36 bit 0x01 (LE
+                      Transmitter Test v2 0x2034, an RF test mode,
+                      not advertising) and octet 37 bit 0x80 (LE
+                      Extended Create Connection 0x2043, an
+                      initiating command whose completion would
+                      require synthesizing a connection to a peer
+                      that does not exist) stay CLEAR, named in the
+                      named dispositions. No advertising, periodic, scan
+                      request, or sync event is ever fabricated. */
         static const uint8_t c[64] = {
             0x23, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0xc3,
             0x00, 0x02, 0x60, 0x10, 0x00, 0x00, 0xf8, 0x03,
             0x00, 0x42, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00,
             0x40, 0xb7, 0x7f, 0x00, 0x08, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0xfe, 0x7f, 0x00, 0x00,
             0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -505,6 +610,222 @@ void hv_bt_command(HvBtHci *bt, const uint8_t *pkt, uint32_t len) {
         if (btlog()) fprintf(stderr, "bt: le scan %s\n", bt->le_scan_enabled ? "enabled" : "disabled");
         command_complete(bt, opcode, 0, NULL, 0);
         break;
+    case 0x2035: { /* LE Set Advertising Set Random Address:
+                      handle (1) + address (6). Pure per-set write,
+                      status-only completion (descriptor return
+                      length 0; the daemon wrapper 0x100227a90 passes
+                      the caller's completion through and tests the
+                      synchronous return). */
+        if (plen < 7) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        HvBtAdvSet *s = adv_find(bt, par[0]);
+        if (!s) { command_complete(bt, opcode, 0x42, NULL, 0); break; }
+        memcpy(s->random_addr, par + 1, 6);
+        s->random_addr_set = 1;
+        if (btlog()) fprintf(stderr, "bt: adv set %u random addr set\n", par[0]);
+        command_complete(bt, opcode, 0, NULL, 0);
+        break;
+    }
+    case 0x2036: { /* LE Set Extended Advertising Parameters: fixed
+                      25 bytes (see bt_hci.h). Creates the set. The
+                      completion is status + exactly 1 byte, the
+                      Selected_TX_Power: the daemon callback
+                      (bluetoothd 0x10022a2e4) consumes that byte by
+                      value and appends it to the advertising data
+                      as AD type 0x0A when no TX power element is
+                      present, so a status-only reply would corrupt
+                      the daemon's data build. This core selects the
+                      requested power verbatim, or 0 dBm when the
+                      request is 0x7F (no preference). */
+        if (plen < 25) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        if (par[0] > 0xef) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        HvBtAdvSet *s = adv_find(bt, par[0]);
+        if (s && s->enabled) { command_complete(bt, opcode, 0x0c, NULL, 0); break; }
+        if (!s) {
+            s = adv_alloc(bt, par[0]);
+            if (!s) { command_complete(bt, opcode, 0x07, NULL, 0); break; }
+        }
+        memcpy(s->params, par, 25);
+        s->params_set = 1;
+        s->properties = (uint16_t)(par[1] | par[2] << 8);
+        s->interval_min = (uint32_t)par[3] | (uint32_t)par[4] << 8 | (uint32_t)par[5] << 16;
+        s->interval_max = (uint32_t)par[6] | (uint32_t)par[7] << 8 | (uint32_t)par[8] << 16;
+        s->channel_map = par[9];
+        s->tx_power_request = (int8_t)par[19];
+        s->primary_phy = par[20];
+        s->secondary_phy = par[22];
+        s->sid = par[23];
+        s->tx_power_selected = s->tx_power_request == 0x7f ? 0 : s->tx_power_request;
+        if (btlog())
+            fprintf(stderr, "bt: adv set %u params sid %u tx %d -> %d\n", par[0], s->sid,
+                    s->tx_power_request, s->tx_power_selected);
+        command_complete(bt, opcode, 0, (const uint8_t *)&s->tx_power_selected, 1);
+        break;
+    }
+    case 0x2037: /* LE Set Extended Advertising Data: handle (1),
+                    operation (1), fragment preference (1), data
+                    length (1), data. Status-only completion; the
+                    daemon's completion (0x10022ad18) is a status
+                    continuation that issues the next fragment. */
+    case 0x2038: { /* LE Set Extended Advertising Scan Response Data:
+                      same wire shape as 0x2037. */
+        if (plen < 4) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        HvBtAdvSet *s = adv_find(bt, par[0]);
+        if (!s) { command_complete(bt, opcode, 0x42, NULL, 0); break; }
+        if ((uint32_t)par[3] != plen - 4) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        uint8_t *buf; uint16_t *lenp; int *asmp; uint8_t *prefp;
+        if (opcode == 0x2037) {
+            buf = s->adv_data; lenp = &s->adv_data_len; asmp = &s->adv_assembling; prefp = &s->adv_frag_pref;
+        } else {
+            buf = s->scan_rsp_data; lenp = &s->scan_rsp_len; asmp = &s->scan_assembling; prefp = &s->scan_frag_pref;
+        }
+        uint8_t st = adv_assemble(buf, lenp, asmp, par[1], par + 4, plen - 4);
+        if (st == 0) {
+            *prefp = par[2];
+            if (btlog())
+                fprintf(stderr, "bt: adv set %u %s data op %u total %u\n", par[0],
+                        opcode == 0x2037 ? "adv" : "scan-rsp", par[1], *lenp);
+        }
+        command_complete(bt, opcode, st, NULL, 0);
+        break;
+    }
+    case 0x2039: { /* LE Set Extended Advertising Enable: enable (1),
+                      number of sets (1), then per set: handle (1),
+                      duration (2, 10 ms units), max events (1).
+                      Status-only completion (three of the daemon's
+                      five sites pass a NULL completion; the named
+                      ones, e.g. multipleAdvStartCb 0x10022ac68,
+                      consume status only). */
+        if (plen < 2) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        uint8_t enable = par[0] != 0;
+        uint8_t num = par[1];
+        if ((uint32_t)plen < 2u + (uint32_t)num * 4u) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        if (enable && num > 0) {
+            for (int i = 0; i < num; i++)
+                if (!adv_find(bt, par[2 + i * 4])) { command_complete(bt, opcode, 0x42, NULL, 0); goto adv_enable_done; }
+        }
+        if (num == 0) {
+            for (int i = 0; i < HV_BT_MAX_ADV_SETS; i++) {
+                HvBtAdvSet *s = &bt->adv_sets[i];
+                if (!s->in_use) continue;
+                s->enabled = enable;
+                s->enable_duration = 0;
+                s->enable_max_events = 0;
+            }
+        } else {
+            for (int i = 0; i < num; i++) {
+                HvBtAdvSet *s = adv_find(bt, par[2 + i * 4]);
+                if (!s) continue; /* disabling a missing set: tolerated no-op */
+                s->enabled = enable;
+                s->enable_duration = (uint16_t)(par[3 + i * 4] | par[4 + i * 4] << 8);
+                s->enable_max_events = par[5 + i * 4];
+            }
+        }
+        adv_recompute_legacy_flag(bt);
+        if (btlog())
+            fprintf(stderr, "bt: adv enable %u num_sets %u\n", enable, num);
+        command_complete(bt, opcode, 0, NULL, 0);
+    adv_enable_done:
+        break;
+    }
+    case 0x203a: { /* LE Read Maximum Advertising Data Length: no
+                      parameters; completion is status + the uint16
+                      maximum. The daemon callback (0x100227ec4)
+                      consumes the value by value, stores it as
+                      fControllerMaxExtendedAdvertisingPayloadSize,
+                      and clamps anything above 1650 down to 1650;
+                      this core's assembled-data cap is exactly
+                      1650, so 1650 is the truthful value. */
+        static const uint8_t mx[2] = {0x72, 0x06}; /* 1650 little-endian */
+        command_complete(bt, opcode, 0, mx, sizeof mx);
+        break;
+    }
+    case 0x203b: { /* LE Read Number of Supported Advertising Sets:
+                      completion is status + 1 byte, this core's real
+                      set capacity. No dispatcher call site exists in
+                      bluetoothd (proven against the daemon); the shape
+                      is the spec's and the descriptor's return
+                      length field (1). */
+        static const uint8_t nsets[1] = {HV_BT_MAX_ADV_SETS};
+        command_complete(bt, opcode, 0, nsets, sizeof nsets);
+        break;
+    }
+    case 0x203c: { /* LE Remove Advertising Set: handle (1).
+                      Status-only. No dispatcher call site exists in
+                      bluetoothd (the daemon removes via disable +
+                      clear in its traced flows); served per spec so
+                      the lifecycle is complete and truthful. */
+        if (plen < 1) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        HvBtAdvSet *s = adv_find(bt, par[0]);
+        if (!s) { command_complete(bt, opcode, 0x42, NULL, 0); break; }
+        if (s->enabled) { command_complete(bt, opcode, 0x0c, NULL, 0); break; }
+        memset(s, 0, sizeof *s);
+        adv_recompute_legacy_flag(bt);
+        if (btlog()) fprintf(stderr, "bt: adv set %u removed\n", par[0]);
+        command_complete(bt, opcode, 0, NULL, 0);
+        break;
+    }
+    case 0x203d: /* LE Clear Advertising Sets: no parameters,
+                    status-only; the daemon's completion callback
+                    (0x1002281c8) is a bare return (a no-op) and its
+                    issuer logs only on synchronous failure. Clears
+                    every set, enabled or not (teardown semantics;
+                    the daemon's sole site is an init/teardown
+                    path). */
+        memset(bt->adv_sets, 0, sizeof bt->adv_sets);
+        bt->le_advertising_enabled = 0;
+        if (btlog()) fprintf(stderr, "bt: adv sets cleared\n");
+        command_complete(bt, opcode, 0, NULL, 0);
+        break;
+    case 0x203e: { /* LE Set Periodic Advertising Parameters: handle
+                      (1), interval min (2), interval max (2),
+                      properties (2). Status-only; the daemon
+                      callback (0x10022b040,
+                      setPeriodicAdvParamsCompleteCb) logs the status
+                      and nothing else. */
+        if (plen < 7) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        HvBtAdvSet *s = adv_find(bt, par[0]);
+        if (!s) { command_complete(bt, opcode, 0x42, NULL, 0); break; }
+        memcpy(s->per_params, par, 7);
+        s->per_params_set = 1;
+        s->per_interval_min = (uint16_t)(par[1] | par[2] << 8);
+        s->per_interval_max = (uint16_t)(par[3] | par[4] << 8);
+        s->per_properties = (uint16_t)(par[5] | par[6] << 8);
+        command_complete(bt, opcode, 0, NULL, 0);
+        break;
+    }
+    case 0x203f: { /* LE Set Periodic Advertising Data: handle (1),
+                      operation (1), data length (1), data (no
+                      fragment-preference byte, unlike 0x2037).
+                      Status-only; the daemon callback (0x10022b4d8,
+                      setPeriodicAdvDataPacketCompleteCb) consumes
+                      status and re-issues the next fragment itself
+                      while data remains. */
+        if (plen < 3) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        HvBtAdvSet *s = adv_find(bt, par[0]);
+        if (!s) { command_complete(bt, opcode, 0x42, NULL, 0); break; }
+        if ((uint32_t)par[2] != plen - 3) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        uint8_t st = adv_assemble(s->per_data, &s->per_data_len, &s->per_assembling, par[1], par + 3, plen - 3);
+        if (btlog() && st == 0)
+            fprintf(stderr, "bt: adv set %u periodic data op %u total %u\n", par[0], par[1], s->per_data_len);
+        command_complete(bt, opcode, st, NULL, 0);
+        break;
+    }
+    case 0x2040: { /* LE Set Periodic Advertising Enable: enable (1),
+                      handle (1), fixed plen 2. Status-only; the
+                      daemon callbacks (0x100229658 "Periodic
+                      advertising started", 0x10022927c stop-context
+                      finder) consume status only. No Periodic
+                      Advertising Sync Established or Report event is
+                      ever synthesized from this state. */
+        if (plen < 2) { command_complete(bt, opcode, 0x12, NULL, 0); break; }
+        HvBtAdvSet *s = adv_find(bt, par[1]);
+        if (!s) { command_complete(bt, opcode, 0x42, NULL, 0); break; }
+        s->per_enabled = par[0] != 0;
+        if (btlog())
+            fprintf(stderr, "bt: adv set %u periodic %s\n", par[1], s->per_enabled ? "enabled" : "disabled");
+        command_complete(bt, opcode, 0, NULL, 0);
+        break;
+    }
     case 0x2041: /* LE Set Extended Scan Parameters: a pure parameter
                     state write; the core retains no scan parameters
                     (exactly as for classic 0x200B), so the accept-success
