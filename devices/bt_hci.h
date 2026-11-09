@@ -54,6 +54,12 @@ const char *hv_bt_usb_product(void);
 const char *hv_bt_usb_serial(void);
 /* HCI Read Local Name payload for the active personality. */
 const char *hv_bt_local_name(void);
+/* Per-machine identity seed: the machine UUID's 16 raw bytes, supplied by
+   the host before the core is initialized (hv_xhci_create passes the
+   machine's stored copy). hv_bt_init derives the controller address and
+   the BCM USB serial string from it. NULL, or an all-zero UUID, clears
+   the seed; a seedless core keeps the fixed per-personality addresses. */
+void hv_bt_set_machine_uuid(const uint8_t uuid[16]);
 
 typedef struct HvBtPacket {
     uint16_t len;

@@ -2,10 +2,14 @@
    links (via host/vm.c) against an ADT blob: the synthetic fixture
    in tests/fixtures, generated from the dtplant.h format definition.
    Usage: test_dtplant <adt.bin>
-   Checks: insert lands the exact 52-byte entry in /options, every other
-   byte identical, total length +52, re-walk consumes the grown blob;
-   second insert is a no-op already-present; truncated / poisoned-slack /
-   short-allocation inputs fail clean with the buffer untouched. */
+   Checks: with no machine identity supplied, insert fails clean with
+   the buffer untouched (the payload's identity is derived, never
+   fixed); with the fixture identity supplied, insert lands the exact
+   52-byte entry in /options carrying that identity's derived payload,
+   every other byte identical, total length +52, re-walk consumes the
+   grown blob; second insert is a no-op already-present; truncated /
+   poisoned-slack / short-allocation inputs fail clean with the buffer
+   untouched. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +35,30 @@ int main(int argc, char **argv) {
     printf("blob %u bytes, test allocation %llu bytes (zero-filled page slack %llu)\n",
            len, (unsigned long long)cap, (unsigned long long)(cap - len));
 
+    /* The fixture machine identity: a synthetic 16-byte seed authored
+       for this test. Its derived payload is pinned byte-for-byte in
+       the expectation below, so the derivation itself is under test. */
+    static const uint8_t fixture_uuid[16] = {0x54, 0x45, 0x53, 0x54, 0x2d, 0x55, 0x55, 0x49,
+                                             0x44, 0x2d, 0x30, 0x30, 0x30, 0x30, 0x30, 0x31};
+
+    /* No identity supplied: insert fails clean, buffer untouched. */
+    {
+        uint8_t *nb = calloc(1, cap);
+        memcpy(nb, orig, len);
+        uint8_t *nb0 = malloc(cap);
+        memcpy(nb0, nb, cap);
+        const char *nreason = NULL;
+        uint32_t nnl = 0;
+        int nr = dtplant_insert(nb, len, cap, &nnl, &nreason);
+        CHECK(nr == 0, "seedless insert returned %d, want 0", nr);
+        CHECK(nreason && !strcmp(nreason, "no machine identity supplied for the plant payload"),
+              "seedless insert reason: %s", nreason ? nreason : "?");
+        CHECK(!memcmp(nb, nb0, cap), "seedless failure modified the buffer");
+        printf("seedless insert: PASS (%s)\n", nreason ? nreason : "?");
+        free(nb); free(nb0);
+    }
+    dtplant_set_machine_uuid(fixture_uuid);
+
     const char *reason = NULL;
     DtplantInfo before;
     CHECK(dtplant_inspect(orig, len, &before, &reason), "pre-walk failed: %s", reason ? reason : "?");
@@ -45,7 +73,9 @@ int main(int argc, char **argv) {
     memset(expect, 0, sizeof(expect));
     memcpy(expect, "bluetoothInternalControllerInfo", 31);
     expect[32] = 14;
-    static const uint8_t payload[14] = {0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x98, 0x18, 0xF0};
+    /* The fixture identity's derived payload: the format's zero
+       prefix, then the derived internal address in HCI wire order. */
+    static const uint8_t payload[14] = {0, 0, 0, 0, 0, 0, 0, 0, 0xA5, 0xE8, 0x1D, 0x98, 0x18, 0xF0};
     memcpy(expect + 36, payload, 14);
 
     uint8_t *buf = calloc(1, cap);

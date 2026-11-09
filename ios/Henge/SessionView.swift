@@ -603,7 +603,8 @@ struct SessionView: View {
             henge_vm_set_display_mm(0, 0)
         }
         HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
-        let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
+        let uuidBytes: [UInt8] = withUnsafeBytes(of: mac.id.uuid) { Array($0) }
+        let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, uuidBytes, ram, Int32(cpus), &buffer, buffer.count)
         if rc != 0 {
             error = String(cString: buffer)
             return
