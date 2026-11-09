@@ -20,6 +20,7 @@
 
 #include "audio_mac.h"
 #include "dispatch.h"
+#include "dtplant.h"
 #include "net_slirp.h"
 
 static HvMachine m;
@@ -50,6 +51,465 @@ HvMachine *hv_vm_machine(void) { return &m; }
 HvVmapple *hv_vm_board(void) { return &board; }
 HvCpu *hv_vm_cpu(int index) { return index >= 0 && index < ncpus ? &cpus[index] : NULL; }
 int hv_vm_ncpus(void) { return ncpus; }
+
+/* Boot-args RAM patch, gated by HV_BOOTARGS_APPEND (value: the exact
+   string to append). The scanner below (hv_vm_boot_display) finds the
+   guest's boot_args struct in RAM by signature, read-only, to display
+   iBoot's framebuffer. With the gate set, the first successful detection
+   also appends the token to the struct's CommandLine field, in guest RAM,
+   through the same board.ram mapping the scanner reads, and latches: one
+   attempt per boot, never a loop-rewrite. Without the env var this code
+   is inert: hv_bootargs_maybe_patch returns at its first check and the
+   poll thread in hv_vm_create is never started.
+   CommandLine offset and capacity are NOT defined anywhere in this tree
+   (the scanner reads only the Video fields). They come from the published
+   arm64 boot_args layout (XNU pexpert arm boot.h, as reproduced in
+   PongoOS src/kernel/pongo.h): Revision 0, Version 2, pad 4, virtBase 8,
+   physBase 16, memSize 24, topOfKernelData 32, Video[6] 40..87,
+   machineType 88, pad 92, deviceTreeP 96, deviceTreeLength 104,
+   CommandLine 108 (PongoOS carries a static assert:
+   offsetof(deviceTreeLength) + 4 == offsetof(CommandLine)). The first
+   fields match this scanner's own q[] indexing exactly (q[1] virtBase,
+   q[2] physBase, q[3] memSize, q[5..10] Video). CommandLine capacity is
+   256 in the conservative published variant (0x100; a second variant is
+   0x260): writes are bounded by 256, inside the field under either. */
+#define HV_BOOTARGS_CMDLINE_OFF 108
+#define HV_BOOTARGS_CMDLINE_CAP 256
+#define HV_BOOTARGS_DTPTR_OFF 96
+#define HV_BOOTARGS_DTLEN_OFF 104
+
+static _Atomic int bootargs_patch_state; /* 0 = not attempted, 1 = appended, 2 = not applied */
+static _Atomic int bootargs_patch_claimed; /* one attempt, even with concurrent display callers */
+
+static int hv_bootargs_patch_settled(void) { return atomic_load_explicit(&bootargs_patch_state, memory_order_acquire) != 0; }
+
+static void hv_bootargs_not_applied(const char *reason) {
+    fprintf(stderr, "bootargs-patch: NOT APPLIED (%s)\n", reason);
+    atomic_store_explicit(&bootargs_patch_state, 2, memory_order_release);
+}
+
+static double hv_bootargs_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static double bootargs_t0; /* hv_vm_create time (monotonic s) with the gate set; host-t logs are relative to it */
+
+/* The scanner's signature (hv_vm_boot_display) as a pure predicate, shared by
+   the arming scan and the interlocks: header, memory fields and Video must
+   all be plausible for the candidate at RAM offset off. On success the
+   struct's virtBase/physBase/topOfKernelData are returned. */
+static int hv_bootargs_sig_ok(const uint8_t *ram, uint64_t size, uint64_t off,
+                              uint64_t *virt_out, uint64_t *phys_out, uint64_t *top_out) {
+    if (!ram || off + 0x1000 > size) return 0;
+    const uint64_t *q = (const uint64_t *)(ram + off);
+    const uint16_t *h = (const uint16_t *)(ram + off);
+    if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) return 0;
+    if (q[1] >> 40 != 0xfffffe || q[2] < VMAPPLE_MEM || q[2] >= VMAPPLE_MEM + size || q[3] == 0 || q[3] > size) return 0;
+    uint64_t base = q[5], row = q[7], w = q[8], hh = q[9], depth = q[10];
+    if (w < 320 || w > 8192 || hh < 200 || hh > 8192 || row < w * 4 || (depth & 0xff) != 32) return 0;
+    if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) return 0;
+    if (virt_out) *virt_out = q[1];
+    if (phys_out) *phys_out = q[2];
+    if (top_out) *top_out = q[4];
+    return 1;
+}
+
+static pthread_mutex_t bootargs_write_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Validate the struct at RAM offset found exactly as the poll patch does and append the
+   HV_BOOTARGS_APPEND token to its CommandLine. Returns 1 after logging the
+   success line (via == NULL: the poll line verbatim; otherwise the same line
+   extended with the trigger name and host-t), or 0 with *reason set to a
+   static string. Serialized: the poll thread and the vCPU interlocks may
+   race to the same struct; the write itself is identical either way. */
+static int hv_bootargs_patch_core(uint8_t *ram, uint64_t size, uint64_t found, const char *via, const char **reason) {
+    const char *token = getenv("HV_BOOTARGS_APPEND");
+    if (!token) { *reason = "gate unset"; return 0; }
+    pthread_mutex_lock(&bootargs_write_mu);
+    size_t tlen = strlen(token);
+    int bad = tlen == 0;
+    for (size_t i = 0; i < tlen; i++)
+        if (token[i] <= ' ' || token[i] >= 0x7f) bad = 1;
+    if (bad) { *reason = "invalid token"; goto fail; }
+    if (found + HV_BOOTARGS_CMDLINE_OFF + HV_BOOTARGS_CMDLINE_CAP > size) { *reason = "command line field out of RAM bounds"; goto fail; }
+    /* Confidence checks at the same standard the scanner applies to the
+       fields it reads: the device tree pointer and length that sit
+       immediately before CommandLine must be plausible, and the field
+       itself must hold a clean NUL-terminated printable string. */
+    uint64_t dtp;
+    uint32_t dtlen;
+    memcpy(&dtp, ram + found + HV_BOOTARGS_DTPTR_OFF, 8);
+    memcpy(&dtlen, ram + found + HV_BOOTARGS_DTLEN_OFF, 4);
+    if (dtlen < 256 || dtlen > (16u << 20)) { *reason = "device tree length implausible"; goto fail; }
+    if (dtp >= VMAPPLE_MEM && dtp < VMAPPLE_MEM + size) {
+        if (dtp - VMAPPLE_MEM + dtlen > size) { *reason = "device tree out of RAM bounds"; goto fail; }
+    } else if (dtp >> 40 != 0xfffffe) { *reason = "device tree pointer implausible"; goto fail; }
+    char *cmd = (char *)(ram + found + HV_BOOTARGS_CMDLINE_OFF);
+    size_t len = 0;
+    while (len < HV_BOOTARGS_CMDLINE_CAP && cmd[len]) {
+        unsigned char ch = (unsigned char)cmd[len];
+        if (ch < ' ' || ch >= 0x7f) { *reason = "command line is not a clean string"; goto fail; }
+        len++;
+    }
+    if (len >= HV_BOOTARGS_CMDLINE_CAP) { *reason = "command line not NUL-terminated within its field"; goto fail; }
+    if (strstr(cmd, token)) { *reason = "token already present"; goto fail; }
+    size_t sep = len ? 1 : 0;
+    if (len + sep + tlen + 1 > HV_BOOTARGS_CMDLINE_CAP) { *reason = "insufficient capacity in command line field"; goto fail; }
+    size_t at = len + sep;
+    if (sep) cmd[len] = ' ';
+    memcpy(cmd + at, token, tlen);
+    cmd[at + tlen] = 0;
+    if (memcmp(cmd + at, token, tlen) != 0 || cmd[at + tlen] != 0) { *reason = "write-back verify failed"; goto fail; }
+    if (via)
+        fprintf(stderr, "bootargs-patch: appended '%s' at cmdline offset %zu (was len %zu, now len %zu) via %s at host-t %.3f\n", token, at, len, at + tlen, via, hv_bootargs_now() - bootargs_t0);
+    else
+        fprintf(stderr, "bootargs-patch: appended '%s' at cmdline offset %zu (was len %zu, now len %zu)\n", token, at, len, at + tlen);
+    pthread_mutex_unlock(&bootargs_write_mu);
+    return 1;
+fail:
+    pthread_mutex_unlock(&bootargs_write_mu);
+    return 0;
+}
+
+static void hv_bootargs_maybe_patch(uint8_t *ram, uint64_t size, uint64_t found) {
+    const char *token = getenv("HV_BOOTARGS_APPEND");
+    if (!token) return;
+    if (hv_bootargs_patch_settled()) return;
+    if (atomic_exchange_explicit(&bootargs_patch_claimed, 1, memory_order_acq_rel)) return;
+    const char *reason = NULL;
+    if (hv_bootargs_patch_core(ram, size, found, NULL, &reason)) {
+        atomic_store_explicit(&bootargs_patch_state, 1, memory_order_release);
+        return;
+    }
+    hv_bootargs_not_applied(reason);
+}
+
+/* Device-tree plant, gated by HV_DT_PLANT_INTERNAL=1 (independent of
+   HV_BOOTARGS_APPEND; the combined configuration sets both). A boot proved the
+   override=10 stack start reaches TransportInit's flag-1 ChipsetSelect,
+   which logs "Internal controller info missing" because no
+   bluetoothInternalControllerInfo property exists in
+   IODeviceTree:/options. The 14-byte value cannot survive the NVRAM
+   store's name=value string grammar, so the plant is an
+   interlock-class RAM patch to the ADT blob itself, delivered at the
+   same hook points as the boot-args patch (T1 kernel entry, T2 first
+   hypercall, T3 poll/display safety net) and sharing its discipline:
+   the validated boot_args struct supplies deviceTreeP/deviceTreeLength;
+   the shared core in dtplant.h validates every ADT field, PROVES
+   zero-filled page slack of at least 52 bytes before shifting anything,
+   inserts, and re-walks the grown blob; any failure logs a signed
+   dtplant PASS line and releases the vCPU immediately with the guest
+   unharmed. With the gate unset (or not exactly "1") nothing here runs:
+   no DT writes, no log lines, behavior identical to the boot-args-only build. */
+static _Atomic int dtplant_state; /* 0 = not planted, 1 = planted (or already present) */
+static _Atomic int dtplant_t3_claimed;
+static _Atomic int dtplant_t1_done, dtplant_t2_done;
+
+static int hv_dtplant_gate_on(void) {
+    const char *g = getenv("HV_DT_PLANT_INTERNAL");
+    return g && !strcmp(g, "1");
+}
+
+static int hv_dtplant_settled(void) { return atomic_load_explicit(&dtplant_state, memory_order_acquire) != 0; }
+
+static void hv_dtplant_pass(const char *via, const char *reason) {
+    fprintf(stderr, "dtplant: PASS %s via %s at host-t %.3f\n", reason, via, hv_bootargs_now() - bootargs_t0);
+}
+
+/* One plant attempt against the boot_args struct at RAM offset found:
+   full signature first, then deviceTreeP/deviceTreeLength locate the
+   ADT (deviceTreeP is a guest physical address, or a kernel virtual
+   address under the struct's own virtBase/physBase mapping, the QEMU
+   vmapple convention), then the dtplant.h core does the work.
+   On success the struct's deviceTreeLength grows by 52. Returns 1 on
+   plant, or when the goal state already holds. Serialized with the
+   boot-args patch on the same write mutex. */
+static int hv_dtplant_attempt(uint64_t found, const char *via, const char **reason) {
+    uint8_t *ram = board.ram;
+    uint64_t size = board.ram_size;
+    if (!ram) { *reason = "guest RAM not mapped"; return 0; }
+    uint64_t virt = 0, phys = 0;
+    if (!hv_bootargs_sig_ok(ram, size, found, &virt, &phys, NULL)) { *reason = "candidate fails the boot_args signature"; return 0; }
+    pthread_mutex_lock(&bootargs_write_mu);
+    uint64_t dtp;
+    uint32_t dtlen;
+    memcpy(&dtp, ram + found + HV_BOOTARGS_DTPTR_OFF, 8);
+    memcpy(&dtlen, ram + found + HV_BOOTARGS_DTLEN_OFF, 4);
+    if (dtlen < 256 || dtlen > (16u << 20)) { *reason = "device tree length implausible"; goto fail; }
+    uint64_t pa;
+    if (dtp >= VMAPPLE_MEM && dtp < VMAPPLE_MEM + size) pa = dtp;
+    else if (dtp >= virt && dtp - virt < size) pa = phys + (dtp - virt);
+    else { *reason = "device tree pointer implausible"; goto fail; }
+    if (pa < VMAPPLE_MEM || pa >= VMAPPLE_MEM + size || pa - VMAPPLE_MEM + dtlen > size) { *reason = "device tree out of RAM bounds"; goto fail; }
+    uint64_t dt_off = pa - VMAPPLE_MEM;
+    uint32_t newlen = 0;
+    int r = dtplant_insert(ram + dt_off, dtlen, size - dt_off, &newlen, reason);
+    if (r == 2) { /* the plant property already present with the exact payload: goal state holds */
+        atomic_store_explicit(&dtplant_state, 1, memory_order_release);
+        pthread_mutex_unlock(&bootargs_write_mu);
+        return 1;
+    }
+    if (r != 1) goto fail;
+    uint32_t check = 0;
+    memcpy(ram + found + HV_BOOTARGS_DTLEN_OFF, &newlen, 4);
+    memcpy(&check, ram + found + HV_BOOTARGS_DTLEN_OFF, 4);
+    if (check != newlen) { *reason = "device tree length write-back verify failed"; goto fail; }
+    atomic_store_explicit(&dtplant_state, 1, memory_order_release);
+    fprintf(stderr, "dtplant: inserted bluetoothInternalControllerInfo (14 B) into /options, dt len %u -> %u, via %s at host-t %.3f\n",
+            dtlen, newlen, via, hv_bootargs_now() - bootargs_t0);
+    pthread_mutex_unlock(&bootargs_write_mu);
+    return 1;
+fail:
+    pthread_mutex_unlock(&bootargs_write_mu);
+    return 0;
+}
+
+/* T3: the poll/display detection path shares the plant routine, as it
+   shares the boot-args patch. One attempt, latched, like
+   hv_bootargs_maybe_patch. Inert and silent with the gate unset. */
+static void hv_dtplant_maybe_plant(uint8_t *ram, uint64_t size, uint64_t found) {
+    (void)ram;
+    (void)size;
+    if (!hv_dtplant_gate_on()) return;
+    if (hv_dtplant_settled()) return;
+    if (atomic_exchange_explicit(&dtplant_t3_claimed, 1, memory_order_acq_rel)) return;
+    const char *reason = NULL;
+    if (hv_dtplant_attempt(found, "T3", &reason)) return;
+    if (hv_dtplant_settled()) return;
+    hv_dtplant_pass("T3", reason ? reason : "plant failed");
+}
+
+/* Kernel-entry interlock. The poll patch loses the race to
+   arm_init's whole-struct copy (const_boot_args = *args, the kernel's first
+   C function): the copy lands inside (3.207, 3.504) s in the observed log while
+   the throttled poll fired at 4.787 s. The interlock therefore does not
+   poll for the patch itself; it ARMS from the poll thread (the struct's
+   identity and the kernel's address range, known once the final iBoot
+   stage has built the struct, well before handoff) and PATCHES
+   synchronously on the vCPU thread at one of two events that provably
+   precede the copy:
+     T1 (dispatcher, core/dispatch.c run_loop via m->bootargs_fetch_hook):
+        the first block fetch whose PC enters the kernel range
+        [physBase, topOfKernelData) (or its virtBase image once the MMU is
+        on) from outside it, on CPU 0 at EL1. No kernel instruction of
+        that block has executed yet; x0 still holds the entry value iBoot
+        passed, the boot_args pointer per the arm64 boot convention.
+        The first-ever fetch of the entry block cannot be chained or
+        IJC-cached (it was never translated), so the dispatcher always
+        sees it. This is strictly before arm_init.
+     T2 (HVC, core/exception.c hv_exception_insn via m->bootargs_hvc_hook):
+        the first EL1 hypercall from CPU 0 at which a boot_args struct is
+        identifiable. x0 at an HVC is the call number (psci() consumes
+        it), NOT the entry pointer, so the struct is located by scanning
+        x1..x30 for a pointer that passes the full signature (the entry
+        value survives in a callee-saved register across the call), then
+        by the armed offset. These calls (0x8300ff01 class, observed log
+        t=3.214) are _start's platform/PAC setup, before arm_init runs.
+   T3 is the poll patch above, unchanged, as the safety net.
+   Fail-safes: an interlock attempt validates its target with the scanner
+   signature PLUS the poll patch's field validation before writing; any failure logs
+   INTERLOCK PASS and returns at once (the vCPU is never held, nothing
+   loops or waits on this path; the write mutex is held only for the
+   bounded validate-and-write). A PASS spends that trigger only; the
+   other trigger and the T3 net remain live. With HV_BOOTARGS_APPEND
+   unset the hooks are never installed (hv_vm_create) and this code is
+   unreachable. */
+static _Atomic int bootargs_arm_valid;
+static _Atomic uint64_t bootargs_arm_found, bootargs_arm_phys, bootargs_arm_top, bootargs_arm_virt;
+static _Atomic int bootargs_arm_range_ok;
+static _Atomic int bootargs_t1_done, bootargs_t2_done;
+
+static int hv_bootargs_scan_raw(uint8_t *ram, uint64_t size, uint64_t *found_out, uint64_t *virt_out, uint64_t *phys_out, uint64_t *top_out) {
+    uint64_t limit = size < (1ull << 30) ? size : 1ull << 30;
+    for (uint64_t off = 0; off + 0x1000 <= limit; off += 0x4000) {
+        if (!hv_bootargs_sig_ok(ram, size, off, virt_out, phys_out, top_out)) continue;
+        *found_out = off;
+        return 1;
+    }
+    return 0;
+}
+
+static void hv_bootargs_try_arm(void) {
+    if (atomic_load_explicit(&bootargs_arm_valid, memory_order_acquire)) return;
+    uint8_t *ram = board.ram;
+    uint64_t size = board.ram_size;
+    if (!ram) return;
+    uint64_t found, virt, phys, top;
+    if (!hv_bootargs_scan_raw(ram, size, &found, &virt, &phys, &top)) return;
+    atomic_store_explicit(&bootargs_arm_found, found, memory_order_release);
+    atomic_store_explicit(&bootargs_arm_phys, phys, memory_order_release);
+    atomic_store_explicit(&bootargs_arm_top, top, memory_order_release);
+    atomic_store_explicit(&bootargs_arm_virt, virt, memory_order_release);
+    int range_ok = top > phys && top - phys <= size;
+    atomic_store_explicit(&bootargs_arm_range_ok, range_ok, memory_order_release);
+    atomic_store_explicit(&bootargs_arm_valid, 1, memory_order_release);
+    fprintf(stderr, "bootargs-patch: interlock armed at host-t %.3f (struct RAM offset %#llx, kernel PA range %#llx-%#llx%s)\n",
+            hv_bootargs_now() - bootargs_t0, (unsigned long long)found, (unsigned long long)phys, (unsigned long long)top,
+            range_ok ? "" : ", range implausible: T1 falls back to the entry point only");
+}
+
+/* A guest pointer (physical, or kernel-virtual under the armed struct's
+   virtBase/physBase mapping) to a RAM offset, or 0. */
+static int hv_bootargs_off_from_ptr(uint64_t ptr, uint64_t *off_out) {
+    uint64_t size = board.ram_size;
+    if (!board.ram) return 0;
+    if (ptr >= VMAPPLE_MEM && ptr < VMAPPLE_MEM + size) { *off_out = ptr - VMAPPLE_MEM; return 1; }
+    if (atomic_load_explicit(&bootargs_arm_valid, memory_order_acquire)) {
+        uint64_t virt = atomic_load_explicit(&bootargs_arm_virt, memory_order_acquire);
+        uint64_t phys = atomic_load_explicit(&bootargs_arm_phys, memory_order_acquire);
+        if (ptr >= virt && ptr - virt < size) {
+            uint64_t pa = phys + (ptr - virt);
+            if (pa >= VMAPPLE_MEM && pa < VMAPPLE_MEM + size) { *off_out = pa - VMAPPLE_MEM; return 1; }
+        }
+    }
+    return 0;
+}
+
+/* One interlock attempt against the struct at RAM offset off: full
+   signature first (the interlock paths derive off from a register, not
+   from the scanner), then the shared core. On success the patch settles for
+   every path. Never waits or retries. */
+static int hv_bootargs_interlock_attempt(uint64_t off, const char *via, const char **reason) {
+    uint8_t *ram = board.ram;
+    uint64_t size = board.ram_size;
+    if (!ram) { *reason = "guest RAM not mapped"; return 0; }
+    if (!hv_bootargs_sig_ok(ram, size, off, NULL, NULL, NULL)) { *reason = "candidate fails the boot_args signature"; return 0; }
+    if (!hv_bootargs_patch_core(ram, size, off, via, reason)) {
+        if (*reason && !strcmp(*reason, "token already present")) {
+            /* The goal state (token in the struct before the copy) already
+               holds, reached by whichever path wrote first. */
+            atomic_store_explicit(&bootargs_patch_state, 1, memory_order_release);
+            atomic_store_explicit(&bootargs_patch_claimed, 1, memory_order_release);
+            return 1;
+        }
+        return 0;
+    }
+    atomic_store_explicit(&bootargs_patch_state, 1, memory_order_release);
+    atomic_store_explicit(&bootargs_patch_claimed, 1, memory_order_release);
+    return 1;
+}
+
+static void hv_bootargs_interlock_pass(const char *via, const char *reason) {
+    fprintf(stderr, "bootargs-patch: INTERLOCK PASS (%s) via %s at host-t %.3f\n", reason, via, hv_bootargs_now() - bootargs_t0);
+}
+
+static int hv_bootargs_in_kernel_range(HvCpu *cpu, uint64_t pc, uint64_t phys, uint64_t top, uint64_t virt, int range_ok) {
+    if (cpu->sctlr_el1 & 1) { /* MMU on: PCs are virtual */
+        if (range_ok) return pc >= virt && pc - virt < top - phys;
+        return pc == virt;
+    }
+    if (range_ok) return pc >= phys && pc < top;
+    return pc == phys;
+}
+
+/* T1: see the design comment above. Called by the dispatcher before the
+   fetch of every block while armed; fast-outs until the entry edge. */
+static void hv_bootargs_t1_fetch(HvCpu *cpu, uint64_t prev_pc) {
+    if (cpu->index != 0 || cpu->el != 1) return;
+    /* Each patch spends its own T1 latch; with the DT gate unset the
+       boot-args flow below is the original flow unchanged. */
+    int ba_active = getenv("HV_BOOTARGS_APPEND") && !hv_bootargs_patch_settled();
+    int dt_active = hv_dtplant_gate_on() && !hv_dtplant_settled();
+    if (!ba_active && !dt_active) return;
+    if (!atomic_load_explicit(&bootargs_arm_valid, memory_order_acquire)) return;
+    uint64_t phys = atomic_load_explicit(&bootargs_arm_phys, memory_order_acquire);
+    uint64_t top = atomic_load_explicit(&bootargs_arm_top, memory_order_acquire);
+    uint64_t virt = atomic_load_explicit(&bootargs_arm_virt, memory_order_acquire);
+    int range_ok = atomic_load_explicit(&bootargs_arm_range_ok, memory_order_acquire);
+    if (!hv_bootargs_in_kernel_range(cpu, cpu->pc, phys, top, virt, range_ok)) return;
+    if (hv_bootargs_in_kernel_range(cpu, prev_pc, phys, top, virt, range_ok)) return; /* not the first fetch */
+    uint64_t off = 0;
+    int have_off = hv_bootargs_off_from_ptr(cpu->x[0], &off);
+    if (ba_active && !atomic_exchange_explicit(&bootargs_t1_done, 1, memory_order_acq_rel)) {
+        const char *reason = NULL;
+        if (!(have_off && hv_bootargs_interlock_attempt(off, "T1", &reason))) {
+            if (!reason) reason = "x0 does not identify a valid boot_args struct";
+            if (!hv_bootargs_patch_settled()) hv_bootargs_interlock_pass("T1", reason); /* another path may have won while we validated */
+        }
+    }
+    if (dt_active && !atomic_exchange_explicit(&dtplant_t1_done, 1, memory_order_acq_rel)) {
+        const char *reason = NULL;
+        if (!(have_off && hv_dtplant_attempt(off, "T1", &reason))) {
+            if (!reason) reason = "x0 does not identify a valid boot_args struct";
+            if (!hv_dtplant_settled()) hv_dtplant_pass("T1", reason);
+        }
+    }
+}
+
+/* T2: see the design comment above. Called on every EL1 HVC from the
+   exception path, before psci() answers (and overwrites x0). */
+static void hv_bootargs_t2_hvc(HvCpu *cpu, uint64_t fn) {
+    (void)fn;
+    if (cpu->index != 0 || cpu->el != 1) return;
+    /* Each patch spends its own T2 latch (below); with the DT gate
+       unset the boot-args flow is the original flow unchanged. */
+    int ba_active = getenv("HV_BOOTARGS_APPEND") && !hv_bootargs_patch_settled();
+    int dt_active = hv_dtplant_gate_on() && !hv_dtplant_settled();
+    if (!ba_active && !dt_active) return;
+    /* Eligibility: a boot_args struct must be identifiable right now (armed
+       by the scan, or pointed to by a live register passing the full
+       signature). An earlier hypercall with no identifiable struct is the
+       firmware still building it: not the kernel's first call, and it does
+       not spend the trigger. */
+    int have_armed = atomic_load_explicit(&bootargs_arm_valid, memory_order_acquire);
+    uint64_t armed_off = have_armed ? atomic_load_explicit(&bootargs_arm_found, memory_order_acquire) : 0;
+    uint64_t reg_off[31];
+    int nreg = 0, reg_is_armed = 0;
+    for (int i = 1; i <= 30; i++) {
+        uint64_t off;
+        if (!hv_bootargs_off_from_ptr(cpu->x[i], &off)) continue;
+        if (!hv_bootargs_sig_ok(board.ram, board.ram_size, off, NULL, NULL, NULL)) continue;
+        if (have_armed && off == armed_off) reg_is_armed = 1;
+        else reg_off[nreg++] = off;
+    }
+    if (!have_armed && !nreg && !reg_is_armed) return;
+    if (ba_active && !atomic_exchange_explicit(&bootargs_t2_done, 1, memory_order_acq_rel)) {
+        const char *reason = NULL;
+        int ok = 0;
+        if (reg_is_armed && hv_bootargs_interlock_attempt(armed_off, "T2", &reason)) ok = 1;
+        for (int i = 0; i < nreg && !ok; i++)
+            if (hv_bootargs_interlock_attempt(reg_off[i], "T2", &reason)) ok = 1;
+        if (!ok && have_armed && !reg_is_armed && hv_bootargs_interlock_attempt(armed_off, "T2", &reason)) ok = 1;
+        if (!ok) {
+            if (!reason) reason = "no register or armed struct validates as boot_args at the first hypercall";
+            if (!hv_bootargs_patch_settled()) hv_bootargs_interlock_pass("T2", reason);
+        }
+    }
+    if (dt_active && !atomic_exchange_explicit(&dtplant_t2_done, 1, memory_order_acq_rel)) {
+        const char *reason = NULL;
+        int ok = 0;
+        if (reg_is_armed && hv_dtplant_attempt(armed_off, "T2", &reason)) ok = 1;
+        for (int i = 0; i < nreg && !ok; i++)
+            if (hv_dtplant_attempt(reg_off[i], "T2", &reason)) ok = 1;
+        if (!ok && have_armed && !reg_is_armed && hv_dtplant_attempt(armed_off, "T2", &reason)) ok = 1;
+        if (!ok) {
+            if (!reason) reason = "no register or armed struct validates as boot_args at the first hypercall";
+            if (!hv_dtplant_settled()) hv_dtplant_pass("T2", reason);
+        }
+    }
+}
+
+/* Settled means every ENABLED patch has settled; with the DT gate
+   unset this is exactly hv_bootargs_patch_settled(). */
+static int hv_patches_all_settled(void) {
+    if (getenv("HV_BOOTARGS_APPEND") && !hv_bootargs_patch_settled()) return 0;
+    if (hv_dtplant_gate_on() && !hv_dtplant_settled()) return 0;
+    return 1;
+}
+
+static void *hv_bootargs_poll_thread(void *unused) {
+    (void)unused;
+    HvBootDisplay d;
+    while (!hv_patches_all_settled()) {
+        hv_bootargs_try_arm(); /* arm the interlocks the moment the struct is signature-valid */
+        hv_vm_boot_display(&d);
+        if (hv_patches_all_settled()) break;
+        usleep(50000);
+    }
+    return NULL;
+}
 
 /* arm64 boot_args: {u16 Revision, u16 Version, u64 virtBase, physBase, memSize,
    topOfKernelData, Video {baseAddr, display, rowBytes, width, height, depth}, ...}.
@@ -88,6 +548,8 @@ int hv_vm_boot_display(HvBootDisplay *d) {
                 if (w < 320 || w > 8192 || hh < 200 || hh > 8192 || row < w * 4 || (depth & 0xff) != 32) continue;
                 if (base < VMAPPLE_MEM || base - VMAPPLE_MEM + row * hh > size) continue;
                 boot_args_offset = off;
+                hv_bootargs_maybe_patch(ram, size, off); /* inert unless HV_BOOTARGS_APPEND is set */
+                hv_dtplant_maybe_plant(ram, size, off); /* inert unless HV_DT_PLANT_INTERNAL=1 */
             }
         }
         if (!boot_args_offset) return -1;
@@ -285,6 +747,13 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     atomic_store_explicit(&display_pvg, board.pvg, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
     atomic_store(&input_stopping, 0);
+    if (getenv("HV_BOOTARGS_APPEND") || hv_dtplant_gate_on()) { /* On this host nothing polls hv_vm_boot_display during boot, so give the scanner a cadence (the poll thread also arms the interlocks); the interlock hooks patch at kernel entry / first hypercall, the poll patch latches at first detection as the safety net, and the thread then exits. The same hooks and thread also serve the DT plant when its own gate is set; with neither gate set nothing here runs, exactly as alt-6. */
+        bootargs_t0 = hv_bootargs_now();
+        m.bootargs_fetch_hook = hv_bootargs_t1_fetch;
+        m.bootargs_hvc_hook = hv_bootargs_t2_hvc;
+        pthread_t pt;
+        pthread_create(&pt, NULL, hv_bootargs_poll_thread, NULL);
+    }
     return 0;
 }
 

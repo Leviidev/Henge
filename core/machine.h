@@ -242,6 +242,12 @@ typedef struct HvMachine {
     uint64_t stop_pc;    /* tests: leave the dispatcher when pc reaches this */
     void (*stop_hook)(HvCpu *cpu); /* debugging: call this there instead of leaving */
     uint64_t stop_pc2;   /* debugging: a second such place */
+    /* Boot-args interlock (host/vm.c): NULL unless HV_BOOTARGS_APPEND arms them.
+       fetch: the dispatcher calls it before each block fetch, with the next block's CPU
+       state and the previous block's PC. hvc: called on an EL1 HVC before x0 (the call
+       number) is answered, so the entry registers are still live. */
+    void (*bootargs_fetch_hook)(HvCpu *cpu, uint64_t prev_pc);
+    void (*bootargs_hvc_hook)(HvCpu *cpu, uint64_t fn);
     uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
     int gen_checks;
     int trace;           /* print every block entered */

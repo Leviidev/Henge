@@ -981,6 +981,7 @@ static int run_loop(HvCpu *cpu, int one) {
             m->stop_hook(cpu);
             pending_chain = NULL; /* every call must come back through here */
         }
+        if (m->bootargs_fetch_hook) m->bootargs_fetch_hook(cpu, prev_pc); /* Kernel-entry interlock (NULL unless HV_BOOTARGS_APPEND) */
 
         if ((m->log || m->gen_checks) && cpu->el && (cpu->sctlr_el1 & 1) && !((cpu->pc >> 55) & 1) && cpu->pc >= 0x100000000ull) { /* EL1 at a user address: how did we get here? */
             static int reported;

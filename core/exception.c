@@ -242,6 +242,7 @@ int hv_exception_insn(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         return 1;
     }
     if (opc == 0 && ll == 2 && cpu->el == 1) { /* HVC: the hypervisor's PSCI and vmapple's PAC calls */
+        if (cpu->m && cpu->m->bootargs_hvc_hook) cpu->m->bootargs_hvc_hook(cpu, cpu->x[0]); /* First-hypercall interlock, before psci() overwrites x0 */
         cpu->x[0] = psci(cpu, cpu->x[0]);
         if (!cpu->halted && !cpu->off) return 0; /* like a call: the block carries on (xnu makes one per context switch) */
         cpu->pc = pc + 4;
