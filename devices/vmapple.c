@@ -229,6 +229,7 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     hv_virtio_input_poll(b->mouse);
     hv_virtio_snd_poll(b->snd);
     hv_virtio_usb_poll(b->vusb);
+    hv_virtio_balloon_poll(b->balloon);
     hv_bdif_poll(b->bdif);
     return deadline; /* every GIC state change already updated the CPU's lines */
 }
@@ -245,6 +246,7 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
+    b->ram_fd = -1;
     b->m = m;
     b->cpu = cpu;
     b->ncpus = cfg->nr_cpus ? (int)cfg->nr_cpus : 1;
@@ -266,7 +268,8 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             unlink(ram_file);
             if (ftruncate(fd, (off_t)ram_size) == 0)
                 b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            close(fd);
+            if (b->ram != MAP_FAILED) b->ram_fd = fd; /* the balloon punches holes in it */
+            else close(fd);
         }
         if (b->ram == MAP_FAILED) fprintf(stderr, "hengevm: guest RAM file %s failed: %s; using anonymous memory\n", ram_file, strerror(errno));
         else {
@@ -315,6 +318,10 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     if (!order) b->mouse = hv_virtio_input_create(m, b->pcie, HV_VINPUT_MOUSE);
     if (!getenv("HV_NO_SOUND")) b->snd = hv_virtio_snd_create(m, b->pcie);
     if ((aux && !b->aux_blk) || (root && !b->root_blk)) return -1;
+    if (getenv("HV_BALLOON")) {
+        b->balloon = hv_virtio_balloon_create(m, b->pcie, b->ram, VMAPPLE_MEM, ram_size, b->ram_fd);
+        hv_virtio_balloon_set_target(b->balloon, (uint64_t)atoll(getenv("HV_BALLOON")) << 20);
+    }
     /* Installer boots (the ROM goes to DFU) get the USB device port, as VZ gives it. */
     if (cfg->run_installer1 || cfg->run_installer2) {
         b->vusb = hv_virtio_usb_create(m, b->pcie);
@@ -359,6 +366,7 @@ void hv_vmapple_destroy(HvVmapple *b) {
         free(b->vusb);
     }
     if (b->snd) { free(b->snd->ring); free(b->snd); }
+    free(b->balloon);
     if (b->keyboard) { pthread_mutex_destroy(&b->keyboard->mu); free(b->keyboard); }
     if (b->mouse) { pthread_mutex_destroy(&b->mouse->mu); free(b->mouse); }
     if (b->usb) { pthread_mutex_destroy(&b->usb->mu); free(b->usb); }
@@ -375,5 +383,7 @@ void hv_vmapple_destroy(HvVmapple *b) {
     free(b->cfg);
     if (b->rom && b->rom != MAP_FAILED) munmap(b->rom, ROM_SIZE);
     if (b->ram && b->ram != MAP_FAILED) munmap(b->ram, b->ram_size);
+    if (b->ram_fd >= 0) close(b->ram_fd);
     memset(b, 0, sizeof *b);
+    b->ram_fd = -1;
 }

@@ -5,7 +5,7 @@
 #include "henge-vm.h"
 #include "henge-ios-jit.h"
 
-#define HENGE_ENGINE_ABI 2
+#define HENGE_ENGINE_ABI 3
 
 #define HENGE_ENGINE_RESULTS(X) \
     X(int, henge_install_step, (void), (), -1) \
@@ -17,8 +17,10 @@
     X(int, henge_vm_exit_outcome, (void), (), HENGE_VM_OUTCOME_ERROR) \
     X(const char *, henge_vm_exit_reason, (void), (), "Engine unavailable") \
     X(int, henge_vm_knob, (const char *name, int value), (name, value), 0) \
+    X(long, henge_vm_balloon, (long target_mb), (target_mb), -1) \
     X(uint64_t, henge_vm_blocks, (void), (), 0) \
     X(uint64_t, henge_vm_net_frames, (int sent), (sent), 0) \
+    X(uint64_t, henge_vm_dns, (int which), (which), 0) \
     X(int, henge_vm_cpus_on, (void), (), 0) \
     X(int, henge_vm_guest_el0, (void), (), 0) \
     X(char *, henge_share_take_clipboard, (void), (), NULL) \

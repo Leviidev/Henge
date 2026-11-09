@@ -20,8 +20,6 @@ static HengeDualMapping mapping;
 static int failures;
 static _Atomic int reader_done;
 HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
-/* The lifecycle check runs on macOS; the app-only iOS memory budget is unused. */
-size_t os_proc_available_memory(void) { return 0; }
 void hv_prof_ios_start(void) {}
 int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
                      HvInstallProgress progress, void *user) {
@@ -59,6 +57,7 @@ static void *read_ui(void *unused) {
         henge_vm_pointer(&x, &y);
         henge_vm_cpus_on();
         henge_vm_gpu_frames();
+        henge_vm_balloon(-1);
         henge_vm_set_display_layer(NULL);
         if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
         usleep(500);
@@ -67,17 +66,24 @@ static void *read_ui(void *unused) {
 }
 int main(void) {
     alarm(60);
-    char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], error[256];
+    char dir[] = "/tmp/henge-lifecycle-XXXXXX", rom[256], disk[256], aux[256], ram[256], error[256];
     if (!mkdtemp(dir) || hv_jit_region_open(&jit, 8 << 20)) return 1;
     snprintf(rom, sizeof rom, "%s/rom", dir);
     snprintf(disk, sizeof disk, "%s/disk", dir);
     snprintf(aux, sizeof aux, "%s/aux", dir);
+    snprintf(ram, sizeof ram, "%s/ram", dir);
+    setenv("HV_RAM_FILE", ram, 1);
+    setenv("HV_RAM_NO_LEDGER", "1", 1);
+    setenv("HV_BALLOON", "0", 1);
     write_file(disk, NULL, 1 << 20);
     write_file(aux, NULL, 1 << 20);
     mapping = (HengeDualMapping){.rx_addr = (uint8_t *)jit.base,
         .rw_addr = (uint8_t *)jit.base + jit.rw_diff, .size = jit.capacity * 4};
     pthread_t reader;
     if (pthread_create(&reader, NULL, read_ui, NULL)) return 1;
+    /* Warm the process-wide pointer queue before counting worker threads. */
+    hv_vm_mouse_move(0, 0);
+    usleep(100000);
     int initial_fds = fds();
     unsigned initial_threads = threads();
     /* Missing ROM fails after disks, RAM and device workers were created. */
@@ -96,7 +102,13 @@ int main(void) {
         if (rc) fprintf(stderr, "boot %d: %s\n", i, error);
         check("boot succeeds without restarting app", rc == 0);
         if (rc) break;
-        if (outcome == HENGE_VM_OUTCOME_HOST_STOP) henge_vm_stop();
+        if (outcome == HENGE_VM_OUTCOME_HOST_STOP) {
+            henge_vm_mouse_button(0, 1);
+            henge_vm_mouse_button(1, 1);
+            henge_vm_mouse_move(5, 7);
+            henge_vm_mouse_button(1, 0);
+            henge_vm_stop();
+        }
         for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
         check("terminal state is published after cleanup", henge_vm_state() == 2);
         if (henge_vm_state() != 2) exit(1);
@@ -104,6 +116,8 @@ int main(void) {
         check("start is available again", henge_vm_can_start());
         check("new generation", henge_vm_generation() == (uint64_t)i + 1);
         check("RAM released", hv_vm_board()->ram == NULL);
+        check("RAM file closed", hv_vm_board()->ram_fd == -1);
+        check("balloon released", hv_vm_board()->balloon == NULL);
         check("translation metadata released", hv_vm_machine()->blocks == NULL && hv_vm_machine()->jit.base == NULL);
         check("borrowed JIT mapping retained", mapping.rx_addr == (uint8_t *)jit.base);
         check("no disk or network descriptor leak", fds() == initial_fds);

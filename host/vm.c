@@ -3,6 +3,7 @@
 
 #include <TargetConditionals.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <os/lock.h>
 #include <stdatomic.h>
 #include <pthread.h>
@@ -24,7 +25,9 @@
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
 static int ncpus = 1;
-static HvVmapple board;
+static HvVmapple board = {.ram_fd = -1};
+static _Atomic int input_stopping = 1;
+static void stop_pointer(void);
 /* UI display changes may arrive before or during the background machine creation. */
 static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
 static CFTypeRef display_layer;
@@ -281,6 +284,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (display_layer_set && board.pvg) hv_pvg_lite_set_layer(board.pvg, (void *)display_layer);
     atomic_store_explicit(&display_pvg, board.pvg, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
+    atomic_store(&input_stopping, 0);
     return 0;
 }
 
@@ -295,6 +299,7 @@ void hv_vm_destroy(void) {
     os_unfair_lock_lock(&display_lock);
     atomic_store_explicit(&display_pvg, NULL, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
+    stop_pointer();
     hv_net_detach();
     net_on = 0;
     hv_audio_detach();
@@ -442,25 +447,102 @@ void hv_vm_stop(void) {
     hv_machine_halt(&m, HV_HALT_HOST);
 }
 
+/* macOS's virtio mouse driver drops BTN_RIGHT, so the right button is a Control-click, with the right
+   Control. The USB keyboard is read every 10 ms and the click goes over virtio, so Control goes down
+   50 ms before the click and comes up 50 ms after it. The waits run on a serial queue that the pointer's
+   moves and buttons all go through, so they stay in order and the caller (often the main thread) never
+   waits. The guest's right Control and left button each have two owners, and stay down while either holds them. */
+#define HID_RIGHT_CONTROL 0xe4
+#define LINUX_KEY_RIGHTCTRL 97
+static os_unfair_lock rctrl_lock = OS_UNFAIR_LOCK_INIT;
+static int rctrl_user, rctrl_click;
+static int left_user, left_click, left_sent; /* only the pointer queue touches these */
+
+static dispatch_queue_t pointer_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("henge.pointer", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+
+static void stop_pointer(void) {
+    atomic_store(&input_stopping, 1);
+    /* The bridge excludes new input. Finish a click already in progress and
+       discard queued input before releasing the keyboard and mouse. */
+    dispatch_sync(pointer_queue(), ^{
+        left_user = left_click = left_sent = 0;
+        os_unfair_lock_lock(&rctrl_lock);
+        rctrl_user = rctrl_click = 0;
+        os_unfair_lock_unlock(&rctrl_lock);
+    });
+}
+
+static void rctrl_hold(int *owner, int down) {
+    os_unfair_lock_lock(&rctrl_lock);
+    *owner = down;
+    hv_xhci_key(board.usb, HID_RIGHT_CONTROL, rctrl_user || rctrl_click);
+    os_unfair_lock_unlock(&rctrl_lock);
+}
+
 void hv_vm_key(uint16_t code, int down) {
-    hv_xhci_key_linux(board.usb, code, down);
+    if (code == LINUX_KEY_RIGHTCTRL) rctrl_hold(&rctrl_user, down);
+    else hv_xhci_key_linux(board.usb, code, down);
 }
 
 void hv_vm_key_hid(uint8_t usage, int down) {
-    hv_xhci_key(board.usb, usage, down);
+    if (usage == HID_RIGHT_CONTROL) rctrl_hold(&rctrl_user, down);
+    else hv_xhci_key(board.usb, usage, down);
 }
 
-void hv_vm_mouse_move(int dx, int dy) {
+static void move_now(void *ctx) {
+    if (atomic_load(&input_stopping)) return;
+    int64_t packed = (int64_t)(intptr_t)ctx;
+    int32_t dx = (int32_t)(packed >> 32), dy = (int32_t)packed;
     if (dx) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, dx);
     if (dy) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, dy);
     hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
 }
 
-void hv_vm_mouse_button(int button, int down) {
-    static const uint16_t codes[3] = {HV_BTN_LEFT, HV_BTN_RIGHT, HV_BTN_MIDDLE};
-    if (button < 0 || button > 2) return;
-    hv_virtio_input_send(board.mouse, HV_EV_KEY, codes[button], down);
+void hv_vm_mouse_move(int dx, int dy) {
+    int64_t packed = (int64_t)((uint64_t)(uint32_t)dx << 32 | (uint32_t)dy);
+    dispatch_async_f(pointer_queue(), (void *)(intptr_t)packed, move_now);
+}
+
+static void left_update(void) {
+    int down = left_user || left_click;
+    if (down == left_sent) return;
+    left_sent = down;
+    hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, down);
     hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+}
+
+static void button_now(void *ctx) {
+    if (atomic_load(&input_stopping)) return;
+    intptr_t v = (intptr_t)ctx;
+    int button = (int)(v >> 1), down = (int)(v & 1);
+    if (button == 0) {
+        left_user = down;
+        left_update();
+    } else if (button == 1 && down != left_click) {
+        if (down) {
+            rctrl_hold(&rctrl_click, 1);
+            usleep(50000);
+        }
+        left_click = down;
+        left_update();
+        if (!down) {
+            usleep(50000);
+            rctrl_hold(&rctrl_click, 0);
+        }
+    } else if (button == 2) {
+        hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_MIDDLE, down);
+        hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+    }
+}
+
+void hv_vm_mouse_button(int button, int down) {
+    if (button < 0 || button > 2) return;
+    dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
 }
 
 /* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */

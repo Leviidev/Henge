@@ -33,6 +33,7 @@
 PROGRAM(r4_a); PROGRAM(r4_b); PROGRAM(r4_c); PROGRAM(r4_d);
 PROGRAM(r4_pair); PROGRAM(r4_atomic); PROGRAM(r4_jump);
 PROGRAM(r4_value); PROGRAM(r4_wait);
+PROGRAM(r4_page_end);
 
 static HvMachine m;
 static HvCpu cpu, peer;
@@ -203,6 +204,49 @@ static void atomics(void) {
     check("unaligned atomic faults", cpu.esr_el1 & 63, HV_FSC_ALIGNMENT);
 }
 
+static void page_end(void) {
+    setup(12); data_pages();
+    program(0, r4_page_end, r4_page_end_end);
+    uint64_t value = 0x1122334455667788ull, got = 0;
+    memcpy(ram + data_pa(0) - RAM_PA + 4088, &value, 8);
+    cpu.x[0] = DATA_VA + 4088;
+    cpu.x[1] = DATA_VA + 4096 + 4088;
+    run(CODE_VA); // warm the code and both separate data mappings
+    uint64_t slow = m.stat_slow_mem;
+    run(CODE_VA);
+    memcpy(&got, ram + data_pa(1) - RAM_PA + 4088, 8);
+    check("last aligned word copied", got, value);
+    if (HV_TLB_PAGE_BITS == 12 && hv_knob[HV_K_RECHECK])
+        check("page-end recheck avoids slow load and store", m.stat_slow_mem - slow, 0);
+    map(DATA_VA + 8192, 0, 0);
+    invalidate(&cpu, DATA_VA + 8192);
+    cpu.x[0] = DATA_VA + 4096 + 4092;
+    run(CODE_VA);
+    check("page-end recheck still faults across an unmapped page", cpu.far_el1, DATA_VA + 8192);
+    check("page-end crossing fault type", cpu.esr_el1 & 63, HV_FSC_TRANSLATION(3));
+}
+
+static void remote_range_pages(void) {
+    setup(HV_TLB_PAGE_BITS);
+    const uint64_t page = 1ull << HV_TLB_PAGE_BITS;
+    const uint64_t start = DATA_VA + 3 * page, walked = start + page;
+    map(walked, data_pa(0), DESC | UXN);
+    configure(&peer, 1);
+    translate(&peer, walked); // let the real walker log the page, including its 4 KB offset
+    HvPerCpu *p = peer.pc_state;
+    uint32_t seq = p->walk_seq;
+    __atomic_store_n(&p->walk_seq, seq - 1, __ATOMIC_SEQ_CST); // replay that walk while it is in progress
+    check("remote range waits for its last page's walk", hv_tlbi_drop_remote_range(&peer, start, 2, 7), 0);
+    check("remote range allows a walk outside it", hv_tlbi_drop_remote_range(&peer, start + 2 * page, 2, 7), 1);
+    __atomic_store_n(&p->walk_seq, seq, __ATOMIC_SEQ_CST);
+    HvTlbEntry *entry = hv_tlb_ent(&peer, (walked >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 0);
+    entry->exec_tag = hv_exec_key(walked, entry->addend);
+    peer.exit_req = 0;
+    check("remote range drops last page's executable mapping", hv_tlbi_drop_remote_range(&peer, start, 2, 7), 1);
+    check("remote range makes running code leave its block", peer.exit_req, 1);
+    m.ncpus = 1; m.cpus[1] = NULL;
+}
+
 static void code_changes(void) {
     setup(12); data_pages();
     program(0, r4_jump, r4_jump_end);
@@ -369,7 +413,7 @@ int main(int argc, char **argv) {
         if (!n || (g != 12 && g != 14 && g != 16)) return 2;
         benchmark(n, g);
     } else {
-        boundaries(); atomics(); code_changes(); invalidations(); address_spaces(); remote_invalidation();
+        boundaries(); atomics(); page_end(); code_changes(); invalidations(); address_spaces(); remote_range_pages(); remote_invalidation();
         benchmark(10000, 12); benchmark(10000, 14); benchmark(10000, 16);
     }
     printf("4K cache: %d checks, %d failures (software page %u)\n", checks, failures, 1u << HV_TLB_PAGE_BITS);

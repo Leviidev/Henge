@@ -49,6 +49,8 @@ int main(int argc, char **argv) {
     assert(!dlsym(RTLD_DEFAULT, "hv_rosetta_host_supported"));
     assert(henge_vm_state() == 0 && henge_vm_blocks() == 0);
     assert(henge_vm_can_start() && henge_vm_generation() == 0);
+    assert(henge_vm_balloon(-1) == -1);
+    assert(henge_vm_dns(0) == 0 && henge_vm_dns(1) == 0 && henge_vm_dns(2) == 0);
     assert(henge_vm_exit_outcome() == HENGE_VM_OUTCOME_ERROR);
     henge_vm_free_display(NULL);
     assert(henge_vm_guest_el0() == 0 && henge_vm_cpus_on() == 0);

@@ -60,6 +60,11 @@ BEGIN r4_value
     mov x5, #77
     br x15
 END r4_value
+BEGIN r4_page_end
+    ldr x5, [x0]
+    str x5, [x1]
+    br x15
+END r4_page_end
 BEGIN r4_wait
 1:  ldar x5, [x0]
     cmp x5, #2
