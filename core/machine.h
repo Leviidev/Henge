@@ -248,6 +248,10 @@ typedef struct HvMachine {
        number) is answered, so the entry registers are still live. */
     void (*bootargs_fetch_hook)(HvCpu *cpu, uint64_t prev_pc);
     void (*bootargs_hvc_hook)(HvCpu *cpu, uint64_t fn);
+    /* The machine's UUID (16 raw bytes, all zero when the host supplied
+       none), copied from HvVmConfig by hv_vm_create before devices are
+       built; the Bluetooth core derives its controller address from it. */
+    uint8_t machine_uuid[16];
     uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
     int gen_checks;
     int trace;           /* print every block entered */

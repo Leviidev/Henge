@@ -15,6 +15,7 @@ typedef struct HvVmConfig {
     const char *disk, *aux;   /* the root disk image and the auxiliary storage */
     uint64_t aux_offset;      /* where the aux image's data starts (16 KB) */
     uint64_t ecid, seed;      /* the machine identity the disk was installed with */
+    uint8_t machine_uuid[16]; /* the machine's UUID (its app-side record's id); all zero = none supplied */
     uint64_t ram_mb;
     int ncpus;
     int log;                  /* m->log */

@@ -3,10 +3,14 @@
    Header-only and dependency-free so the exact code linked into hengevm
    (via host/vm.c) is also what tests/test_dtplant.c exercises, against
    the synthetic ADT fixture in tests/fixtures (a generated blob built
-   from the format definition below). Pure buffer operations: no
-   globals, no I/O, no allocation; every failure returns 0 with *reason
-   set and the buffer byte-identical to its input (the one write path
-   rolls back if its post-insert re-walk fails).
+   from the format definition below). Pure buffer operations: no I/O,
+   no allocation; every failure returns 0 with *reason set and the
+   buffer byte-identical to its input (the one write path rolls back
+   if its post-insert re-walk fails). The one piece of state is the
+   machine-identity seed below, set by the host before any insert,
+   process-wide like the HCI core's seed: this process hosts one
+   machine. The planted value's identity bytes are derived from that
+   seed, so no fixed internal-controller identity is ever served.
    ADT format (the definition the fixture is generated from):
      node     := u32 nProperties, u32 nChildren, properties, children
      property := char name[32] (NUL-padded), u32 length, value bytes
@@ -27,10 +31,59 @@
 #define DTPLANT_ENTRY_SIZE 52 /* 32 name + 4 length + 16 (14 padded to 4) */
 #define DTPLANT_PAGE 16384u /* iBoot pads the in-RAM tree to its last 16 KiB page (QEMU vmapple precedent) */
 
-static const uint8_t dtplant_payload[DTPLANT_PAYLOAD_LEN] = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* producer-proven zeros */
-    0x01, 0x00, 0x00, 0x98, 0x18, 0xF0 /* internal addr, HCI wire order: F0:18:98:00:00:01 */
-};
+/* ---- per-machine identity seed -----------------------------------------
+   The host supplies the machine UUID's 16 raw bytes before any insert
+   (dtplant_set_machine_uuid). All zero means no machine identity was
+   supplied; insert then fails clean (below), because the payload's
+   identity bytes are derived from the seed and there is no fixed
+   identity to fall back to. */
+static uint8_t dtplant_seed[16];
+
+static inline void dtplant_set_machine_uuid(const uint8_t uuid[16]) {
+    if (uuid) memcpy(dtplant_seed, uuid, 16);
+    else memset(dtplant_seed, 0, 16);
+}
+
+static inline int dtplant_seed_present(void) {
+    for (int i = 0; i < 16; i++)
+        if (dtplant_seed[i]) return 1;
+    return 0;
+}
+
+/* The derived internal-address suffix: FNV-1a, 64-bit, over the seed's
+   16 bytes; the low 24 bits, one byte per address octet, composed
+   exactly as the HCI core composes its derived suffix. The guards are
+   the core's (a zero suffix, or one equal to either legacy fixed
+   controller suffix, is XORed with 0x000001), plus one more: a result
+   equal to the legacy fixed internal suffix this derivation replaces
+   is XORed with 0x010100, so the plant never serves that fixed
+   identity, including via the zero-suffix guard's own mapping. */
+static inline uint32_t dtplant_derived_suffix(void) {
+    uint64_t x = 14695981039346656037ULL;
+    for (int i = 0; i < 16; i++) {
+        x ^= dtplant_seed[i];
+        x *= 1099511628211ULL;
+    }
+    uint32_t suffix = (uint32_t)(x & 0xffffff);
+    if (suffix == 0 || suffix == 0xb20702 || suffix == 0xda7113) suffix ^= 0x000001;
+    if (suffix == 0x000001) suffix ^= 0x010100;
+    return suffix;
+}
+
+/* Build the 14-byte payload: the leading eight bytes stay the
+   format's zero prefix; the last six are the internal address in HCI
+   wire order (LSB first): the high three display octets stay
+   F0:18:98, the low three are the derived suffix. */
+static inline void dtplant_build_payload(uint8_t out[DTPLANT_PAYLOAD_LEN]) {
+    memset(out, 0, DTPLANT_PAYLOAD_LEN);
+    uint32_t sfx = dtplant_derived_suffix();
+    out[8] = (uint8_t)sfx;
+    out[9] = (uint8_t)(sfx >> 8);
+    out[10] = (uint8_t)(sfx >> 16);
+    out[11] = 0x98;
+    out[12] = 0x18;
+    out[13] = 0xF0;
+}
 
 static inline uint32_t dtplant_rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline void dtplant_wr32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
@@ -133,6 +186,9 @@ static int dtplant_inspect(const uint8_t *buf, uint32_t len, DtplantInfo *info, 
    least 52, and be zero-filled; anything else is a clean failure. */
 static int dtplant_insert(uint8_t *buf, uint32_t len, uint64_t bound, uint32_t *new_len_out, const char **reason) {
     if (!buf || len < 8 || (uint64_t)len > bound) { *reason = "adt blob out of allocation bounds"; return 0; }
+    if (!dtplant_seed_present()) { *reason = "no machine identity supplied for the plant payload"; return 0; }
+    uint8_t dtplant_payload[DTPLANT_PAYLOAD_LEN];
+    dtplant_build_payload(dtplant_payload);
     DtplantInfo info;
     if (!dtplant_inspect(buf, len, &info, reason)) return 0;
     if (!info.have_options) { *reason = "options node not found"; return 0; }

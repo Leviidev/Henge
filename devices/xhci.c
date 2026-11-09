@@ -187,11 +187,14 @@ static void bt_fill_device_desc(uint8_t out[18]) {
 
 static const char *bt_string(int idx) {
     if (hv_bt_personality() == HV_BT_PERS_BCM20702) {
-        /* Serial is the BD_ADDR serialization of the HCI
-           identity (00:1F:E1:B2:07:02), "001FE1B20702", 12 chars, so the
-           served string descriptor is 26 bytes. Manufacturer and product
-           are as defined below. */
-        static const char *const bcm[] = {NULL, "Broadcom Corp", "BCM20702A0", "001FE1B20702"};
+        /* Serial is the BD_ADDR serialization of the HCI identity, so it
+           comes from the core (hv_bt_usb_serial), which formats it from
+           the composed address: the fixed identity's serialization
+           (12 chars, so the served string descriptor is 26 bytes) when
+           no machine seed was supplied, the derived address's display
+           hex when one was. Manufacturer and product are as before. */
+        if (idx == 3) return hv_bt_usb_serial();
+        static const char *const bcm[] = {NULL, "Broadcom Corp", "BCM20702A0", NULL};
         return idx >= 0 && idx < 4 ? bcm[idx] : NULL;
     }
     static const char *const csr[] = {NULL, "HengeVM", "HengeVM Bluetooth", "1"};
@@ -1583,6 +1586,7 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     x->m = m;
     pthread_mutex_init(&x->mu, NULL);
     x->bt_present = getenv("HV_NO_BT") == NULL;
+    hv_bt_set_machine_uuid(m ? m->machine_uuid : NULL);
     hv_bt_init(&x->bt);
     if (x->bt_present && getenv("HV_BT_LOG"))
         fprintf(stderr, "xhci: bt dongle personality %s vid %04x pid %04x manufacturer \"%s\" product \"%s\"\n",

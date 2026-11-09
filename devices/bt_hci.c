@@ -10,6 +10,43 @@ static int btlog(void) {
     return on;
 }
 
+/* ---- per-machine identity seed -----------------------------------------
+   The host supplies the machine UUID's 16 raw bytes before init (see
+   hv_bt_set_machine_uuid in bt_hci.h). Process-wide, like the
+   personality selection below: this process hosts one machine. All zero
+   means no machine identity was supplied, and init then composes the
+   fixed per-personality addresses exactly as before. */
+static uint8_t bt_machine_uuid[16];
+static char bt_derived_serial[13]; /* BCM serial for the seeded address, formatted at init */
+static int bt_have_derived_serial;
+
+void hv_bt_set_machine_uuid(const uint8_t uuid[16]) {
+    if (uuid) memcpy(bt_machine_uuid, uuid, 16);
+    else memset(bt_machine_uuid, 0, 16);
+}
+
+static int bt_seed_present(void) {
+    for (int i = 0; i < 16; i++)
+        if (bt_machine_uuid[i]) return 1;
+    return 0;
+}
+
+/* The derived address suffix: FNV-1a, 64-bit, over the seed's 16 bytes;
+   the low 24 bits, one byte per address octet in display order. A suffix
+   of zero, or one equal to either legacy fixed suffix,
+   is XORed with 0x000001, so a derived address never reproduces the
+   all-installs-identical values it replaces. */
+static uint32_t bt_derived_suffix(void) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int i = 0; i < 16; i++) {
+        h ^= bt_machine_uuid[i];
+        h *= 1099511628211ULL;
+    }
+    uint32_t suffix = (uint32_t)(h & 0xffffff);
+    if (suffix == 0 || suffix == 0xb20702 || suffix == 0xda7113) suffix ^= 0x000001;
+    return suffix;
+}
+
 /* ---- personality -------------------------------------------------------
    Default is bcm20702. =csr selects the CSR personality's fixed
    identity bytes. Unknown values fall back to the
@@ -43,7 +80,11 @@ const char *hv_bt_usb_product(void) {
 }
 
 const char *hv_bt_usb_serial(void) {
-    return hv_bt_personality() == HV_BT_PERS_CSR ? "1" : "001FE1B20702";
+    if (hv_bt_personality() == HV_BT_PERS_CSR) return "1";
+    /* Seeded: the serial is the derived BD_ADDR in display hex, formatted
+       by hv_bt_init from the composed address. Seedless: the fixed
+       identity's serialization. */
+    return bt_have_derived_serial ? bt_derived_serial : "001FE1B20702";
 }
 
 const char *hv_bt_local_name(void) {
@@ -111,7 +152,27 @@ static void le_meta_event(HvBtHci *bt, uint8_t subevent, const uint8_t *params, 
 void hv_bt_init(HvBtHci *bt) {
     memset(bt, 0, sizeof *bt);
     bt->personality = hv_bt_personality();
-    if (bt->personality == HV_BT_PERS_BCM20702) {
+    bt_have_derived_serial = 0;
+    if (bt_seed_present()) {
+        /* Per-machine address: the low three octets are derived from the
+           machine UUID (bt_derived_suffix); the high three stay the
+           personality's, with the CSR personality's first display octet
+           carrying the locally administered bit (0x02) in place of its
+           fixed address's 0x00. The same seed feeds both personalities,
+           so one machine keeps one suffix across a personality switch;
+           only the high octets change. Wire order is LSB first. */
+        uint32_t sfx = bt_derived_suffix();
+        if (bt->personality == HV_BT_PERS_BCM20702) {
+            const uint8_t addr[6] = {(uint8_t)sfx, (uint8_t)(sfx >> 8), (uint8_t)(sfx >> 16), 0xe1, 0x1f, 0x00};
+            memcpy(bt->bd_addr, addr, 6);
+            snprintf(bt_derived_serial, sizeof bt_derived_serial, "%02X%02X%02X%02X%02X%02X",
+                     bt->bd_addr[5], bt->bd_addr[4], bt->bd_addr[3], bt->bd_addr[2], bt->bd_addr[1], bt->bd_addr[0]);
+            bt_have_derived_serial = 1;
+        } else {
+            const uint8_t addr[6] = {(uint8_t)sfx, (uint8_t)(sfx >> 8), (uint8_t)(sfx >> 16), 0x7d, 0x1a, 0x02};
+            memcpy(bt->bd_addr, addr, 6);
+        }
+    } else if (bt->personality == HV_BT_PERS_BCM20702) {
         /* Broadcom OUI 00:1F:E1 (registered to Broadcom Corp and the OUI
            BCM20702-era USB dongles ship under); the low three octets
            B2:07:02 name the chip so logs and guest UI identify the model.

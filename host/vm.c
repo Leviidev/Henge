@@ -245,6 +245,7 @@ static int hv_dtplant_attempt(uint64_t found, const char *via, const char **reas
     if (pa < VMAPPLE_MEM || pa >= VMAPPLE_MEM + size || pa - VMAPPLE_MEM + dtlen > size) { *reason = "device tree out of RAM bounds"; goto fail; }
     uint64_t dt_off = pa - VMAPPLE_MEM;
     uint32_t newlen = 0;
+    dtplant_set_machine_uuid(m.machine_uuid); /* the plant payload's identity is derived from this machine's UUID */
     int r = dtplant_insert(ram + dt_off, dtlen, size - dt_off, &newlen, reason);
     if (r == 2) { /* the plant property already present with the exact payload: goal state holds */
         atomic_store_explicit(&dtplant_state, 1, memory_order_release);
@@ -717,6 +718,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
     m.log = c->log;
+    memcpy(m.machine_uuid, c->machine_uuid, sizeof m.machine_uuid);
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;

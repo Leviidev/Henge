@@ -6,9 +6,11 @@
 #include <stdint.h>
 
 /* Builds the machine from imported files, on the JIT region the app holds
-   (henge_ios_jit_prewarm), and starts it. 0, or -1 with a reason in err. */
-int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
-                  int cpus, char *err, size_t errlen);
+   (henge_ios_jit_prewarm), and starts it. machine_uuid is the machine's
+   UUID (16 raw bytes, its record's id); NULL leaves the machine identity
+   unset. 0, or -1 with a reason in err. */
+int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed,
+                  const uint8_t *machine_uuid, uint64_t ram_mb, int cpus, char *err, size_t errlen);
 /* Installs macOS from an IPSW onto a new machine (blank disk and auxiliary
    storage): boots the ROM in DFU mode and runs the restore over its USB port,
    as Virtualization.framework's installer does. workdir is scratch space.

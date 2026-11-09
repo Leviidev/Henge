@@ -90,8 +90,8 @@ static int started(char *err, size_t errlen) {
     return 0;
 }
 
-int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
-                  int cpus, char *err, size_t errlen) {
+int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed,
+                  const uint8_t *machine_uuid, uint64_t ram_mb, int cpus, char *err, size_t errlen) {
     { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
     if (begin_start(err, errlen)) return -1;
     HengeDualMapping *jit = henge_ios_jit_get_mapping();
@@ -101,6 +101,7 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
     }
     HvVmConfig c = {.rom = rom, .disk = disk, .aux = aux, .ecid = ecid, .seed = seed, .ram_mb = ram_mb, .ncpus = cpus, .log = 1,
                     .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
+    if (machine_uuid) memcpy(c.machine_uuid, machine_uuid, sizeof c.machine_uuid);
     fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
             jit->size >> 20);
     if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
