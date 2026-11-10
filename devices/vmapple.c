@@ -1,6 +1,7 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
 #include "panic_candidates.h"
+#include "sysreg.h"
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -329,6 +330,7 @@ int hv_vmapple_load_rom(HvVmapple *b, const char *path) {
 }
 
 void hv_vmapple_reset_cpu(HvVmapple *b) {
+    b->m->cntvoff = hv_counter();
     for (int i = 0; i < b->ncpus; i++) {
         HvCpu *c = &b->cpu[i];
         hv_cpu_reset_index(c, b->m, (uint32_t)i);

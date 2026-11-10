@@ -290,6 +290,11 @@ typedef struct HvMachine {
     uint32_t prof_head, prof_tail;
     int (*host_run_allowed)(void); /* optional host lifecycle gate */
     void (*host_wait_run)(void);
+    /* The host counter when the machine started: every CPU's CNTVOFF, so the guest's virtual counter (its
+       mach_absolute_time) starts near 0 as on a Mac or under Virtualization.framework. With the host's own
+       count (days of uptime) macOS 12 took the user as idle for that long and put itself to sleep while
+       still starting up: its window server never drew. */
+    uint64_t cntvoff;
 } HvMachine;
 
 static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
