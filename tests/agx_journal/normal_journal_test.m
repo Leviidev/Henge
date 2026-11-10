@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#include <mach-o/ldsyms.h>
 static NSString *TestRoot;
 #define HV_AGX_TEST_ROOT TestRoot
 #import "pvg_agx_journal.h"
@@ -7,6 +8,11 @@ int main(int argc,const char **argv) { @autoreleasepool {
     if(argc!=4)return 64;
     TestRoot=@(argv[1]);if([NSFileManager.defaultManager fileExistsAtPath:TestRoot])return 73;
     if(![NSFileManager.defaultManager createDirectoryAtPath:TestRoot withIntermediateDirectories:NO attributes:nil error:nil])return 73;
+    NSString *expectedUUID=hv_agx_image_uuid((const struct mach_header *)&_mh_execute_header);
+    NSDictionary *identity=hv_agx_identity();
+    if(check(![expectedUUID isEqual:@"unknown"] &&
+             [identity[@"executable_uuid"] isEqual:expectedUUID] &&
+             [identity[@"renderer_image_uuid"] isEqual:expectedUUID],"UUID belongs to the linked executable"))return 1;
     NSData *a=[NSData dataWithContentsOfFile:@(argv[2])],*b=[NSData dataWithContentsOfFile:@(argv[3])];
     if(check(a&&b&&! [a isEqual:b],"two valid distinct ordinary libraries"))return 1;
     if(check(!hv_agx_library(a,hv_agx_hash(a),@"disabled-control"),"disabled gate"))return 1;
@@ -15,7 +21,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
     NSMutableArray *results=[NSMutableArray new];
     MTLRenderPipelineDescriptor *d=[MTLRenderPipelineDescriptor new];d.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
     NSMutableDictionary *attempt=[@{@"schema":@1,@"attempt":NSUUID.UUID.UUIDString,@"tag":@14,@"pid":@(getpid()),
-       @"executable_identity":hv_agx_identity(),@"test_scope":@"helper-unit: two successful public-API compiles, manually exercise first/retry labels; no error-recovery or serialized-descriptor integration claim"}mutableCopy];
+       @"executable_identity":identity,@"test_scope":@"helper-unit: two successful public-API compiles, manually exercise first/retry labels; no error-recovery or serialized-descriptor integration claim"}mutableCopy];
     NSUInteger i=0;
     for(NSData *bytes in @[a,b]) {
         NSError *error=nil;

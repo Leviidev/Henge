@@ -7,6 +7,7 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#include <dlfcn.h>
 #include <unistd.h>
 
 static NSString *hv_agx_documents(void) {
@@ -29,23 +30,42 @@ static NSObject *hv_agx_guard(void) {
     static NSObject *guard;static dispatch_once_t once;
     dispatch_once(&once,^{guard=[NSObject new];});return guard;
 }
+static NSString *hv_agx_image_uuid(const struct mach_header *header) {
+    if (!header || header->magic != MH_MAGIC_64) return @"unknown";
+    const uint8_t *p = (const uint8_t *)header + sizeof(struct mach_header_64);
+    const uint8_t *end = p + header->sizeofcmds;
+    for (uint32_t i = 0; i < header->ncmds && (size_t)(end - p) >= sizeof(struct load_command); i++) {
+        const struct load_command *command = (const void *)p;
+        if (command->cmdsize < sizeof *command || command->cmdsize > (size_t)(end - p)) break;
+        if (command->cmd == LC_UUID && command->cmdsize >= sizeof(struct uuid_command))
+            return [[NSUUID alloc] initWithUUIDBytes:((const struct uuid_command *)command)->uuid].UUIDString;
+        p += command->cmdsize;
+    }
+    return @"unknown";
+}
+
 static NSDictionary *hv_agx_identity(void) {
     static NSDictionary *identity;static dispatch_once_t once;
     dispatch_once(&once,^{
-        NSString *uuid=@"unknown";
-        const struct mach_header *header=_dyld_get_image_header(0);
-        if(header && header->magic==MH_MAGIC_64) {
-            const uint8_t *p=(const uint8_t*)header+sizeof(struct mach_header_64);
-            const uint8_t *end=p+header->sizeofcmds;
-            for(uint32_t i=0;i<header->ncmds && p+sizeof(struct load_command)<=end;i++) {
-                const struct load_command *cmd=(const void*)p;
-                if(cmd->cmdsize<sizeof *cmd || cmd->cmdsize>(uintptr_t)(end-p))break;
-                if(cmd->cmd==LC_UUID && cmd->cmdsize>=sizeof(struct uuid_command))
-                    uuid=[[NSUUID alloc]initWithUUIDBytes:((const struct uuid_command*)cmd)->uuid].UUIDString;
-                p+=cmd->cmdsize;
+        /* An injected image can occupy dyld index zero. Resolve this code's
+           actual image first; in debug builds it can be in a dylib. */
+        Dl_info info = {0};
+        const struct mach_header *renderer = dladdr((const void *)&hv_agx_identity, &info)
+            ? (const struct mach_header *)info.dli_fbase : NULL;
+        const struct mach_header *executable = renderer;
+        if (!executable || executable->filetype != MH_EXECUTE) {
+            executable = NULL;
+            uint32_t count = _dyld_image_count();
+            for (uint32_t i = 0; i < count; i++) {
+                const struct mach_header *candidate = _dyld_get_image_header(i);
+                if (candidate && candidate->filetype == MH_EXECUTE) {
+                    executable = candidate;
+                    break;
+                }
             }
         }
-        identity=@{@"executable_uuid":uuid,@"bundle_id":NSBundle.mainBundle.bundleIdentifier?:@"",
+        identity=@{@"executable_uuid":hv_agx_image_uuid(executable),
+            @"renderer_image_uuid":hv_agx_image_uuid(renderer),@"bundle_id":NSBundle.mainBundle.bundleIdentifier?:@"",
             @"bundle_version":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"]?:@""};
     });return identity;
 }
