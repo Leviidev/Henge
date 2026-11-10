@@ -1015,23 +1015,23 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
 - (void)makeTexture:(HvObject *)o at:(uint64_t)at size:(uint32_t)size task:(uint32_t)task {
     NSMutableData *all = [NSMutableData dataWithLength:size];
     if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return;
-    const uint8_t *d = all.bytes;
-    /* {length, page}, a layout table, {tag, size, ref}, the description. */
-    memcpy(&o->length, d, 8);
-    memcpy(&o->vpage, d + 8, 4);
-    const uint8_t *layout = d + 12;
-    o->tex_mips = *(const uint16_t *)layout & 0x3fff;
-    o->tex_slices = *(const uint16_t *)(layout + 2);
-    memcpy(&o->tex_base, layout + 4, 8);
-    memcpy(&o->tex_stride, layout + 12, 8);
-    o->tex_block_h = layout[0x15];
-    uint32_t table = o->tex_mips * 36;
-    if (12 + 0x18 + table + 12 > size) { [self complain:@"texture entry too small"]; return; }
+    HvOrdinaryTextureRecord texture;
+    if (!hv_pvg_decode_ordinary_texture(all.bytes, all.length, &texture)) {
+        [self complain:@"ordinary texture record exceeds its declared layout/descriptor bounds"];
+        return;
+    }
+    o->length = texture.length;
+    o->vpage = texture.page;
+    o->tex_mips = texture.mips;
+    o->tex_slices = texture.slices;
+    o->tex_base = texture.base;
+    o->tex_stride = texture.stride;
+    o->tex_block_h = texture.block_height;
+    size_t table = (size_t)texture.mips * 36;
     o->tex_layout = malloc(table);
-    memcpy(o->tex_layout, layout + 0x18, table);
-    const uint8_t *rec = layout + 0x18 + table;
-    uint32_t tag = *(const uint32_t *)rec;
-    MTLTextureDescriptor *t = (tag == 0x34 || tag == 0x39) ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
+    if (!o->tex_layout) { [self complain:@"ordinary texture layout allocation failed"]; return; }
+    memcpy(o->tex_layout, texture.layout, table);
+    MTLTextureDescriptor *t = texture.v2 ? descriptor_v2(texture.descriptor) : descriptor_v1(texture.descriptor);
     t.storageMode = MTLStorageModePrivate;
     t.usage |= MTLTextureUsageShaderRead;
     o->object = [device newTextureWithDescriptor:t];

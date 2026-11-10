@@ -259,3 +259,8 @@ test-agx-journal: $(B)/test_agx_journal $(B)/agx_journal_a.metallib $(B)/agx_jou
 test-pvg-task-lifecycle:
 	python3 tests/test_pvg_task_lifecycle.py
 .PHONY: test-pvg-task-lifecycle
+
+# CPU-only ordinary texture decoding under ASan and UBSan.
+test-pvg-ordinary-texture:
+	python3 tests/test_pvg_ordinary_texture.py
+.PHONY: test-pvg-ordinary-texture
