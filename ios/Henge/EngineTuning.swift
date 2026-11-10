@@ -16,6 +16,12 @@ enum EngineTuning {
         "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
         "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
+        // Bluetooth bind: the host interlock appends this
+        // token to the guest boot-args in-window, so bluetoothd latches transport
+        // index 10, passes the VM power gate, and starts the core stack, whose
+        // flag-1 consultation then finds and configures the modeled dongle.
+        "HV_BOOTARGS_APPEND": "bt-transport-override=10",
+        "HV_BT_PERSONALITY": "bcm20702", // the modeled USB dongle personality the guest finder accepts
     ]
 
     static func apply() {

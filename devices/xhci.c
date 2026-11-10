@@ -138,6 +138,135 @@ static const struct HvXhciDev devs[HV_XHCI_DEVICES] = {
     {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
 };
 
+/* ---- the Bluetooth dongle on port 3 ----
+   A USB Bluetooth HCI controller in the shape commodity dongles present:
+   device class 0xe0/0x01/0x01 (Wireless / RF / Bluetooth), CSR-style
+   VID/PID (0x0a12:0x0001), HCI over the control pipe (class request 0x20),
+   events on EP1 IN (interrupt), ACL on EP2 (bulk), SCO on EP3 (isochronous,
+   alternate setting 1). Endpoint DCI map for the BT slot: */
+#define BT_DCI_EVT 3  /* EP1 IN interrupt */
+#define BT_DCI_ACL_OUT 4
+#define BT_DCI_ACL_IN 5
+#define BT_DCI_SCO_OUT 6
+#define BT_DCI_SCO_IN 7
+#define BT_DCI_EP4_OUT 8 /* EP4 OUT bulk (BCM interface 2 only) */
+#define BT_DCI_EP4_IN 9  /* EP4 IN bulk (BCM interface 2 only) */
+
+/* Device descriptor template: class 0xe0/0x01/0x01 in both personalities;
+   VID/PID are patched per HV_BT_PERSONALITY at request time.
+   CSR values are the fixed CSR descriptor bytes. */
+static const uint8_t bt_device_desc_tpl[18] = {
+    18, 1, 0x00, 0x02, 0xe0, 0x01, 0x01, 64, /* USB 2.0, wireless/BT class, EP0 64 */
+    0x12, 0x0a, 0x01, 0x00,                  /* vendor/product: patched below */
+    0x00, 0x01, 1, 2, 3, 1,                  /* bcdDevice 1.00, strings 1-3, one configuration */
+};
+
+/* BCM20702 device descriptor (measured silicon): identical
+   layout to the template except bDeviceClass 0xff/0x01/0x01 (vendor
+   specific, not the E0 wireless class) and bcdDevice 0x0112. VID/PID are
+   patched per personality exactly as in bt_fill_device_desc, so the bytes
+   below at offsets 8-11 are placeholders carrying the BCM values. Served
+   only under the BCM personality; the CSR path never reads this array. */
+static const uint8_t bt_device_desc_bcm[18] = {
+    18, 1, 0x00, 0x02, 0xff, 0x01, 0x01, 64, /* USB 2.0, vendor class FF/01/01, EP0 64 */
+    0x5c, 0x0a, 0xe8, 0x21,                  /* vendor/product: patched below */
+    0x12, 0x01, 1, 2, 3, 1,                  /* bcdDevice 1.12, strings 1-3, one configuration */
+};
+
+static void bt_fill_device_desc(uint8_t out[18]) {
+    if (hv_bt_personality() == HV_BT_PERS_BCM20702)
+        memcpy(out, bt_device_desc_bcm, 18);
+    else
+        memcpy(out, bt_device_desc_tpl, 18);
+    uint16_t vid = hv_bt_usb_vid(), pid = hv_bt_usb_pid();
+    out[8] = (uint8_t)vid;
+    out[9] = (uint8_t)(vid >> 8);
+    out[10] = (uint8_t)pid;
+    out[11] = (uint8_t)(pid >> 8);
+}
+
+static const char *bt_string(int idx) {
+    if (hv_bt_personality() == HV_BT_PERS_BCM20702) {
+        /* Serial is the BD_ADDR serialization of the HCI identity, so it
+           comes from the core (hv_bt_usb_serial), which formats it from
+           the composed address: the fixed identity's serialization
+           (12 chars, so the served string descriptor is 26 bytes) when
+           no machine seed was supplied, the derived address's display
+           hex when one was. Manufacturer and product are as before. */
+        if (idx == 3) return hv_bt_usb_serial();
+        static const char *const bcm[] = {NULL, "Broadcom Corp", "BCM20702A0", NULL};
+        return idx >= 0 && idx < 4 ? bcm[idx] : NULL;
+    }
+    static const char *const csr[] = {NULL, "HengeVM", "HengeVM Bluetooth", "1"};
+    return idx >= 0 && idx < 4 ? csr[idx] : NULL;
+}
+
+static const uint8_t bt_config_desc[62] = {
+    9, 2, 62, 0, 1, 1, 0, 0x80, 50,               /* one interface (2 alt settings), bus powered, 100 mA */
+    9, 4, 0, 0, 3, 0xe0, 0x01, 0x01, 0,           /* interface 0 alt 0: wireless/BT */
+    7, 5, 0x81, 3, 16, 0, 1,                      /* EP1 IN, interrupt, 16 bytes, 1 ms: HCI events */
+    7, 5, 0x82, 2, 64, 0, 1,                      /* EP2 IN, bulk, 64 bytes: ACL in */
+    7, 5, 0x02, 2, 64, 0, 1,                      /* EP2 OUT, bulk, 64 bytes: ACL out */
+    9, 4, 0, 1, 2, 0xe0, 0x01, 0x01, 0,           /* interface 0 alt 1: adds SCO */
+    7, 5, 0x83, 1, 64, 0, 1,                      /* EP3 IN, isochronous, 64 bytes: SCO in */
+    7, 5, 0x03, 1, 64, 0, 1,                      /* EP3 OUT, isochronous, 64 bytes: SCO out */
+};
+
+/* BCM20702 configuration descriptor (measured silicon,
+   218 bytes, external-dongle power variant): wTotalLength 218,
+   bNumInterfaces 4, bmAttributes 0xa0 (bus powered, remote wakeup),
+   MaxPower 50 (100 mA). Interface 0: events/ACL (class FF/01/01).
+   Interface 1 alts 0-5: SCO EP3 pair at 0/9/17/25/33/49. Alt 6 adds
+   interface 1 alt 6 (SCO EP3 pair at 63, the Core 6.0 mSBC setting
+   bluetoothd's FoundBluetoothInterfaces gate demands),
+   extending the blob to 241 bytes with wTotalLength 241. Interface 2:
+   vendor EP4 bulk pair at 32 (class FF/FF/FF). Interface 3: DFU
+   (class FE/01/01) plus its 9-byte DFU functional descriptor. Served
+   only under the BCM personality; CSR keeps bt_config_desc above. */
+static const uint8_t bt_config_desc_bcm[241] = {
+    9, 2, 241, 0, 4, 1, 0, 0xa0, 50,              /* 4 interfaces, bus powered + remote wakeup, 100 mA */
+    9, 4, 0, 0, 3, 0xff, 0x01, 0x01, 0,           /* interface 0 alt 0: vendor/BT FF/01/01 */
+    7, 5, 0x81, 3, 16, 0, 1,                      /* EP1 IN, interrupt, 16 bytes, 1 ms: HCI events */
+    7, 5, 0x82, 2, 64, 0, 1,                      /* EP2 IN, bulk, 64 bytes: ACL in */
+    7, 5, 0x02, 2, 64, 0, 1,                      /* EP2 OUT, bulk, 64 bytes: ACL out */
+    9, 4, 1, 0, 2, 0xff, 0x01, 0x01, 0,           /* interface 1 alt 0: SCO, zero bandwidth */
+    7, 5, 0x83, 1, 0, 0, 1,                       /* EP3 IN, isochronous, 0 bytes: SCO in */
+    7, 5, 0x03, 1, 0, 0, 1,                       /* EP3 OUT, isochronous, 0 bytes: SCO out */
+    9, 4, 1, 1, 2, 0xff, 0x01, 0x01, 0,           /* interface 1 alt 1: SCO 9 */
+    7, 5, 0x83, 1, 9, 0, 1,
+    7, 5, 0x03, 1, 9, 0, 1,
+    9, 4, 1, 2, 2, 0xff, 0x01, 0x01, 0,           /* interface 1 alt 2: SCO 17 */
+    7, 5, 0x83, 1, 17, 0, 1,
+    7, 5, 0x03, 1, 17, 0, 1,
+    9, 4, 1, 3, 2, 0xff, 0x01, 0x01, 0,           /* interface 1 alt 3: SCO 25 */
+    7, 5, 0x83, 1, 25, 0, 1,
+    7, 5, 0x03, 1, 25, 0, 1,
+    9, 4, 1, 4, 2, 0xff, 0x01, 0x01, 0,           /* interface 1 alt 4: SCO 33 */
+    7, 5, 0x83, 1, 33, 0, 1,
+    7, 5, 0x03, 1, 33, 0, 1,
+    9, 4, 1, 5, 2, 0xff, 0x01, 0x01, 0,           /* interface 1 alt 5: SCO 49 */
+    7, 5, 0x83, 1, 49, 0, 1,
+    7, 5, 0x03, 1, 49, 0, 1,
+    9, 4, 1, 6, 2, 0xff, 0x01, 0x01, 0,           /* interface 1 alt 6: SCO 63 */
+    7, 5, 0x83, 1, 63, 0, 1,                      /* EP3 IN, isochronous, 63 bytes: SCO in */
+    7, 5, 0x03, 1, 63, 0, 1,                      /* EP3 OUT, isochronous, 63 bytes: SCO out */
+    9, 4, 2, 0, 2, 0xff, 0xff, 0xff, 0,           /* interface 2 alt 0: Broadcom vendor FF/FF/FF */
+    7, 5, 0x84, 2, 32, 0, 1,                      /* EP4 IN, bulk, 32 bytes */
+    7, 5, 0x04, 2, 32, 0, 1,                      /* EP4 OUT, bulk, 32 bytes */
+    9, 4, 3, 0, 0, 0xfe, 0x01, 0x01, 0,           /* interface 3 alt 0: DFU FE/01/01, no endpoints */
+    9, 0x21, 0x05, 0x88, 0x13, 0x40, 0x00, 0x10, 0x01, /* DFU functional descriptor */
+};
+
+/* The configuration blob for the active personality, with its length. */
+static const uint8_t *bt_config_for_personality(int *len_out) {
+    if (hv_bt_personality() == HV_BT_PERS_BCM20702) {
+        *len_out = (int)sizeof bt_config_desc_bcm;
+        return bt_config_desc_bcm;
+    }
+    *len_out = (int)sizeof bt_config_desc;
+    return bt_config_desc;
+}
+
 static int xlog(void) {
     static int on = -1;
     if (on < 0) on = getenv("HV_XHCI_LOG") != NULL;
@@ -425,6 +554,296 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
 }
 
 /* Run the control transfers queued on the device's endpoint 0. */
+/* ---- the Bluetooth dongle's control requests ---- */
+
+/* Answer a SETUP on the BT device's endpoint 0. HCI commands arrive as a
+   host-to-device class request with bRequest 0 and the command packet as
+   the OUT data stage (handled in run_ep0_bt). The Bluetooth spec text
+   names bmRequestType 0x20 (device recipient); this guest's stack uses
+   0x21 (interface recipient) on the wire, so the dispatch routes on
+   the transfer's semantics, not on one literal byte: class type,
+   host-to-device direction, bRequest 0, and a data stage present. A
+   device-to-host class form (0xA1) is never an HCI command. */
+static int bt_is_hci_command(const uint8_t setup[8]) {
+    return (setup[0] & 0x60) == 0x20 && !(setup[0] & 0x80) && setup[1] == 0 &&
+           (setup[6] | setup[7] << 8) != 0;
+}
+static int control_bt(HvXhci *x, const uint8_t setup[8], uint8_t *out, int max) {
+    uint8_t type = setup[0], req = setup[1];
+    uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
+    uint16_t index = (uint16_t)(setup[4] | setup[5] << 8); /* wIndex: interface number for GET/SET_INTERFACE */
+    if (xlog()) fprintf(stderr, "xhci: bt request %02x %02x value %04x len %u\n", type, req, value, setup[6] | setup[7] << 8);
+    const uint8_t *src = NULL;
+    int len = 0;
+    uint8_t tmp[64];
+    if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
+        uint8_t dt = value >> 8, idx = value & 0xff;
+        if (dt == 1) {
+            static uint8_t desc[18];
+            bt_fill_device_desc(desc);
+            src = desc, len = 18;
+        } else if (dt == 2) {
+            /* Per-personality config blob: 241 bytes BCM, 62 bytes CSR. */
+            int clen = 0;
+            src = bt_config_for_personality(&clen);
+            len = clen;
+        }
+        else if (dt == 3) {
+            if (idx == 0) {
+                tmp[0] = 4, tmp[1] = 3, tmp[2] = 0x09, tmp[3] = 0x04;
+                src = tmp, len = 4;
+            } else if (bt_string(idx)) {
+                const char *s = bt_string(idx);
+                int n = (int)strlen(s);
+                tmp[0] = (uint8_t)(2 + 2 * n), tmp[1] = 3;
+                for (int i = 0; i < n; i++) tmp[2 + 2 * i] = (uint8_t)s[i], tmp[3 + 2 * i] = 0;
+                src = tmp, len = 2 + 2 * n;
+            } else
+                return -1;
+        } else
+            return -1;
+    } else if (type == 0x80 && req == 0) { /* GET_STATUS */
+        tmp[0] = 0, tmp[1] = 0;
+        src = tmp, len = 2;
+    } else if (type == 0x80 && req == 8) { /* GET_CONFIGURATION */
+        tmp[0] = (uint8_t)x->bt_configured;
+        src = tmp, len = 1;
+    } else if (type == 0x00 && req == 9) { /* SET_CONFIGURATION */
+        x->bt_configured = value & 0xff;
+        /* USB: alternate settings reset to 0 on (re)configuration. */
+        memset(x->bt_alt, 0, sizeof x->bt_alt);
+        return 0;
+    } else if (type == 0x81 && req == 10) { /* GET_INTERFACE */
+        /* Personality divergence is in the interface count only: BCM has
+           interfaces 0-3, CSR has interface 0 only. Both personalities
+           answer with the recorded alternate setting (default 0) instead
+           of the previous stall; CSR descriptor bytes are unchanged. */
+        int niface = hv_bt_personality() == HV_BT_PERS_BCM20702 ? 4 : 1;
+        if (index >= (uint16_t)niface) return -1;
+        tmp[0] = x->bt_alt[index];
+        src = tmp, len = 1;
+    } else if (type == 0x01 && req == 11) { /* SET_INTERFACE */
+        int niface = hv_bt_personality() == HV_BT_PERS_BCM20702 ? 4 : 1;
+        if (index >= (uint16_t)niface) return -1;
+        x->bt_alt[index] = (uint8_t)(value & 0xff);
+        if (xlog()) fprintf(stderr, "xhci: bt set_interface iface %u alt %u\n", index, value & 0xff);
+        return 0;
+    } else if (bt_is_hci_command(setup)) { /* HCI command: the data stage carries it */
+        return 0;
+    } else if ((type & 0x60) == 0x20 || (type == 0x00 && (req == 1 || req == 3)) ||
+               (type == 0x02 && (req == 1 || req == 3))) {
+        return 0; /* feature requests: accepted (SET_INTERFACE is handled above) */
+    } else {
+        if (x->m->log) fprintf(stderr, "hengevm: xhci: bt unhandled request %02x %02x value %04x\n", type, req, value);
+        return -1;
+    }
+    if (len > max) len = max;
+    memcpy(out, src, (size_t)len);
+    return len;
+}
+
+/* Run the control transfers queued on the BT device's endpoint 0. Mirrors
+   run_ep0, but on the BT slot's rings and with OUT data stages fed to the
+   HCI core when the setup was the class HCI-command request. An OUT data
+   stage may arrive as a chain of Data TRBs (the 251-byte Write Local Name
+   stage is the first stage large enough for a guest to split); chained
+   fragments are accumulated and handed to the core once, at the unchained
+   tail TRB, so the core always sees the whole command packet. */
+static void run_ep0_bt(HvXhci *x, int slot) {
+    HvXhciRing *r = &x->bep[1];
+    uint32_t trb[4];
+    uint64_t at;
+    uint8_t setup[8], reply[256];
+    uint8_t acc[1056];
+    uint32_t acc_len = 0;
+    int reply_len = 0, stalled = 0, is_hci = 0;
+    while (ring_peek(x, r, trb, &at)) {
+        int type = (trb[3] >> 10) & 0x3f;
+        int ioc = (trb[3] >> 5) & 1;
+        if (type == TRB_SETUP) {
+            memcpy(setup, trb, 8);
+            uint16_t wlen = (uint16_t)(setup[6] | setup[7] << 8);
+            is_hci = bt_is_hci_command(setup);
+            acc_len = 0;
+            reply_len = control_bt(x, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
+            stalled = reply_len < 0;
+            ring_advance(r);
+            if (stalled) {
+                transfer_event(x, at, CC_STALL, 0, slot, 1);
+                set_ep_state(x, slot, 1, 2);
+                x->bep_running[1] = 0;
+                return;
+            }
+            if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
+        } else if (type == TRB_DATA) {
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            int in = (trb[3] >> 16) & 1;
+            uint32_t n = 0;
+            if (in) {
+                n = reply_len < 0 ? 0 : (uint32_t)reply_len < want ? (uint32_t)reply_len : want;
+                if (n) wr(x, buf, reply, n);
+            } else {
+                uint8_t data[1056];
+                uint32_t dn = want < sizeof data ? want : (uint32_t)sizeof data;
+                rd(x, buf, data, dn);
+                if (is_hci) {
+                    int chain = (trb[3] >> 4) & 1;
+                    if (chain || acc_len) {
+                        uint32_t room = (uint32_t)sizeof acc - acc_len;
+                        uint32_t cn = dn < room ? dn : room;
+                        memcpy(acc + acc_len, data, cn);
+                        acc_len += cn;
+                        if (!chain) {
+                            hv_bt_command(&x->bt, acc, acc_len);
+                            acc_len = 0;
+                        }
+                    } else {
+                        hv_bt_command(&x->bt, data, dn);
+                    }
+                }
+                n = want;
+            }
+            ring_advance(r);
+            int isp = (trb[3] >> 2) & 1;
+            if (ioc || (isp && n < want)) transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, 1);
+        } else if (type == TRB_STATUS) {
+            ring_advance(r);
+            if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
+        } else {
+            ring_advance(r);
+            if (ioc) transfer_event(x, at, CC_SUCCESS, 0, slot, 1);
+        }
+    }
+}
+
+/* Deliver queued HCI events / ACL data to the BT endpoints' posted
+   transfers, and consume ACL/SCO data the guest sends. Called from the BT
+   doorbell path and from hv_xhci_poll. */
+static void run_bt_eps(HvXhci *x) {
+    int slot = x->bt_slot;
+    if (!slot) return;
+    uint32_t trb[4];
+    uint64_t at;
+    uint8_t pkt[HV_BT_MAX_PACKET];
+    /* events, interrupt IN */
+    if (x->bep_running[BT_DCI_EVT]) {
+        HvXhciRing *r = &x->bep[BT_DCI_EVT];
+        uint32_t n;
+        while (hv_bt_event_pending(&x->bt)) {
+            if (!ring_peek(x, r, trb, &at)) break; /* no buffer posted yet */
+            n = hv_bt_take_event(&x->bt, pkt, sizeof pkt);
+            if (!n) break;
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t dn = n < want ? n : want;
+            wr(x, buf, pkt, dn);
+            transfer_event(x, at, dn < want ? CC_SHORT_PACKET : CC_SUCCESS, want - dn, slot, BT_DCI_EVT);
+        }
+    }
+    /* ACL in (backend -> guest), bulk IN */
+    if (x->bep_running[BT_DCI_ACL_IN]) {
+        HvXhciRing *r = &x->bep[BT_DCI_ACL_IN];
+        uint32_t n;
+        while (hv_bt_acl_pending(&x->bt)) {
+            if (!ring_peek(x, r, trb, &at)) break;
+            n = hv_bt_take_acl(&x->bt, pkt, sizeof pkt);
+            if (!n) break;
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t dn = n < want ? n : want;
+            wr(x, buf, pkt, dn);
+            transfer_event(x, at, dn < want ? CC_SHORT_PACKET : CC_SUCCESS, want - dn, slot, BT_DCI_ACL_IN);
+        }
+    }
+    /* ACL out (guest -> backend), bulk OUT */
+    if (x->bep_running[BT_DCI_ACL_OUT]) {
+        HvXhciRing *r = &x->bep[BT_DCI_ACL_OUT];
+        while (ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint8_t data[HV_BT_MAX_PACKET];
+            uint32_t dn = want < sizeof data ? want : (uint32_t)sizeof data;
+            rd(x, buf, data, dn);
+            hv_bt_acl_from_guest(&x->bt, data, dn);
+            transfer_event(x, at, CC_SUCCESS, 0, slot, BT_DCI_ACL_OUT);
+        }
+    }
+    /* SCO both ways, isochronous: consume OUT, complete IN with silence */
+    if (x->bep_running[BT_DCI_SCO_OUT]) {
+        HvXhciRing *r = &x->bep[BT_DCI_SCO_OUT];
+        while (ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint8_t data[256];
+            uint32_t dn = want < sizeof data ? want : (uint32_t)sizeof data;
+            rd(x, buf, data, dn);
+            hv_bt_sco_from_guest(&x->bt, data, dn);
+            transfer_event(x, at, CC_SUCCESS, 0, slot, BT_DCI_SCO_OUT);
+        }
+    }
+    if (x->bep_running[BT_DCI_SCO_IN]) {
+        HvXhciRing *r = &x->bep[BT_DCI_SCO_IN];
+        while (ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint8_t zero[64] = {0};
+            uint32_t dn = want < sizeof zero ? want : (uint32_t)sizeof zero;
+            wr(x, buf, zero, dn);
+            transfer_event(x, at, dn < want ? CC_SHORT_PACKET : CC_SUCCESS, want - dn, slot, BT_DCI_SCO_IN);
+        }
+    }
+    /* EP4 vendor pair: exists only in the BCM
+       configuration (interface 2). OUT transfers are consumed and
+       completed (payload discarded: no HCI/ACL consumer exists for this
+       vendor pipe); IN transfers complete with silence/zeros, exactly
+       like SCO IN above. No DCI renumbering: EP3 stays DCI 6/7. */
+    if (x->bep_running[BT_DCI_EP4_OUT]) {
+        HvXhciRing *r = &x->bep[BT_DCI_EP4_OUT];
+        while (ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint8_t data[64];
+            uint32_t dn = want < sizeof data ? want : (uint32_t)sizeof data;
+            rd(x, buf, data, dn);
+            transfer_event(x, at, CC_SUCCESS, 0, slot, BT_DCI_EP4_OUT);
+        }
+    }
+    if (x->bep_running[BT_DCI_EP4_IN]) {
+        HvXhciRing *r = &x->bep[BT_DCI_EP4_IN];
+        while (ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint8_t zero[64] = {0};
+            uint32_t dn = want < sizeof zero ? want : (uint32_t)sizeof zero;
+            wr(x, buf, zero, dn);
+            transfer_event(x, at, dn < want ? CC_SHORT_PACKET : CC_SUCCESS, want - dn, slot, BT_DCI_EP4_IN);
+        }
+    }
+}
+
+/* Run the control transfers queued on the keyboard's endpoint 0. */
 static void run_ep0(HvXhci *x, int slot) {
     HvXhciRing *r = &x->slots[slot].ep[1];
     uint32_t trb[4];
@@ -545,6 +964,12 @@ static void init_ring_from_ctx(HvXhci *x, int slot, int dci) {
     uint64_t ctx = out_ctx(x, slot) + 32ull * dci;
     uint64_t deq;
     rd(x, ctx + 8, &deq, 8);
+    if (slot == x->bt_slot) {
+        x->bep[dci].dequeue = deq & ~0xfull;
+        x->bep[dci].ccs = (int)(deq & 1);
+        x->bep_running[dci] = 1;
+        return;
+    }
     x->slots[slot].ep[dci].dequeue = deq & ~0xfull;
     x->slots[slot].ep[dci].ccs = (int)(deq & 1);
     x->slots[slot].ep_running[dci] = 1;
@@ -556,9 +981,13 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     rd(x, input + 32, slot_ctx, 32);
     rd(x, input + 64, ep0, 32);
     int port = slot_ctx[6]; /* root hub port number, dword 1 bits 23:16 */
-    int dev = port - 1;
-    if (dev < 0 || dev >= HV_XHCI_DEVICES) return CC_TRB_ERROR;
-    x->slots[slot].dev = dev;
+    int is_bt = (port == 3 && x->bt_present);
+    if (port != 1 && port != 2 && !is_bt) return CC_TRB_ERROR;
+    if (!is_bt) {
+        int dev = port - 1;
+        if (dev < 0 || dev >= HV_XHCI_DEVICES) return CC_TRB_ERROR;
+        x->slots[slot].dev = dev;
+    }
     uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot); /* default or addressed; address = slot */
     memcpy(slot_ctx + 12, &dw3, 4);
     uint32_t e0 = 0;
@@ -567,6 +996,10 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     memcpy(ep0, &e0, 4);
     wr(x, out, slot_ctx, 32);
     wr(x, out + 32, ep0, 32);
+    if (port == 3) {
+        x->bt_slot = slot; /* must precede init_ring_from_ctx: it routes by slot */
+        if (xlog()) fprintf(stderr, "xhci: bt dongle addressed in slot %d\n", slot);
+    }
     init_ring_from_ctx(x, slot, 1);
     return CC_SUCCESS;
 }
@@ -574,14 +1007,17 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
 static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfigure) {
     struct HvXhciSlot *s = &x->slots[slot];
     uint64_t out = out_ctx(x, slot);
+    int *running = slot == x->bt_slot ? x->bep_running : x->slots[slot].ep_running;
     if (deconfigure) {
-        for (int dci = 2; dci < HV_XHCI_EPS; dci++) s->ep_running[dci] = 0;
+        for (int dci = 2; dci < HV_XHCI_EPS; dci++) running[dci] = 0;
+        if (slot == x->bt_slot) x->bt_configured = 0;
+        else s->configured = 0;
         return CC_SUCCESS;
     }
     uint32_t drop = rd32(x, input), add = rd32(x, input + 4);
     for (int dci = 2; dci < HV_XHCI_EPS; dci++) {
         if (drop & (1u << dci)) {
-            s->ep_running[dci] = 0;
+            running[dci] = 0;
             uint8_t zero[32] = {0};
             wr(x, out + 32ull * dci, zero, 32);
         }
@@ -642,6 +1078,10 @@ static void run_commands(HvXhci *x) {
                 x->slots[slot].dev = -1;
                 memset(x->slots[slot].ep_running, 0, sizeof x->slots[slot].ep_running);
             }
+            if (slot == x->bt_slot) {
+                x->bt_slot = 0;
+                memset(x->bep_running, 0, sizeof x->bep_running);
+            }
             break;
         case TRB_ADDRESS_DEVICE:
             cc = address_device(x, slot, ptr, (trb[3] >> 9) & 1);
@@ -665,26 +1105,31 @@ static void run_commands(HvXhci *x) {
         }
         case TRB_STOP_EP: {
             int dci = (trb[3] >> 16) & 0x1f;
-            x->slots[slot].ep_running[dci] = 0;
+            HvXhciRing *ring = slot == x->bt_slot ? &x->bep[dci] : &x->slots[slot].ep[dci];
+            if (slot == x->bt_slot) x->bep_running[dci] = 0;
+            else x->slots[slot].ep_running[dci] = 0;
             set_ep_state(x, slot, dci, 3);
             /* The dequeue pointer goes back into the context for the driver to read. */
-            uint64_t deq = x->slots[slot].ep[dci].dequeue | (uint64_t)x->slots[slot].ep[dci].ccs;
+            uint64_t deq = ring->dequeue | (uint64_t)ring->ccs;
             wr(x, out_ctx(x, slot) + 32ull * dci + 8, &deq, 8);
             break;
         }
         case TRB_SET_TR_DEQUEUE: {
             int dci = (trb[3] >> 16) & 0x1f;
             uint64_t p = (uint64_t)trb[1] << 32 | trb[0];
-            x->slots[slot].ep[dci].dequeue = p & ~0xfull;
-            x->slots[slot].ep[dci].ccs = (int)(p & 1);
+            HvXhciRing *ring = slot == x->bt_slot ? &x->bep[dci] : &x->slots[slot].ep[dci];
+            ring->dequeue = p & ~0xfull;
+            ring->ccs = (int)(p & 1);
             wr(x, out_ctx(x, slot) + 32ull * dci + 8, &p, 8);
             break;
         }
         case TRB_RESET_DEVICE: {
-            for (int dci = 2; dci < HV_XHCI_EPS; dci++) x->slots[slot].ep_running[dci] = 0;
+            int *running = slot == x->bt_slot ? x->bep_running : x->slots[slot].ep_running;
+            for (int dci = 2; dci < HV_XHCI_EPS; dci++) running[dci] = 0;
             uint32_t dw3 = (uint32_t)1 << 27; /* default state, address 0 */
             wr(x, out_ctx(x, slot) + 12, &dw3, 4);
-            x->slots[slot].configured = 0;
+            if (slot == x->bt_slot) x->bt_configured = 0;
+            else x->slots[slot].configured = 0;
             break;
         }
         case TRB_NOOP_CMD:
@@ -701,10 +1146,11 @@ static void run_commands(HvXhci *x) {
 /* ---- ports ---- */
 
 /* Port 1 is the full-speed keyboard; port 2 is the high-speed trackpad, as the real
-   Magic Trackpad 2 is. */
+   Magic Trackpad 2 is; port 3 is the full-speed Bluetooth dongle, when present. */
 static void port_connect(HvXhci *x) {
     for (int p = 0; p < HV_XHCI_PORTS; p++) {
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        if (p == 2 && !x->bt_present) continue;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p == 1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
         port_event(x, p);
     }
 }
@@ -760,8 +1206,14 @@ static void reset(HvXhci *x) {
     x->tp_db = 0;
     x->tp_multi_logs = 0;
     x->tp_f1_len = 0;
+    memset(x->bep_running, 0, sizeof x->bep_running);
+    x->bt_slot = 0;
+    x->bt_configured = 0;
+    memset(x->bt_alt, 0, sizeof x->bt_alt);
+    hv_bt_reset(&x->bt);
     for (int p = 0; p < HV_XHCI_PORTS; p++)
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p == 1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+    if (!x->bt_present) x->portsc[2] = 0;
     update_irq(x);
 }
 
@@ -927,6 +1379,15 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
             x->slots[slot].ep_running[dci] = 1;
             if (dci == 1) run_ep0(x, slot);
             else run_ep_in(x, slot);
+        } else if (slot == x->bt_slot) {
+            int dci = (int)(v & 0xff);
+            if (dci < 1 || dci >= HV_XHCI_EPS) return;
+            uint32_t state = rd32(x, out_ctx(x, slot) + 32ull * dci) & 7;
+            if (state == 2) return;
+            if (state != 1) set_ep_state(x, slot, dci, 1);
+            x->bep_running[dci] = 1;
+            if (dci == 1) run_ep0_bt(x, slot);
+            else run_bt_eps(x);
         }
     }
 }
@@ -1116,12 +1577,21 @@ void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
     for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
         if (x->slots[slot].dev >= 0) run_ep_in(x, slot);
+    if (x->bt_slot && (hv_bt_event_pending(&x->bt) || hv_bt_acl_pending(&x->bt) || x->bep_running[BT_DCI_ACL_OUT] || x->bep_running[BT_DCI_SCO_OUT] || x->bep_running[BT_DCI_EP4_OUT] || x->bep_running[BT_DCI_EP4_IN]))
+        run_bt_eps(x);
 }
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     HvXhci *x = calloc(1, sizeof *x);
     x->m = m;
     pthread_mutex_init(&x->mu, NULL);
+    x->bt_present = getenv("HV_NO_BT") == NULL;
+    hv_bt_set_machine_uuid(m ? m->machine_uuid : NULL);
+    hv_bt_init(&x->bt);
+    if (x->bt_present && getenv("HV_BT_LOG"))
+        fprintf(stderr, "xhci: bt dongle personality %s vid %04x pid %04x manufacturer \"%s\" product \"%s\"\n",
+                hv_bt_personality_name(), hv_bt_usb_vid(), hv_bt_usb_pid(), hv_bt_usb_manufacturer(),
+                hv_bt_usb_product());
     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
     x->pci.opaque = x;

@@ -3,17 +3,18 @@
 
 #include <pthread.h>
 
+#include "bt_hci.h"
 #include "pcie.h"
 
 /* An xHCI USB host controller (xHCI 1.0, one interrupter, 32-byte contexts,
    INTx) with two USB HID devices: a boot keyboard on port 1 and a Magic
    Trackpad 2 on port 2: what Virtualization.framework gives a macOS guest as
    its "Virtual USB Keyboard", plus Apple's multitouch pad, so the guest's
-   own gesture engine sees a real trackpad. Changes come from the host UI on
+   own gesture engine sees a real trackpad, plus a Bluetooth HCI dongle on port 3. Changes come from the host UI on
    any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
    (hv_xhci_poll). */
 #define HV_XHCI_SLOTS 8
-#define HV_XHCI_PORTS 2
+#define HV_XHCI_PORTS 3 /* port 1: keyboard; port 2: Magic Trackpad 2; port 3: Bluetooth HCI dongle */
 #define HV_XHCI_DEVICES 2
 #define HV_XHCI_INTRS 4
 #define HV_XHCI_EPS 32 /* device context index 1..31 */
@@ -83,6 +84,20 @@ typedef struct HvXhci {
     uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
     uint8_t tp_f1[8];   /* feature report 1: the header for the selected sensor register */
     int tp_f1_len;
+    /* The Bluetooth dongle (port 3): its own slot and its
+       own endpoint rings, so the keyboard path above is untouched. DCI map:
+       1 = EP0, 3 = EP1 IN (HCI events, interrupt), 4 = EP2 OUT (ACL, bulk),
+       5 = EP2 IN (ACL, bulk), 6 = EP3 OUT (SCO, iso), 7 = EP3 IN (SCO, iso). */
+    int bt_present;              /* 0 only with HV_NO_BT */
+    int bt_slot;
+    HvXhciRing bep[HV_XHCI_EPS];
+    int bep_running[HV_XHCI_EPS];
+    int bt_configured;
+    /* Alternate setting per BT interface (0..3), recorded by SET_INTERFACE
+       and answered by GET_INTERFACE.
+       Default 0; cleared on controller reset and on SET_CONFIGURATION. */
+    uint8_t bt_alt[4];
+    HvBtHci bt;
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
