@@ -23,9 +23,6 @@
 #include "dispatch.h"
 #include "net_slirp.h"
 
-HvLifecycleGate hv_app_lifecycle = HV_LIFECYCLE_INITIALIZER;
-HvLifecycleGate hv_cpu_lifecycle = HV_LIFECYCLE_INITIALIZER;
-pthread_mutex_t hv_lifecycle_state_mu = PTHREAD_MUTEX_INITIALIZER;
 static int host_run_allowed(void) {
     return atomic_load(&hv_cpu_lifecycle.active) || atomic_load(&hv_cpu_lifecycle.cancelled);
 }

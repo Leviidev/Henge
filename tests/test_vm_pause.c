@@ -2,6 +2,7 @@
 #define main reference_vm_lifecycle_main
 #include "test_vm_lifecycle.c"
 #undef main
+#include "sysreg.h"
 static int wait_blocks(uint64_t before) {
     for(int n=0;n<2000;n++){if(henge_vm_blocks()>before)return 1;usleep(1000);}return 0;
 }
@@ -28,6 +29,9 @@ int main(void) {
     henge_vm_set_app_active(1);
     int rc=henge_vm_boot(rom,disk,aux,1,0,64,4,error,sizeof error);
     check("tiny authored guest starts",rc==0);if(rc)return 1;
+    uint64_t offset=hv_vm_cpu(0)->cntvoff;
+    check("virtual counter begins near zero",offset>0 && hv_counter()-offset<24000000ULL*5);
+    for(int i=0;i<4;i++)check("all CPUs share boot counter origin",hv_vm_cpu(i)->cntvoff==offset);
     check("CPU initially progresses",wait_blocks(0));
     for(int i=0;i<3;i++){
         henge_vm_set_app_active(0);
@@ -49,7 +53,7 @@ int main(void) {
     henge_vm_set_app_active(1);usleep(30000);
     rc=henge_vm_boot(rom,disk,aux,1,0,64,4,error,sizeof error);
     check("new VM after paused stop starts",rc==0);
-    if(!rc){check("new active VM does not inherit closed CPU gate",wait_blocks(0));henge_vm_stop();}
+    if(!rc){check("new boot resets virtual counter origin",hv_vm_cpu(0)->cntvoff>offset);check("new active VM does not inherit closed CPU gate",wait_blocks(0));henge_vm_stop();}
     for(int n=0;n<3000 && henge_vm_state()!=2;n++)usleep(1000);
     check("second VM stops",henge_vm_state()==2);
     hv_vm_destroy();hv_jit_region_close(&jit);
