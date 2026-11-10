@@ -133,6 +133,34 @@ warm-cache evidence; cold misses still require the configured compiler. It does
 not qualify dynamic render/stateful features, every app, or another OS/device.
 Source/recipe identity was unchanged between the cold and offline gates.
 
+Collect each process's exact exit status beside the result folders, using normal
+shell commands in the guest (no Python). For example, after the documented cold
+control commands, preserve their statuses in `matrix.exit`, `async.exit` and
+`snapshot.exit` respectively; capture `$?` immediately, before copying/uploading
+anything. Keep `matrix-results`, `async-results` and `snapshot-results` unchanged.
+Offline collections use `offline-async.exit`, `offline-snapshot.exit` and the
+same async/snapshot folder names in a separate directory.
+
+On the analysis Mac, independently review the collected raw readbacks:
+
+```sh
+python3 controls/review_results.py --results /path/collected-cold \
+  --mode cold --output /path/new-cold-review.json
+python3 controls/review_results.py --results /path/collected-offline \
+  --mode offline --output /path/new-offline-review.json
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+The reviewer decodes every raw little-endian uint32 against the authored formulas
+(alpha/beta specialization, `i*7+19`, and the replacement dependency `i*7+23`).
+It checks byte counts, actual hashes, producer completion/callback/lifetime fields,
+required route rejection and recorded exits. It does not trust a reported pass
+flag as a substitute for raw values. Nine controls include a valid buffer and rejection of corrupted
+values with a matching forged SHA/pass flag, wrong dependency/byte order,
+truncation, stale SHA, escaped paths, nonzero exit and incomplete dispatch.
+Transport authentication, compiler shutdown and absence of external relays still
+need their own provenance; this host reviewer does not infer them from pixels.
+
 For native-only integration testing:
 
 ```sh
