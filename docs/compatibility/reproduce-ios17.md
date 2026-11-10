@@ -106,8 +106,9 @@ python3 ios/scripts/sync_shader_conversions.py --help
 Supply your SSH host and the exact application Documents path. The companion
 uses a recipe-qualified/hash-checked cache and a short-lived lease. Existing
 valid cache entries work offline; uncached conversions currently require the
-Mac companion. Generated Apple libraries remain private local data. Root's new
-dynamic-shader work is pending integration and may change this boundary.
+Mac companion. Generated Apple libraries remain private local data. The separate dynamic-library package, when installed, has its own explicit
+compiler/configuration and offline-cache boundary; do not infer it from this
+static conversion companion.
 
 ## Installation, rollback and health checks
 
@@ -160,13 +161,27 @@ it does not erase the app or restore a stale guest disk over current user data.
 
 ## Separate guest compatibility and remaining integration
 
-VLC 3.0.24 source patches and source-only build support belong under
-`compat/vlc/`. They fix AAC/draining/timestamps, default module selection,
-HEVC GUI exposure and color/range forwarding. They are optional guest software
-changes, not Henge renderer fixes. The tested software CGL fallback remains
-honestly reported as software. A new opt-in accelerated renderer-discovery
-experiment is pending; no hardware OpenGL support is claimed by this package.
+The optional [VLC source package](../../compat/vlc/README.md) fixes AAC drain,
+MP4 timing, default module selection, native HEVC menu and VUI forwarding. It
+provides pinned clean builds, authored export controls and guarded normal-app
+promotion/rollback. A new build still requires guest GUI and speaker acceptance.
 
-Root's new OpenGL, dynamic-shader and AGX work must be imported as separate
-reviewed commits with updated input hashes and tests. The historical AGX lock
-abort remains unproven; successful later tests are not a retrospective fix claim.
+The [OpenGL discovery helper](../../compat/opengl-discovery/README.md) supplies a
+missing renderer discovery property only within explicitly launched processes.
+With the separately tested late render-store-action fix, accelerated clear/GLSL
+and five bounded draw/readback cases passed on the tested Sonoma/iPad route.
+System renderer registration is unchanged; ordinary double-click applications
+without this opt-in route are not thereby repaired. No all-app OpenGL claim is made.
+
+The [AGX provenance journal](agx-journal.md) is opt-in diagnostics. It archives
+actually selected bytes and first/retry pipeline attempt metadata without a new
+Metal-object retention policy. The historical AGX lock abort remains unproven;
+successful later compilation does not retrospectively identify or fix it.
+
+The original-base staging series and latest-upstream reconciliation are separate.
+The latter preserves upstream planar aliases, generalized metallib relabel,
+multitouch trackpad and ordered GPU teardown. Both pass local compilation/tests;
+only the original production lineage has the retained device qualification.
+Do not deploy the latest-upstream reconciliation as if its new combinations were
+already tested on-device. Keep each optional package and subsequent qualification
+as a separate reviewed commit and record the exact base/HEAD in build manifests.
