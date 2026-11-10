@@ -14,9 +14,7 @@
 #import <objc/message.h>
 #import <TargetConditionals.h>
 #import <IOSurface/IOSurfaceRef.h>
-#if TARGET_OS_IPHONE
 #import <CommonCrypto/CommonDigest.h>
-#endif
 #include <string.h>
 #include <sys/utsname.h>
 
@@ -547,8 +545,8 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
     __block NSError *err = nil;
     id<MTLLibrary> library = nil;
-    NSString *libraryID = nil;
 #if TARGET_OS_IPHONE
+    NSString *libraryID = nil;
     NSString *convertedPath = nil;
     NSString *convertedRoute = nil;
     BOOL usedConverted = NO;
