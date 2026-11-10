@@ -549,6 +549,11 @@ void hv_vm_mouse_button(int button, int down) {
 static void wheel(uint16_t axis, int amount) {
     while (amount) {
         int piece = amount > 100 ? 100 : amount < -100 ? -100 : amount;
+        /* Some macOS virtio-input builds reuse the last relative X/Y values
+           when a later report contains only a wheel axis. Clear both axes in
+           the same report so scrolling cannot move the pointer. */
+        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, 0);
+        hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, 0);
         hv_virtio_input_send(board.mouse, HV_EV_REL, axis, piece);
         hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
         amount -= piece;
