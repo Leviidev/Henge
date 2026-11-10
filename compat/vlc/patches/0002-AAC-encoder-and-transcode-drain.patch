@@ -1,0 +1,142 @@
+--- a/modules/codec/avcodec/encoder.c
++++ b/modules/codec/avcodec/encoder.c
+@@ -1062,6 +1062,10 @@
+             goto error;
+         }
+         p_enc->fmt_out.audio.i_frame_length = p_context->frame_size;
++        p_enc->fmt_out.audio_gapless = p_enc->fmt_in.audio_gapless;
++        if(p_enc->fmt_out.audio_gapless.magic == VLC_AUDIO_GAPLESS_MAGIC)
++            p_enc->fmt_out.audio_gapless.initial_padding = p_context->initial_padding;
++
+         p_enc->fmt_out.audio.i_blockalign = p_context->block_align;
+         p_enc->fmt_out.audio.i_bitspersample = aout_BitsPerSample( p_enc->fmt_out.i_codec );
+         //b_variable tells if we can feed any size frames to encoder
+@@ -1126,7 +1130,8 @@
+     block_t *p_block = &b->self;
+ 
+     block_Init( p_block, packet->data, packet->size );
+-    p_block->i_nb_samples = 0;
++    p_block->i_nb_samples = context->codec_type == AVMEDIA_TYPE_AUDIO ?
++        av_rescale_q(packet->duration, context->time_base, (AVRational){1,context->sample_rate}) : 0;
+     p_block->pf_release = vlc_av_packet_Release;
+     b->packet = packet;
+ 
+@@ -1213,7 +1218,12 @@
+         return NULL;
+     }
+     ret = avcodec_receive_packet( p_sys->p_context, av_pkt );
+-    if( ret != 0 && ret != AVERROR(EAGAIN) )
++    if( ret == AVERROR(EAGAIN) || ret == AVERROR_EOF )
++    {
++        av_packet_free( &av_pkt );
++        return NULL; /* normal encoder latency or completed drain */
++    }
++    if( ret != 0 )
+     {
+         msg_Warn( p_enc, "cannot encode one frame" );
+         av_packet_free( &av_pkt );
+@@ -1221,7 +1231,8 @@
+     }
+ 
+     block_t *p_block = vlc_av_packet_Wrap( av_pkt,
+-            av_pkt->duration / p_sys->p_context->time_base.den, p_sys->p_context );
++            av_rescale_q( av_pkt->duration, p_sys->p_context->time_base,
++                          (AVRational){ 1, CLOCK_FREQ } ), p_sys->p_context );
+     if( unlikely(p_block == NULL) )
+     {
+         av_packet_free( &av_pkt );
+@@ -1339,12 +1350,6 @@
+         p_aout_buf->i_nb_samples -= leftover_samples;
+         memcpy( p_sys->p_buffer+buffer_delay, p_aout_buf->p_buffer, leftover );
+ 
+-        // We need to deinterleave from p_aout_buf to p_buffer the leftover bytes
+-        if( p_sys->b_planar )
+-            aout_Deinterleave( p_sys->p_interleave_buf, p_sys->p_buffer,
+-                p_sys->i_frame_size, p_enc->fmt_out.audio.i_channels, p_enc->fmt_in.i_codec );
+-        else
+-            memcpy( p_sys->p_buffer + buffer_delay, p_aout_buf->p_buffer, leftover);
+ 
+         p_aout_buf->p_buffer     += leftover;
+         p_aout_buf->i_buffer     -= leftover;
+@@ -1360,10 +1365,17 @@
+         memset( p_sys->p_buffer + (leftover+buffer_delay), 0, padding_size );
+         buffer_delay += padding_size;
+     }
++    /* Also refresh planar data when draining without a new input block.
++     * Use the actual partial-frame size and matching packed plane alignment. */
++    if( p_sys->b_planar )
++        aout_Deinterleave( p_sys->p_interleave_buf, p_sys->p_buffer,
++                          p_sys->frame->nb_samples,
++                          p_enc->fmt_out.audio.i_channels,
++                          p_enc->fmt_in.i_codec );
+     if( avcodec_fill_audio_frame( p_sys->frame, p_enc->fmt_out.audio.i_channels,
+             p_sys->p_context->sample_fmt, p_sys->b_planar ? p_sys->p_interleave_buf : p_sys->p_buffer,
+             p_sys->i_buffer_out,
+-            DEFAULT_ALIGN) < 0 )
++            1) < 0 )
+     {
+         msg_Err( p_enc, "filling error on fillup" );
+         p_sys->frame->nb_samples = 0;
+@@ -1424,8 +1436,8 @@
+     {
+         p_chain = handle_delay_buffer( p_enc, p_sys, buffer_delay, p_aout_buf, leftover_samples );
+         buffer_delay = 0;
+-        if( unlikely( !p_chain ) )
+-            return NULL;
++        /* A delayed encoder may consume a frame without returning a packet.
++         * Keep processing the unconsumed input instead of dropping it. */
+     }
+ 
+     if( unlikely( !p_aout_buf ) )
+--- a/modules/stream_out/transcode/audio.c
++++ b/modules/stream_out/transcode/audio.c
+@@ -124,6 +124,14 @@
+     id->p_encoder->fmt_in.audio.i_physical_channels =
+         id->p_encoder->fmt_out.audio.i_physical_channels;
+     aout_FormatPrepare( &id->p_encoder->fmt_in.audio );
++    msg_Dbg(p_stream,"audit04 propagate gapless magic %x samples %llu",id->p_decoder->fmt_out.audio_gapless.magic,(unsigned long long)id->p_decoder->fmt_out.audio_gapless.valid_samples);
++    id->p_encoder->fmt_in.audio_gapless = id->p_decoder->fmt_out.audio_gapless;
++    if(id->p_encoder->fmt_in.audio_gapless.magic == VLC_AUDIO_GAPLESS_MAGIC &&
++       id->p_decoder->fmt_out.audio.i_rate)
++        id->p_encoder->fmt_in.audio_gapless.valid_samples =
++            id->p_decoder->fmt_out.audio_gapless.valid_samples *
++            id->p_encoder->fmt_in.audio.i_rate / id->p_decoder->fmt_out.audio.i_rate;
++
+ 
+     id->p_encoder->p_cfg = p_stream->p_sys->p_audio_cfg;
+     id->p_encoder->p_module =
+@@ -390,6 +398,18 @@
+     {
+         if( id->p_encoder->p_module )
+         {
++            /* Flush delayed filter/resampler PCM before the encoder. */
++            block_t *pending = id->p_af_chain ? aout_FiltersDrain(id->p_af_chain) : NULL;
++            while(pending)
++            {
++                block_t *next = pending->p_next;
++                pending->p_next = NULL;
++                pending->i_dts = pending->i_pts;
++                block_t *encoded = id->p_encoder->pf_encode_audio(id->p_encoder, pending);
++                block_ChainAppend(out, encoded);
++                block_Release(pending);
++                pending = next;
++            }
+             block_t *p_block;
+             do {
+                p_block = id->p_encoder->pf_encode_audio(id->p_encoder, NULL );
+--- a/modules/stream_out/transcode/video.c
++++ b/modules/stream_out/transcode/video.c
+@@ -212,6 +212,13 @@
+     es_format_Init( &id->p_encoder->fmt_in, id->p_decoder->fmt_in.i_cat,
+                     id->p_decoder->fmt_out.i_codec );
+ 
++    /* The availability probe determines the input chroma used to build
++     * the conversion chain before the real encoder is opened. Preserve
++     * the declared source range here, so full-range planar encoders can
++     * request J420 instead of planning an irreversible J420 -> I420 step. */
++    id->p_encoder->fmt_in.video.b_color_range_full =
++        id->p_decoder->fmt_in.video.b_color_range_full;
++
+     /* The dimensions will be set properly later on.
+      * Just put sensible values so we can test an encoder is available. */
+     id->p_encoder->fmt_in.video.i_width =

@@ -1,0 +1,403 @@
+--- a/include/vlc_es.h
++++ b/include/vlc_es.h
+@@ -605,6 +605,13 @@
+         struct {
+             audio_format_t  audio;    /**< description of audio format */
+             audio_replay_gain_t audio_replay_gain; /*< audio replay gain information */
++            /* Versioned extension in pre-existing unused audio-union storage.
++             * Existing audio/replaygain fields and total es_format_t size stay ABI-identical. */
++            struct {
++                uint32_t magic;
++                uint32_t initial_padding;
++                uint64_t valid_samples;
++            } audio_gapless;
+         };
+         video_format_t video;     /**< description of video format */
+         subs_format_t  subs;      /**< description of subtitle format */
+@@ -666,3 +673,5 @@
+ }
+ 
+ #endif
++
++#define VLC_AUDIO_GAPLESS_MAGIC UINT32_C(0x67617031)
+--- a/modules/codec/avcodec/audio.c
++++ b/modules/codec/avcodec/audio.c
+@@ -65,6 +65,8 @@
+ 
+     /* */
+     int     i_reject_count;
++    uint64_t gapless_skip, gapless_remaining;
++    bool gapless_active;
+ 
+     /* */
+     bool    b_extract;
+@@ -252,6 +254,12 @@
+     }
+ 
+     p_sys->i_reject_count = 0;
++    p_sys->gapless_active = p_dec->fmt_in.audio_gapless.magic == VLC_AUDIO_GAPLESS_MAGIC;
++    p_sys->gapless_skip = p_dec->fmt_in.audio_gapless.initial_padding;
++    p_sys->gapless_remaining = p_dec->fmt_in.audio_gapless.valid_samples;
++    p_dec->fmt_out.audio_gapless = p_dec->fmt_in.audio_gapless;
++    p_dec->fmt_out.audio_gapless.initial_padding = 0;
++
+     p_sys->b_extract = false;
+     p_sys->i_previous_channels = 0;
+     p_sys->i_previous_layout = 0;
+@@ -446,7 +454,21 @@
+                 p_converted->i_length = date_Increment( &p_sys->end_date,
+                                                       p_converted->i_nb_samples ) - p_converted->i_pts;
+ 
+-                decoder_QueueAudio( p_dec, p_converted );
++                if(p_sys->gapless_active)
++                {
++                    unsigned skip = __MIN(p_sys->gapless_skip, p_converted->i_nb_samples);
++                    p_sys->gapless_skip -= skip;
++                    p_converted->p_buffer += skip * p_dec->fmt_out.audio.i_bytes_per_frame;
++                    p_converted->i_nb_samples -= skip;
++                    p_converted->i_pts += (vlc_tick_t)skip * CLOCK_FREQ / p_dec->fmt_out.audio.i_rate;
++                    p_converted->i_nb_samples = __MIN(p_converted->i_nb_samples, p_sys->gapless_remaining);
++                    p_sys->gapless_remaining -= p_converted->i_nb_samples;
++                    p_converted->i_buffer = p_converted->i_nb_samples * p_dec->fmt_out.audio.i_bytes_per_frame;
++                    p_converted->i_length = (vlc_tick_t)p_converted->i_nb_samples * CLOCK_FREQ / p_dec->fmt_out.audio.i_rate;
++                }
++                if(p_converted->i_nb_samples)
++                    decoder_QueueAudio( p_dec, p_converted );
++                else block_Release(p_converted);
+             }
+ 
+             /* Prepare new frame */
+--- a/modules/codec/avcodec/avcodec.h
++++ b/modules/codec/avcodec/avcodec.h
+@@ -120,7 +120,7 @@
+ /*
+  * Encoder options
+  */
+-#define ENC_CFG_PREFIX "sout-avcodec-"
++#define ENC_CFG_PREFIX "sout-aacfix-"
+ 
+ #define ENC_KEYINT_TEXT N_( "Ratio of key frames" )
+ #define ENC_KEYINT_LONGTEXT N_( "Number of frames " \
+--- /dev/null
++++ b/modules/codec/avcodec/helpers.c
+@@ -0,0 +1,135 @@
++/*****************************************************************************
++ * avcodec.c: video and audio decoder and encoder using libavcodec
++ *****************************************************************************
++ * Copyright (C) 1999-2008 VLC authors and VideoLAN
++ * $Id$
++ *
++ * Authors: Laurent Aimar <fenrir@via.ecp.fr>
++ *          Gildas Bazin <gbazin@videolan.org>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++ *****************************************************************************/
++
++/*****************************************************************************
++ * Preamble
++ *****************************************************************************/
++#ifdef HAVE_CONFIG_H
++# include "config.h"
++#endif
++
++#include <vlc_common.h>
++#include <vlc_plugin.h>
++#include <vlc_codec.h>
++#include <vlc_avcodec.h>
++#include <vlc_cpu.h>
++
++#define HAVE_MMX 1
++#include <libavcodec/avcodec.h>
++
++#include "avcodec.h"
++#include "chroma.h"
++#include "avcommon.h"
++
++/****************************************************************************
++ * Local prototypes
++ ****************************************************************************/
++
++
++AVCodecContext *ffmpeg_AllocContext( decoder_t *p_dec,
++                                     const AVCodec **restrict codecp )
++{
++    unsigned i_codec_id;
++    const char *psz_namecodec;
++    const AVCodec *p_codec = NULL;
++
++    /* *** determine codec type *** */
++    if( !GetFfmpegCodec( p_dec->fmt_in.i_cat, p_dec->fmt_in.i_codec,
++                         &i_codec_id, &psz_namecodec ) )
++         return NULL;
++
++    msg_Dbg( p_dec, "using %s %s", AVPROVIDER(LIBAVCODEC), LIBAVCODEC_IDENT );
++
++    /* Initialization must be done before avcodec_find_decoder() */
++    vlc_init_avcodec(VLC_OBJECT(p_dec));
++
++    /* *** ask ffmpeg for a decoder *** */
++    char *psz_decoder = var_InheritString( p_dec, "avcodec-codec" );
++    if( psz_decoder != NULL )
++    {
++        p_codec = avcodec_find_decoder_by_name( psz_decoder );
++        if( !p_codec )
++            msg_Err( p_dec, "Decoder `%s' not found", psz_decoder );
++        else if( p_codec->id != i_codec_id )
++        {
++            msg_Err( p_dec, "Decoder `%s' can't handle %4.4s",
++                    psz_decoder, (char*)&p_dec->fmt_in.i_codec );
++            p_codec = NULL;
++        }
++        free( psz_decoder );
++    }
++    if( !p_codec )
++        p_codec = avcodec_find_decoder( i_codec_id );
++    if( !p_codec )
++    {
++        msg_Dbg( p_dec, "codec not found (%s)", psz_namecodec );
++        return NULL;
++    }
++
++    *codecp = p_codec;
++
++    /* *** get a p_context *** */
++    AVCodecContext *avctx = avcodec_alloc_context3(p_codec);
++    if( unlikely(avctx == NULL) )
++        return NULL;
++
++    avctx->debug = var_InheritInteger( p_dec, "avcodec-debug" );
++    avctx->opaque = p_dec;
++    return avctx;
++}
++
++/*****************************************************************************
++ * ffmpeg_OpenCodec:
++ *****************************************************************************/
++int ffmpeg_OpenCodec( decoder_t *p_dec, AVCodecContext *ctx,
++                      const AVCodec *codec )
++{
++    char *psz_opts = var_InheritString( p_dec, "avcodec-options" );
++    AVDictionary *options = NULL;
++    int ret;
++
++    if (psz_opts) {
++        vlc_av_get_options(psz_opts, &options);
++        free(psz_opts);
++    }
++
++    vlc_avcodec_lock();
++    ret = avcodec_open2( ctx, codec, options ? &options : NULL );
++    vlc_avcodec_unlock();
++
++    AVDictionaryEntry *t = NULL;
++    while ((t = av_dict_get(options, "", t, AV_DICT_IGNORE_SUFFIX))) {
++        msg_Err( p_dec, "Unknown option \"%s\"", t->key );
++    }
++    av_dict_free(&options);
++
++    if( ret < 0 )
++    {
++        msg_Err( p_dec, "cannot start codec (%s)", codec->name );
++        return VLC_EGENERIC;
++    }
++
++    msg_Dbg( p_dec, "codec (%s) started", codec->name );
++    return VLC_SUCCESS;
++}
+--- a/modules/demux/avformat/demux.c
++++ b/modules/demux/avformat/demux.c
+@@ -74,6 +74,10 @@
+ 
+     struct avformat_track_s *tracks;
+     unsigned i_tracks;
++    AVPacket **pending_packets;
++    unsigned pending_count, pending_index;
++    uint32_t *gapless_skip;
++    bool *gapless_known;
+ 
+     int64_t         i_pcr;
+ 
+@@ -319,7 +323,7 @@
+     /* Fill p_demux fields */
+     p_demux->pf_demux = Demux;
+     p_demux->pf_control = Control;
+-    p_demux->p_sys = p_sys = malloc( sizeof( demux_sys_t ) );
++    p_demux->p_sys = p_sys = calloc( 1, sizeof( demux_sys_t ) );
+     if( !p_sys )
+     {
+         free( psz_url );
+@@ -376,6 +380,17 @@
+     }
+     free( psz_url );
+ 
++    char *sout = var_InheritString(p_demux, "sout");
++    bool exporting = sout && *sout;
++    free(sout);
++    bool has_aac = false;
++    for(unsigned i=0;i<p_sys->ic->nb_streams;i++)
++        has_aac |= p_sys->ic->streams[i]->codecpar->codec_id == AV_CODEC_ID_AAC;
++    if(!exporting || !b_can_seek || !has_aac ||
++       var_InheritFloat(p_demux, "start-time") > 0 ||
++       var_InheritFloat(p_demux, "stop-time") > 0)
++    { avformat_CloseDemux(p_this); return VLC_EGENERIC; }
++
+     char *psz_opts = var_InheritString( p_demux, "avformat-options" );
+     unsigned nb_streams = p_sys->ic->nb_streams;
+ 
+@@ -395,6 +410,7 @@
+     vlc_avcodec_unlock();
+     AVDictionaryEntry *t = NULL;
+     while ((t = av_dict_get(options[0], "", t, AV_DICT_IGNORE_SUFFIX))) {
++        if(!strcmp(t->key,"threads") || !strcmp(t->key,"lowres")) continue;
+         msg_Err( p_demux, "Unknown option \"%s\"", t->key );
+     }
+     av_dict_free(&options[0]);
+@@ -416,6 +432,37 @@
+         return VLC_ENOMEM;
+     }
+     p_sys->i_tracks = nb_streams;
++
++    /* Read only enough packet headers to discover source priming, retaining
++     * every packet for normal demux delivery. Never discard coded payload. */
++    p_sys->gapless_skip = calloc(nb_streams, sizeof(*p_sys->gapless_skip));
++    p_sys->gapless_known = calloc(nb_streams, sizeof(*p_sys->gapless_known));
++    if(!p_sys->gapless_skip || !p_sys->gapless_known) { avformat_CloseDemux(p_this); return VLC_ENOMEM; }
++    unsigned needed = 0;
++    for(unsigned i=0;i<nb_streams;i++)
++        needed += p_sys->ic->streams[i]->codecpar->codec_id == AV_CODEC_ID_AAC;
++    while(needed && p_sys->pending_count < 4096)
++    {
++        AVPacket *packet = av_packet_alloc();
++        if(!packet || av_read_frame(p_sys->ic, packet) < 0)
++        { av_packet_free(&packet); break; }
++        AVPacket **list = realloc(p_sys->pending_packets,
++                                  (p_sys->pending_count + 1) * sizeof(*list));
++        if(!list) { av_packet_free(&packet); avformat_CloseDemux(p_this); return VLC_ENOMEM; }
++        p_sys->pending_packets = list;
++        list[p_sys->pending_count++] = packet;
++        unsigned stream = packet->stream_index;
++        if(stream >= nb_streams || p_sys->gapless_known[stream] ||
++           p_sys->ic->streams[stream]->codecpar->codec_id != AV_CODEC_ID_AAC)
++            continue;
++        size_t size = 0;
++        const uint8_t *skip = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &size);
++        p_sys->gapless_skip[stream] = skip && size >= 10 ? GetDWLE(skip) :
++                                      p_sys->ic->streams[stream]->codecpar->initial_padding;
++        p_sys->gapless_known[stream] = true;
++        needed--;
++    }
++
+ 
+     if( error < 0 )
+     {
+@@ -714,6 +761,17 @@
+                 es_fmt.b_packetized = false;
+             }
+ 
++            if(cp->codec_id == AV_CODEC_ID_AAC && p_sys->gapless_known[i] &&
++               s->duration > 0 && es_fmt.audio.i_rate)
++            {
++                es_fmt.audio_gapless.magic = VLC_AUDIO_GAPLESS_MAGIC;
++                es_fmt.audio_gapless.initial_padding = p_sys->gapless_skip[i];
++                es_fmt.audio_gapless.valid_samples = av_rescale_q(s->duration,
++                    s->time_base, (AVRational){1, es_fmt.audio.i_rate});
++                msg_Dbg(p_demux, "gapless stream %u skip %u valid %"PRIu64,
++                        i, es_fmt.audio_gapless.initial_padding,
++                        es_fmt.audio_gapless.valid_samples);
++            }
+             p_track->p_es = es_out_Add( p_demux->out, &es_fmt );
+             if( p_track->p_es && (s->disposition & AV_DISPOSITION_DEFAULT) )
+                 es_out_Control( p_demux->out, ES_OUT_SET_ES_DEFAULT, p_track->p_es );
+@@ -771,6 +829,11 @@
+     demux_t     *p_demux = (demux_t*)p_this;
+     demux_sys_t *p_sys = p_demux->p_sys;
+ 
++    for(unsigned i=p_sys->pending_index;i<p_sys->pending_count;i++)
++        av_packet_free(&p_sys->pending_packets[i]);
++    free(p_sys->pending_packets);
++    free(p_sys->gapless_skip);
++    free(p_sys->gapless_known);
+     free( p_sys->tracks );
+ 
+     if( p_sys->ic )
+@@ -799,12 +862,19 @@
+ static int Demux( demux_t *p_demux )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+-    AVPacket    pkt;
++    AVPacket    pkt = {0};
+     block_t     *p_frame;
+     int64_t     i_start_time;
+ 
+     /* Read a frame */
+-    int i_av_ret = av_read_frame( p_sys->ic, &pkt );
++    int i_av_ret = 0;
++    if(p_sys->pending_index < p_sys->pending_count)
++    {
++        AVPacket *saved = p_sys->pending_packets[p_sys->pending_index++];
++        av_packet_move_ref(&pkt, saved);
++        av_packet_free(&saved);
++    }
++    else i_av_ret = av_read_frame( p_sys->ic, &pkt );
+     if( i_av_ret )
+     {
+         /* Avoid EOF if av_read_frame returns AVERROR(EAGAIN) */
+@@ -878,7 +948,7 @@
+         p_frame->i_dts = q.quot * CLOCK_FREQ *
+             p_stream->time_base.num + q.rem * CLOCK_FREQ *
+             p_stream->time_base.num /
+-            p_stream->time_base.den - i_start_time + VLC_TICK_0;
++            p_stream->time_base.den - i_start_time + VLC_TICK_0 + 1000000;
+     }
+ 
+     if( pkt.pts == (int64_t)AV_NOPTS_VALUE )
+@@ -889,7 +959,7 @@
+         p_frame->i_pts = q.quot * CLOCK_FREQ *
+             p_stream->time_base.num + q.rem * CLOCK_FREQ *
+             p_stream->time_base.num /
+-            p_stream->time_base.den - i_start_time + VLC_TICK_0;
++            p_stream->time_base.den - i_start_time + VLC_TICK_0 + 1000000;
+     }
+     if( pkt.duration > 0 && p_frame->i_length <= 0 )
+         p_frame->i_length = pkt.duration * CLOCK_FREQ *
+--- a/modules/packetizer/hxxx_nal.c
++++ b/modules/packetizer/hxxx_nal.c
+@@ -126,6 +126,7 @@
+         if( unlikely(!p_newblock) )
+             goto error;
+ 
++        block_CopyProperties(p_newblock, p_block);
+         p_release = p_block; /* Will be released after use */
+         p_source = p_release->p_buffer;
+         p_sourceend = &p_release->p_buffer[p_release->i_buffer];
+--- a/modules/packetizer/mpeg4audio.c
++++ b/modules/packetizer/mpeg4audio.c
+@@ -192,7 +192,7 @@
+     set_category(CAT_SOUT)
+     set_subcategory(SUBCAT_SOUT_PACKETIZER)
+     set_description(N_("MPEG4 audio packetizer"))
+-    set_capability("packetizer", 50)
++    set_capability("packetizer", 60)
+     set_callbacks(OpenPacketizer, ClosePacketizer)
+ vlc_module_end ()
+ 
+@@ -267,6 +267,7 @@
+        and LATM can be sent with out-of-band audioconfig,
+        (avformat sets m4a extradata in both cases)
+        so we can't rely on extradata to guess multiplexing */
++    p_dec->fmt_out.audio_gapless = p_dec->fmt_in.audio_gapless;
+     p_dec->fmt_out.audio.i_rate = p_dec->fmt_in.audio.i_rate;
+ 
+     if(p_dec->fmt_in.i_extra)

@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "archives": {
+    "vlc-3.0.24.tar.gz": {
+      "sha256": "0ba29df0211e6fc826654eda3cece53a5d916d45198f137fc8831bb77aae2f76",
+      "bytes": 34444697,
+      "url": "https://github.com/videolan/vlc/archive/refs/tags/3.0.24.tar.gz"
+    },
+    "ffmpeg-8.1.2.tar.xz": {
+      "sha256": "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+      "bytes": 11710924,
+      "url": "https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz"
+    },
+    "x265_4.1.tar.gz": {
+      "sha256": "a31699c6a89806b74b0151e5e6a7df65de4b49050482fe5ebf8a4379d7af8f29",
+      "bytes": 1725279,
+      "url": "https://bitbucket.org/multicoreware/x265_git/downloads/x265_4.1.tar.gz"
+    },
+    "libsamplerate-0.1.9.tar.gz": {
+      "sha256": "0a7eb168e2f21353fb6d84da152e4512126f7dc48ccb0be80578c565413444c1",
+      "bytes": 4336641,
+      "url": "https://www.mega-nerd.com/SRC/libsamplerate-0.1.9.tar.gz"
+    }
+  },
+  "requirements": {
+    "reference_vlc_app": "Official VLC3.0.24 arm64 supplied by operator; read-only use of libvlccore/Sparkle and unmodified bundle resources",
+    "minimum_macos": "14.0",
+    "x265": "4.1 build215, assembly disabled",
+    "ffmpeg": "8.1.2 minimal static AAC/MOV build",
+    "libsamplerate": "0.1.9 with exact EOF patch"
+  }
+}

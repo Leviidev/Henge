@@ -1,0 +1,123 @@
+--- a/modules/audio_filter/resampler/src.c
++++ b/modules/audio_filter/resampler/src.c
+@@ -62,15 +62,20 @@
+     add_integer ("src-converter-type", SRC_SINC_FASTEST,
+                  SRC_CONV_TYPE_TEXT, SRC_CONV_TYPE_LONGTEXT, true)
+         change_integer_list (conv_type_values, conv_type_texts)
++    add_shortcut("samplerate")
+     set_capability ("audio converter", 50)
+     set_callbacks (Open, Close)
+ 
+     add_submodule ()
++    add_shortcut("samplerate")
+     set_capability ("audio resampler", 50)
+     set_callbacks (OpenResampler, Close)
+ vlc_module_end ()
+ 
++typedef struct { SRC_STATE *state; date_t date; bool drained; } srcfix_sys;
+ static block_t *Resample (filter_t *, block_t *);
++static block_t *Drain (filter_t *);
++static void Flush (filter_t *);
+ 
+ static int Open (vlc_object_t *obj)
+ {
+@@ -103,17 +108,24 @@
+         return VLC_EGENERIC;
+     }
+ 
+-    filter->p_sys = (filter_sys_t *)s;
++    srcfix_sys *sys = calloc(1, sizeof(*sys));
++    if(!sys) { src_delete(s); return VLC_ENOMEM; }
++    sys->state = s;
++    date_Init(&sys->date, filter->fmt_out.audio.i_rate, 1);
++    date_Set(&sys->date, VLC_TICK_INVALID);
++    filter->p_sys = (filter_sys_t *)sys;
+     filter->pf_audio_filter = Resample;
++    filter->pf_audio_drain = Drain;
++    filter->pf_flush = Flush;
+     return VLC_SUCCESS;
+ }
+ 
+ static void Close (vlc_object_t *obj)
+ {
+     filter_t *filter = (filter_t *)obj;
+-    SRC_STATE *s = (SRC_STATE *)filter->p_sys;
+-
+-    src_delete (s);
++    srcfix_sys *sys = (srcfix_sys *)filter->p_sys;
++    src_delete(sys->state);
++    free(sys);
+ }
+ 
+ static block_t *Resample (filter_t *filter, block_t *in)
+@@ -121,7 +133,13 @@
+     block_t *out = NULL;
+     const size_t framesize = filter->fmt_out.audio.i_bytes_per_frame;
+ 
+-    SRC_STATE *s = (SRC_STATE *)filter->p_sys;
++    srcfix_sys *sys = (srcfix_sys *)filter->p_sys;
++    SRC_STATE *s = sys->state;
++    if(in->i_flags & BLOCK_FLAG_DISCONTINUITY)
++        Flush(filter);
++    if(date_Get(&sys->date) == VLC_TICK_INVALID)
++        date_Set(&sys->date, in->i_pts);
++    sys->drained = false;
+     SRC_DATA src;
+ 
+     src.src_ratio = (double)filter->fmt_out.audio.i_rate
+@@ -161,10 +179,52 @@
+ 
+     out->i_buffer = src.output_frames_gen * framesize;
+     out->i_nb_samples = src.output_frames_gen;
+-    out->i_pts = in->i_pts;
+-    out->i_length = src.output_frames_gen * CLOCK_FREQ
+-                  / filter->fmt_out.audio.i_rate;
++    out->i_pts = date_Get(&sys->date);
++    out->i_length = date_Increment(&sys->date, src.output_frames_gen) - out->i_pts;
+ error:
+     block_Release (in);
+     return out;
+ }
++
++/* Preserve buffered PCM at EOF and stamp all output on one sample clock. */
++static block_t *Drain(filter_t *filter)
++{
++    srcfix_sys *sys = (srcfix_sys *)filter->p_sys;
++    if(sys->drained) return NULL;
++    sys->drained = true;
++    const size_t framesize = filter->fmt_out.audio.i_bytes_per_frame;
++    block_t *chain = NULL;
++    for(;;)
++    {
++        block_t *out = block_Alloc(4096 * framesize);
++        if(!out) break;
++        float empty_input = 0.0f;
++        SRC_DATA src = {0};
++        src.data_in = &empty_input; /* libsamplerate0.1.9 requires non-NULL even for zero frames. */
++        src.data_out = (float *)out->p_buffer;
++        src.output_frames = 4096;
++        src.src_ratio = (double)filter->fmt_out.audio.i_rate / filter->fmt_in.audio.i_rate;
++        src.end_of_input = 1;
++        int err = src_process(sys->state, &src);
++        if(err || !src.output_frames_gen)
++        {
++            block_Release(out);
++            if(err) msg_Err(filter, "cannot drain resampler: %s", src_strerror(err));
++            break;
++        }
++        out->i_buffer = src.output_frames_gen * framesize;
++        out->i_nb_samples = src.output_frames_gen;
++        out->i_pts = date_Get(&sys->date);
++        out->i_length = date_Increment(&sys->date, src.output_frames_gen) - out->i_pts;
++        block_ChainAppend(&chain, out);
++    }
++    return chain;
++}
++
++static void Flush(filter_t *filter)
++{
++    srcfix_sys *sys = (srcfix_sys *)filter->p_sys;
++    src_reset(sys->state);
++    date_Set(&sys->date, VLC_TICK_INVALID);
++    sys->drained = false;
++}

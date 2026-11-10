@@ -1,0 +1,6 @@
+0001-gapless-metadata-and-AAC-decode.patch
+0002-AAC-encoder-and-transcode-drain.patch
+0003-MP4-EOF-and-exact-edits.patch
+0004-HEVC-timing-and-VUI.patch
+0005-macOS-HEVC-menu.patch
+0006-libsamplerate-filter-drain.patch

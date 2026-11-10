@@ -1,0 +1,72 @@
+{
+  "vlc_ref": "refs/tags/3.0.24",
+  "vlc_source_archive_sha256": "0ba29df0211e6fc826654eda3cece53a5d916d45198f137fc8831bb77aae2f76",
+  "changed_sources": {
+    "include/vlc_es.h": {
+      "before_sha256": "2ec817b1e8ea56b17434d7408d2f78364bb79bcda4c418f353b970aa8ce322bd",
+      "after_sha256": "733b9c7ece2290e2236f13701ce80a3e8cc99fdec87cf336b413a73530e1f38b"
+    },
+    "modules/codec/avcodec/audio.c": {
+      "before_sha256": "d0454cab1c078e2d2c55d846d73deb9fce846bf50115ba7aae569100217443e8",
+      "after_sha256": "60028d52e797ff8e01d416a722cc3a50f2650dc06c330455c57ea5616e417803"
+    },
+    "modules/codec/avcodec/avcodec.h": {
+      "before_sha256": "a85122b5e800fc5dd67ce39abc8f0fdafb05529200ecc596207ae2dbb35d4bdd",
+      "after_sha256": "cd33741f01edc0ee5f8f427775d603561f03fda062bf25fa947048dc4ea02007"
+    },
+    "modules/codec/avcodec/helpers.c": {
+      "before_sha256": null,
+      "after_sha256": "341f085d785e12cc33197aac850cbec420d43786d3a84508b65193594449ec55"
+    },
+    "modules/demux/avformat/demux.c": {
+      "before_sha256": "5fa5c995621f5edbb5c5abd72d24af7074dd1537be6242917d565e3656adbf06",
+      "after_sha256": "ff59f57201eb6d5b5613463ff7f56900a70ad164e40b68cf60c46a0d57a51afd"
+    },
+    "modules/packetizer/hxxx_nal.c": {
+      "before_sha256": "227871d260f0bca99fcdfdf0f2e3b284dce5b621b6d0af6d0d7a3e5febee696f",
+      "after_sha256": "336b6779e10d6531c2207a064bceab3f00b2ef741f307ce1ae9b50ca1854c7e3"
+    },
+    "modules/packetizer/mpeg4audio.c": {
+      "before_sha256": "bf8da11950c23dbe272b811b789a5054ef5ec9973686ce0c14fd9e7f1f864d03",
+      "after_sha256": "e67ce00bf35993fe265216575a377f554986c6e1cb16ccc105177e8619f6b174"
+    },
+    "modules/codec/avcodec/encoder.c": {
+      "before_sha256": "f51c9aab57fca6b3dd9f86db08b88e7c9efd643b349513851c37103506c8bea3",
+      "after_sha256": "9f98b49de0e9a99ccb0a9f6b54c8657e26fd255f7511351cff9441732eac77f1"
+    },
+    "modules/stream_out/transcode/audio.c": {
+      "before_sha256": "3ed0357f812a7ae674b49300040c4aafef1aa481d0bf65323cbd0e12b4c0540f",
+      "after_sha256": "621b7cdbb89ba9688334108c073ce0641e8ef84f6f579f6888667e1c7cb3b050"
+    },
+    "modules/stream_out/transcode/video.c": {
+      "before_sha256": "160fc85241b4277162c350990c0006d58ab0beaec4e7cff67bf5a5af12cee401",
+      "after_sha256": "63a8376d3d13bddefdff221f55e0d216fdffbbdd35fa2135c15460092f8a64dc"
+    },
+    "modules/mux/mp4/libmp4mux.c": {
+      "before_sha256": "0153083e2420f6d81d4cefc659587139e80b02c1fda748dd21c55267f08e87f8",
+      "after_sha256": "3be2906e8491d91a2ac744cd30e4eeca94811e5a40c3c034e50a55545f67a001"
+    },
+    "modules/mux/mp4/libmp4mux.h": {
+      "before_sha256": "f0188a71eec3f80f08796190cea5f7801d26abb3e2447bc5098950c8136290ef",
+      "after_sha256": "3383e2361ae0be6ee1546d87ebb9eaca11bdc40d18c31fa7bb55ab7a972b852b"
+    },
+    "modules/mux/mp4/mp4.c": {
+      "before_sha256": "bfe9c06915626c2dc7fdff09be66662ea886f3d7b3eca9c6d638fb1f644db701",
+      "after_sha256": "562813354263139625da2ba7e25fc721072945f21215d28c53c160effd85bc36"
+    },
+    "modules/codec/x265.c": {
+      "before_sha256": "54a9aa8ea7d8500c64e8a95d2ef147e4d0a82295337a37d5c8a1e554206a775f",
+      "after_sha256": "f02016f7241b8bd5e58e6e536f5d1fb2624f55e481411538cd5589ea70f2db13"
+    },
+    "modules/gui/macosx/VLCConvertAndSaveWindowController.m": {
+      "before_sha256": "7987db5f60170dbde2f2a4cefd07ee035ca0ad52101b358c3be0af0b9bc53ab9",
+      "after_sha256": "f743021d626f352320976632532be1edec0ab3e1709c779e9c7c6eda4285d451"
+    },
+    "modules/audio_filter/resampler/src.c": {
+      "before_sha256": "be62abdf1f5fd159a7246245160844c33a9eaf9669fc0d39f88130b36a4398d4",
+      "after_sha256": "4098610f75d918d6aeec5bbae4969db81e983442815852775f3a5e6b2ceb138a"
+    }
+  },
+  "installed_v4_source_kit_sha256": "7d06e2d51377b0bb2004d8147e97ad9371820638273937146cd0efae1e09f41a",
+  "scope": "Source-only reconstruction of the nine-plugin v4 compatibility build; no installed app or captured media redistributed."
+}
