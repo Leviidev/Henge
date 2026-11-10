@@ -98,14 +98,11 @@ enum JITBootstrap {
         // buffer with MAP_JIT and the translation layer makes its region itself.
         if canGrantOwnJIT && !stikDebugMayServiceTraps {
             selfGrantTried = true
-            if mapJITWorks {
-                HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); MAP_JIT executes here")
-                lastFailure = nil
-                return true
-            }
-            // MAP_JIT refused (no dynamic-codesigning after all, or Dopamine): plain memory made executable, which a debugged
-            // process or a jailbreak allows -- made here, with no brk for an attach that answers none (#148)
-            HengeLog.log("jit", "not trapping for a JIT region (no StikDebug); MAP_JIT does not execute here, trying plain memory")
+            selfGrantWasDebugged = debuggedFlag
+            // HengeVM consumes the held dual mapping directly; unlike QEMU it
+            // does not allocate one later. Capability alone is not readiness.
+            // The self allocator tries MAP_JIT, then plain executable memory.
+            HengeLog.log("jit", "claiming the JIT region without debugger traps")
             prepareCompressedHeap()
             if henge_ios_jit_prewarm_self(jitBytes) {
                 prewarmed = true
@@ -167,18 +164,20 @@ enum JITBootstrap {
         return method == JITMethod.stikDebug.rawValue || (method == JITMethod.automatic.rawValue && isStikDebugInstalled)
     }
 
-    /// The one try at making the region without a debugger has been made (it is not repeated: the answer will not change).
+    /// Avoid repeating allocation until a debugger grants new permission.
     nonisolated(unsafe) static private var selfGrantTried = false
+    // A later TrollStore/debugger attach changes the allocation permission;
+    // allow one new self-allocation attempt for that transition.
+    nonisolated(unsafe) static private var selfGrantWasDebugged = false
 
-    /// Whether Henge has JIT now: a debugger marked it, or the region is already held. Before iOS 26 this tries, once, to make
-    /// the region itself, which is all TrollStore and jailbroken devices need. Cheap after the first call, and logs nothing.
+    /// Whether Henge holds executable memory. Before iOS 26 this attempts to
+    /// allocate it itself; a later debugger grant permits one retry.
     static var ready: Bool {
         if prewarmed || isLive { return true }
-        // On a TXM device the debugger must also answer the brk that claims the region. CS_DEBUGGED alone is what opening
-        // Henge from StikDebug's app list gives (no Henge script) or LiveContainer, and an install then stops at
-        // "Henge has no JIT region" (#23).
-        if debuggedFlag { return !deviceEnforcesTXM }
-        guard canGrantOwnJIT, !selfGrantTried else { return false }
+        // CS_DEBUGGED grants permission, not a held region. Even on pre-TXM
+        // devices, allocate and self-test before reporting ready to HengeVM.
+        guard canGrantOwnJIT,
+              !selfGrantTried || (!selfGrantWasDebugged && debuggedFlag) else { return false }
         return prewarm()
     }
 
