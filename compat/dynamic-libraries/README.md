@@ -119,11 +119,19 @@ Expected gates:
 - Reports reference raw readback files. Requests, compiler commands, input/output
   digests, receipts and tool recipe provide independent provenance.
 
-The V2 precursor passed these gates on actual Sonoma/Henge, including authenticated
-cold compilation and clean process exit. This refactored injected package passed
-native Mac cold, async, snapshot and offline-cache tests; its independent guest
-package run must still be recorded. Do not substitute the precursor's validation
-for the new package's deployment gate.
+The V2 precursor and native injected controls remain separate evidence. The
+production injected package with recipe
+`5c6b17259467c6a3c45c92b600207bfc06f581d6d2b1431df483ed6dd09ae097`
+also passed its independent actual Sonoma14.6.1 PV-device gate: 2,816 exact raw
+uint32 values across all three executables, all exits0, correct callback counts
+and weak-reference release, and six automatic authenticated cold requests with
+no guest relay. Its user-owned versioned installer passed on that guest.
+
+With both Mac compilers stopped, cached asynchronous and dependency-snapshot
+execution passed another 1,024 exact values and clean exits. That is bounded
+warm-cache evidence; cold misses still require the configured compiler. It does
+not qualify dynamic render/stateful features, every app, or another OS/device.
+Source/recipe identity was unchanged between the cold and offline gates.
 
 For native-only integration testing:
 
