@@ -18,6 +18,19 @@ python3 compat/vlc/test_exports.py --candidate .compat-local/vlc-candidate \
 
 The target app must use the exact reference libvlccore. Candidate creation copies it, retains its Info.plist (including LSEnvironment), main executable content and load commands, installs the nine built plugins into that copy, and signs the copy while preserving entitlements. Existing target-specific CGL compatibility therefore remains intact. No arbitrary app security bypass is introduced. Use an output directory outside cloud/File Provider managed folders: those services can add Finder metadata that invalidates strict signature checks after a move. Final candidate verification rejects that condition. The target's full file/symlink tree is recorded for guarded later promotion. FFmpeg/FFprobe with testsrc2, libx264 and AAC are separate host verification tools; use `--ffmpeg`/`--ffprobe` to select them and retain the recorded version/fixture manifest. These are not guest runtime dependencies.
 
+The resampler's focused source regression is also reproducible independently:
+
+```sh
+python3 compat/vlc/test_samplerate.py --build .compat-local/vlc-build \
+  --archives .compat-local/vlc-archives --output .compat-local/samplerate-tests
+```
+
+It freshly builds the original pinned libsamplerate and compares it with the
+patched build across 18 authored EOF cases (1/2/4/6 channels, down/up/same-rate,
+short and non-integral durations, streaming and final-block input). It checks
+exact output frame counts and byte-identical common PCM, preserving the missing
+sample failure control without redistributing a recorded fixture.
+
 The regression generates authored media and checks six default-module cases: BT.601 x264/x265, BT.709 x265, full-range non-square-SAR x264/x265, and non-integral-duration stereo audio. It verifies actual decoded frames/samples, strict packet DTS/decoded PTS, color/SAR, audio SNR, RGB PSNR/SSIM, A/V start timing, decoder warnings and selected modules. There are no explicit encoder or hardware-decoder CLI overrides. Minimal normal preferences are `codec=avcodec` and `avcodec-hurry-up=0`; no `avcodec-hw=none` is needed in this route.
 
 Clean source-built native regression passed all six authored cases. The original versioned source changes also passed actual guest native Convert/Stream and normal installed-app entry for H.264 and HEVC, with 300 decoded frames and exactly441000 audio samples over10s. New builds and another iPad still need their own guest six-case run, actual GUI Convert/Stream checks, visible playback and physical audio acceptance. A native headless pass does not replace those gates. Long media, arbitrary source codecs, HDR and all GUI profiles are not qualified by these bounded tests.
