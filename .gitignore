@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 # Local compatibility outputs and machine-specific deployment records
 .compat-local/
+.venv/

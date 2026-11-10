@@ -34,6 +34,9 @@ opt-in and do not run during a normal application build.
 
 ## Build from clean source
 
+Use Python 3.9 or later. In a local virtual environment, install the pinned host
+diagnostic dependencies with `python3 -m pip install -r requirements-compat.txt`.
+
 Install the host build tools (including CMake, Meson/Ninja, pkg-config and Rust
 with `aarch64-apple-ios` for Husk's pairing library). Obtain the pinned Husk
 checkout, use its `scripts/fetch_sources.sh`, and build its dependencies with
@@ -141,6 +144,11 @@ not a full disk-content hash. A mismatch stops without overwriting guest data.
 For rollback, halt again, make a fresh preflight, and run the same guarded update
 with the retained old package as candidate and the current package as rollback.
 Do not publish `.compat-local` receipts: they contain device paths and auxiliary data.
+
+`python3 tools/compat/ipad_update.py health --receipt .compat-local/update-receipt
+--output .compat-local/health.json` rechecks installed code and target/container
+identity without requiring a halted guest. It explicitly leaves visible/manual
+acceptance pending.
 
 After an update, verify the package/source identity, that the same data container
 and machine files remain, JIT readiness, desktop boot, pointer/scroll input,

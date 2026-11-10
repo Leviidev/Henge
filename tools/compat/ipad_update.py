@@ -72,7 +72,8 @@ assert len(apps)==1 and len(helpers)==1, 'Ambiguous/missing app or TrollStore he
 app,info=apps[0];executable=app/info['CFBundleExecutable']
 assert executable.parent==app and executable.is_file()
 log=(data/'Documents/henge.log').read_bytes()
-assert log.rstrip().endswith(b'henge: the machine stopped (halt)'), 'Guest must halt normally before update'
+halted=log.rstrip().endswith(b'henge: the machine stopped (halt)')
+if cfg.get('require_halt',True):assert halted, 'Guest must halt normally before update'
 files={}
 for name in ['disk.img','auxiliary.bin']:
     path=machine/name;s=path.stat()
@@ -82,7 +83,7 @@ for name in ['disk.img','auxiliary.bin']:
 print(json.dumps({'model':model,'os':version['ProductVersion'],'os_build':version['ProductBuildVersion'],
  'bundle_id':cfg['bundle_id'],'app':str(app),'executable_sha256':hashlib.sha256(executable.read_bytes()).hexdigest(),
  'normalized_executable_sha256':normalized_macho(executable.read_bytes()),'data_container':str(data),'machine_directory':str(machine),'storage':files,'trollstore_helper':str(helpers[0]),'trollstore_helper_sha256':hashlib.sha256(helpers[0].read_bytes()).hexdigest(),
- 'halt_log_sha256':hashlib.sha256(log).hexdigest()}))
+ 'guest_halted':halted,'halt_log_sha256':hashlib.sha256(log).hexdigest()}))
 '''
 
 
@@ -178,10 +179,23 @@ def main():
     for name in ['host','bundle-id','data-container','machine-directory','expected-os','expected-os-build','expected-model']:p.add_argument('--'+name,required=True)
     p.add_argument('--app-control',default='/var/jb/usr/bin/icli',help='Remote icli-compatible app-control executable');p.add_argument('--host-key-alias');p.add_argument('--output',type=Path,required=True)
     p=commands.add_parser('update');p.add_argument('--plan',type=Path,required=True);p.add_argument('--package',type=Path,required=True);p.add_argument('--rollback-package',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
+    p=commands.add_parser('health');p.add_argument('--receipt',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
     a=parser.parse_args()
     if a.command=='preflight':
         config={k:v for k,v in vars(a).items()if k not in ['command','output']};state=Remote(config).state(config)
         new_private_directory(a.output);save(a.output/'target.json',config);save(a.output/'preflight.json',state);print('Preflight saved. Review target, storage identity and halted state before update.')
+    elif a.command=='health':
+        if a.output.exists():raise ValueError('Health receipt must be new')
+        config=json.loads((a.receipt/'target.json').read_text());config['require_halt']=False
+        packages=json.loads((a.receipt/'packages.json').read_text())
+        if package_identity(a.receipt/'candidate.tipa')!=packages['candidate']:raise ValueError('Retained candidate changed')
+        state=Remote(config).state(config)
+        if state['normalized_executable_sha256']!=packages['candidate']['normalized_executable_sha256']:raise ValueError('Installed code differs from the deployed candidate')
+        save(a.output,{'status':'identity_checks_passed_manual_acceptance_required','state':state,
+            'manual_acceptance':['Start guest and confirm JIT readiness','Visible desktop and advancing video',
+              'Actual speaker output','Pointer movement and scrolling','Lock/unlock and clean guest halt',
+              'Offline behavior within the selected cache/compiler policy'],
+            'limits':'Presence/code/container checks do not prove visible rendering, speaker output, or arbitrary-media correctness.'})
     else:update(a.plan,a.package,a.rollback_package,a.output)
 
 if __name__=='__main__':main()
