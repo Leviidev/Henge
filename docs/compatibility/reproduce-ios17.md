@@ -54,6 +54,8 @@ make ios-lib
 tools/build_ios_restore.sh
 HENGE_IPA_OUTPUT="$PWD/build/artifacts/Henge.tipa" ios/scripts/package_ipa.sh --trollstore
 python3 tools/compat/build_manifest.py --husk "$HUSK" --output build/build-inputs.json
+python3 tools/compat/external_toolchain.py --llvm-config /path/to/llvm-config \
+  --output build/external-toolchain.json
 ```
 
 `HUSK` now selects both dependency copying and the engine's include sysroot.
@@ -64,7 +66,12 @@ tracked project files. Package signing is ad hoc for TrollStore; signing an
 ordinary developer install requires your own valid identity/profile.
 
 The manifest records source hashes, compiler executable hashes, SDK build and
-all consumed Husk binary hashes. Build paths, timestamps, generated Xcode UUIDs,
+all consumed Husk binary hashes. The external-toolchain receipt also records
+SDK build identities and exact compiler/LLVM library hashes. It is separate
+build provenance: the initial dynamic-library runtime recipe binds tool version
+strings, source hashes and policy, but not these external executable hashes.
+A future recipe change must receive a new cache identity and its own guest gate;
+never relabel an existing cache/kit with stronger provenance. Build paths, timestamps, generated Xcode UUIDs,
 and signing can make final IPA bytes differ. This is a reproducible source/build
 recipe with input verification, not an unsupported bit-for-bit IPA claim.
 
