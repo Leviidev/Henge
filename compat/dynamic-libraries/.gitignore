@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+results/
+*.dylib
+*.metallib
+*.air
+*.tar.gz

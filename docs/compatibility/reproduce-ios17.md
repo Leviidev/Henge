@@ -106,9 +106,11 @@ python3 ios/scripts/sync_shader_conversions.py --help
 Supply your SSH host and the exact application Documents path. The companion
 uses a recipe-qualified/hash-checked cache and a short-lived lease. Existing
 valid cache entries work offline; uncached conversions currently require the
-Mac companion. Generated Apple libraries remain private local data. The separate dynamic-library package, when installed, has its own explicit
-compiler/configuration and offline-cache boundary; do not infer it from this
-static conversion companion.
+Mac companion. Generated Apple libraries remain private local data. The separate [dynamic-library package](../../compat/dynamic-libraries/README.md)
+has its own explicit compiler/configuration and offline-cache boundary; do not
+infer it from this static conversion companion. It is selected-process, stateless
+compute only. The injected package's guest gate is separate from its validated
+precursor and native controls.
 
 ## Installation, rollback and health checks
 
