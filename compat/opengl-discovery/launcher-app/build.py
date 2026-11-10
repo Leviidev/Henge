@@ -32,8 +32,9 @@ def main():
   'LSUIElement':True,'NSHighResolutionCapable':True,'HengeOpenGLLauncher':True,
   'HengeTargetExecutable':a.target_executable,'HengeTargetBundleIdentifier':a.target_bundle_id}
  (contents/'Info.plist').write_bytes(plistlib.dumps(info,sort_keys=True))
- compiler=subprocess.check_output(['xcrun','--find','clang'],text=True).strip()
- command=[compiler,'-target','arm64-apple-macos14','-O2','-fobjc-arc','-Wall','-Wextra','-Werror',
+ sdk=subprocess.check_output(['xcrun','--sdk','macosx','--show-sdk-path'],text=True).strip()
+ compiler=subprocess.check_output(['xcrun','--sdk','macosx','--find','clang'],text=True).strip()
+ command=[compiler,'-isysroot',sdk,'-target','arm64-apple-macos14','-O2','-fobjc-arc','-Wall','-Wextra','-Werror',
   str(HERE/'main.m'),'-framework','AppKit','-framework','Foundation','-o',str(macos/'HengeOpenGLLauncher')]
  with (out/'build.log').open('w') as log:subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,check=True)
  # Desktop file-provider/Finder metadata can be added to newly created apps
