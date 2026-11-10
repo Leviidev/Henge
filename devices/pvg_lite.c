@@ -50,6 +50,7 @@ int hv_pvg_trace_on(void) {
     }
     return on;
 }
+#include "pvg_texture_record.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,7 +126,10 @@ static void do_root(HvPvgLite *p) {
         if (p->log) fprintf(stderr, "hengevm: pvg-lite: root op %x len %x stamp %x\n", hdr[0], hdr[1], hdr[2]);
         if ((hdr[0] & 0xffff) == 0x38 && hdr[1] >= 28) {
             uint32_t *id = guest32(p, buf + off + (at + 12) % ring), *page = guest32(p, buf + off + (at + 24) % ring);
-            if (id && page && *id >> 1 < 512) p->task_root[*id >> 1] = *page;
+            if (id && page && *id >> 1 < 512) {
+                uint32_t task = *id >> 1;
+                p->task_root[task] = *page;
+            }
         }
         if ((hdr[0] & 0xffff) == 0x3a && hdr[1] >= 24) {
             uint32_t *count = guest32(p, buf + off + (at + 12) % ring), *page = guest32(p, buf + off + (at + 20) % ring);
@@ -371,6 +375,10 @@ uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
     return p->task_objects[task];
 }
 
+int hv_pvg_lite_legacy_surfaces(HvPvgLite *p, uint32_t task) {
+    return task < 512 && !p->task_objects[task] && hv_pvg_lite_task_objects(p, task) == 0x4000;
+}
+
 int hv_pvg_lite_old_driver(HvPvgLite *p) { return p->old_driver; }
 
 /* A stamp Metal finished: the guest sees it and the next poll raises the interrupt. */
@@ -535,7 +543,10 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     }
     if (op == 0x38) {
         ring_read(p, table, size, rd + 12 + skip, args, 16);
-        if (args[0] >> 1 < 512) p->task_root[args[0] >> 1] = args[3];
+        if (args[0] >> 1 < 512) {
+            uint32_t task = args[0] >> 1;
+            p->task_root[task] = args[3];
+        }
         return;
     }
     if (op == 0x44) {
@@ -561,11 +572,16 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping) {
     /* macOS 14's driver writes 0x200-byte descriptions, 32 to a page; later ones 0x400, 16 to a page. Reading the
        older ones as 0x400 apart put id 2k on the first half of "slot" k and never read id 2k+1 at all. */
-    uint32_t per = p->old_driver ? 32 : 16, size = 0x4000 / per;
     uint64_t table = p->io_regs[0x10 / 8];
-    uint32_t *e = table ? hv_phys_ptr(p->m, table + (mapping / per) * 4ull, 4) : NULL;
+    /* The guest selects 0x200-byte descriptors when bit 0 of the enable
+       register is clear, and 0x400-byte descriptors when it is set. Using
+       0x400 unconditionally makes slot 2 read slot 4's descriptor in the
+       first form, pairing a scanout view with an unrelated small surface. */
+    uint32_t stride = (p->io_regs[0x30 / 8] & 1) ? 0x400 : 0x200;
+    uint32_t per_page = 0x4000 / stride;
+    uint32_t *e = table ? hv_phys_ptr(p->m, table + (mapping / per_page) * 4ull, 4) : NULL;
     if (!e || !(*e & 1)) return NULL;
-    return hv_phys_ptr(p->m, ((uint64_t)(*e & ~1u) << 12) + (mapping % per) * (uint64_t)size, size);
+    return hv_phys_ptr(p->m, ((uint64_t)(*e & ~3u) << 12) + (mapping % per_page) * stride, stride);
 }
 
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) {
@@ -679,10 +695,13 @@ static void do_mapper(HvPvgLite *p) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
             if (!e || !t) continue;
-            fprintf(stderr, "pvgmap op %u id %u table %x %x %x %x\n", e[0], e[1], t[0], t[1], t[2], t[3]);
-            uint32_t seg = e[1] / 16, idx = e[1] % 16;
+            uint32_t stride = (p->io_regs[0x30 / 8] & 1) ? 0x400 : 0x200;
+            uint32_t per_page = 0x4000 / stride;
+            fprintf(stderr, "pvgmap op %u id %u form %u table %x %x %x %x\n",
+                    e[0], e[1], stride, t[0], t[1], t[2], t[3]);
+            uint32_t seg = e[1] / per_page, idx = e[1] % per_page;
             uint32_t *ta = hv_phys_ptr(p->m, table + seg * 4, 4);
-            uint32_t *d = ta ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~1u) << 12) + idx * 0x400ull, 0x400) : NULL;
+            uint32_t *d = ta ? hv_phys_ptr(p->m, ((uint64_t)(*ta & ~3u) << 12) + idx * stride, stride) : NULL;
             if (d && e[0] == 1) {
                 fprintf(stderr, "pvgdesc");
                 for (int k = 0; k < 64; k++) fprintf(stderr, " %08x", d[k]);
