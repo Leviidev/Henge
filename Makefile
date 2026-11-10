@@ -135,9 +135,10 @@ clean:
 # of libslirp and glib from Husk's sysroot (scripts there make them); see ios/README.md.
 IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
-# ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
-IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
-IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+HUSK ?= $(HOME)/Documents/Coding/Husk
+# Prefer installed headers, otherwise use the explicitly selected Husk source build.
+IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HUSK)/build/ios-arm64/sysroot)
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I"$(IOS_DEPS)/include/slirp"
 IB = build/ios
 IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
@@ -221,3 +222,19 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+# Portable compatibility controls: authored inputs, no guest cache or Apple shader assets.
+COMPAT_TESTS = $(B)/test_panic_candidates $(B)/test_pvg_texture_record $(B)/test_pvg_surface_pages $(B)/test_pvg_surface_copyback_plan
+$(B)/test_panic_candidates: tests/test_panic_candidates.c devices/panic_candidates.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_texture_record: tests/test_pvg_texture_record.c devices/pvg_texture_record.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_surface_pages: tests/test_pvg_surface_pages.c devices/pvg_surface_pages.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_surface_copyback_plan: tests/test_pvg_surface_copyback.c devices/pvg_surface_copyback.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+test-sonoma-compat: $(COMPAT_TESTS) $(B)/test_virtio_discard
+	@for test in $^; do "$$test" || exit 1; done
+	python3 -m unittest discover -s ios/scripts -p 'test_*.py'
+	python3 -m unittest discover -s ios/scripts -p '*_test.py'
+.PHONY: test-sonoma-compat

@@ -11,10 +11,12 @@ TROLLSTORE=false
 [ "$1" = "--trollstore" ] && TROLLSTORE=true
 OUT="$HOME/Desktop/Henge.ipa"
 [ "$TROLLSTORE" = true ] && OUT="$HOME/Desktop/Henge.tipa"
+OUT="${HENGE_IPA_OUTPUT:-$OUT}"
+mkdir -p "$(dirname "$OUT")"
 [ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
 cd "$IOS"
 xcodegen generate >/dev/null
-DD="$IOS/build/DerivedData"
+DD="${HENGE_DERIVED_DATA:-$IOS/build/DerivedData}"
 mkdir -p "$IOS/build"
 xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
     -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > "$DD.buildlog" 2>&1 || {
@@ -32,7 +34,7 @@ for f in "$APP/Henge" "$APP/henge-jit.js" "$APP/PlugIns/HengeJITHelper.appex/Hen
 done
 [ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }
 
-STAGE="$(mktemp -d "$DD/stage.XXXXXX")"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/henge-stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/Payload"
 cp -R "$APP" "$STAGE/Payload/"
@@ -42,6 +44,7 @@ cp "$IOS/${HENGE_ENTITLEMENTS:-Henge/Henge.entitlements}" "$ENT"
 BANNED_KEYS=("com.apple.private.cs.debugger" "dynamic-codesigning" "com.apple.private.skip-library-validation")
 if [ "$TROLLSTORE" = true ]; then for k in "${BANNED_KEYS[@]}"; do plutil -remove "$k" "$ENT" 2>/dev/null || true; done; fi
 SAPP="$STAGE/Payload/Henge.app"
+xattr -rc "$SAPP"
 plutil -insert HengeBuildCommit -string "$(git -C "$IOS/.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" "$SAPP/Info.plist"
 plutil -insert HengeBuildDate -string "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SAPP/Info.plist"
 # Apple's boot ROM is fetched on the device (BootROM.swift) and must never ship. An older build folder can still

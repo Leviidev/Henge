@@ -92,6 +92,10 @@ That produces `~/Desktop/Henge.ipa`, and `package_ipa.sh --trollstore` writes `H
 
 `make` builds the engine for the Mac, `build/hengevm`, and `make test` runs its tests.
 
+For the source-only Sonoma/iPadOS 17 compatibility series, pinned build inputs,
+regeneration of authored tests, and guarded in-place updates, see
+[the reproduction guide](docs/compatibility/reproduce-ios17.md).
+
 ## Licence
 
 GPL-2.0-or-later. Henge compiles in usbmuxd (GPLv2 or GPLv3) and code from Husk (GPL-2.0-or-later), so the shipped binary is a combined GPL work. It cannot go on the App Store. See [docs/licensing.md](docs/licensing.md).
