@@ -5,3 +5,7 @@ __pycache__/
 # Local compatibility outputs and machine-specific deployment records
 .compat-local/
 .venv/
+
+# Rebuild protocol3 planner from public source; never commit the local executable.
+ios/scripts/gl-position-plan
+ios/scripts/gl-position-plan.build.json

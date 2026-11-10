@@ -4,6 +4,7 @@
  * No guarantee for AIR that the selected compiler cannot translate. */
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonDigest.h>
+#include "pvg_shader_profile.h"
 
 #define HV_SHADER_LIMIT (32u * 1024u * 1024u)
 
@@ -35,7 +36,7 @@ static NSDictionary *hv_shader_json(NSString *path) {
 }
 
 static BOOL hv_shader_config_valid(NSDictionary *value) {
-    return [value[@"protocol"] isEqual:@2] && [value[@"target"] isEqual:@"air64-apple-ios17.0.0"] &&
+    return ([value[@"protocol"] isEqual:@2] || [value[@"protocol"] isEqual:@3]) && [value[@"target"] isEqual:@"air64-apple-ios17.0.0"] &&
            hv_shader_digest_valid(value[@"recipe"]);
 }
 
@@ -62,12 +63,19 @@ static NSData *hv_shader_cache(NSString *root, NSString *source, NSString *recip
     if (data.length < 4 || memcmp(data.bytes, "MTLB", 4) ||
         ![receipt[@"length"] isEqual:@(data.length)] ||
         ![hv_shader_digest(data) isEqual:receipt[@"output_sha256"]]) return nil;
+    NSDictionary *active=hv_shader_json([root stringByAppendingPathComponent:@"shader-compiler-config.json"]);
+    if (![receipt[@"protocol"] isEqual:active[@"protocol"]]) return nil;
+    if ([receipt[@"protocol"] isEqual:@3] && !hv_shader_profile_validate(receipt,data,source,recipe,NULL)) return nil;
     return data;
 }
 
 static NSDictionary *hv_shader_compiler_config(NSString *root) {
     NSDictionary *config = hv_shader_json([root stringByAppendingPathComponent:@"shader-compiler-config.json"]);
     return hv_shader_config_valid(config) ? config : nil;
+}
+
+static BOOL hv_shader_profile_required(NSString *root) {
+    return [hv_shader_compiler_config(root)[@"protocol"] isEqual:@3];
 }
 
 /* This lookup never creates a request, checks a lease, or waits. It is safe to
@@ -94,7 +102,7 @@ static NSData *hv_shader_converted_bytes(NSString *root, NSString *source, NSStr
     static NSObject *guard;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ guard = [NSObject new]; });
-    NSString *requests = [root stringByAppendingPathComponent:@"shader-requests-v2"];
+    NSString *requests = [root stringByAppendingPathComponent:[config[@"protocol"]isEqual:@3]?@"shader-requests-v3":@"shader-requests-v2"];
     NSString *path = [requests stringByAppendingPathComponent:[source stringByAppendingString:@".json"]];
     NSString *requestID;
     @synchronized (guard) {
@@ -107,7 +115,7 @@ static NSData *hv_shader_converted_bytes(NSString *root, NSString *source, NSStr
             requestID = existing[@"request"];
         } else {
             requestID = NSUUID.UUID.UUIDString;
-            NSDictionary *request = @{@"protocol":@2, @"target":@"air64-apple-ios17.0.0", @"recipe":recipe,
+            NSDictionary *request = @{@"protocol":config[@"protocol"], @"target":@"air64-apple-ios17.0.0", @"recipe":recipe,
                 @"sha256":source, @"owner":owner, @"request":requestID, @"function":function ?: @"(library load)"};
             [NSFileManager.defaultManager createDirectoryAtPath:requests withIntermediateDirectories:YES attributes:nil error:nil];
             NSData *encoded = [NSJSONSerialization dataWithJSONObject:request options:0 error:nil];
@@ -154,6 +162,7 @@ static id hv_shader_load_converted(NSString *root, NSString *source, NSString *l
         id (^load)(NSData *), NSString *__autoreleasing *route) {
     if (route) *route = nil;
     if (!hv_shader_digest_valid(source) || !load) return nil;
+    if (hv_shader_profile_required(root)) return nil; // protocol3 requires the annotated loader below
     NSData *cached = hv_shader_cached_bytes(root, source);
     id result = cached ? load(cached) : nil;
     if (result) { if (route) *route = @"recipe-cache"; return result; }
@@ -166,5 +175,33 @@ static id hv_shader_load_converted(NSString *root, NSString *source, NSString *l
     if (converted.length && ![converted isEqualToData:cached] && ![converted isEqualToData:legacy])
         result = load(converted);
     if (result && route) *route = @"broker";
+    return result;
+}
+
+/* Protocol3 never loads unprofiled bytes. Protocol2 preserves its existing policy. */
+static id hv_shader_load_profiled(NSString *root, NSString *source, NSString *legacyPath,
+        NSString *function, BOOL allowLegacy, BOOL allowRequest,
+        id (^load)(NSData *, NSDictionary *, NSString *), NSString *__autoreleasing *route) {
+    if (route) *route=nil;
+    if (!hv_shader_digest_valid(source)||!load) return nil;
+    NSDictionary *config=hv_shader_compiler_config(root);
+    if (![config[@"protocol"]isEqual:@3])
+        return hv_shader_load_converted(root,source,legacyPath,function,allowLegacy,allowRequest,
+            ^id(NSData *bytes){ return load(bytes,nil,nil); },route);
+    NSString *recipe=config[@"recipe"];
+    NSString *base=[[[root stringByAppendingPathComponent:@"shader-cache"]stringByAppendingPathComponent:recipe]stringByAppendingPathComponent:source];
+    NSData *cached=hv_shader_cache(root,source,recipe);
+    NSDictionary *receipt=hv_shader_json([base stringByAppendingString:@".json"]);
+    id result=cached&&hv_shader_profile_validate(receipt,cached,source,recipe,NULL)?load(cached,receipt,recipe):nil;
+    if(result){if(route)*route=@"profiled-recipe-cache";return result;}
+    NSData *legacy=allowLegacy&&legacyPath?hv_shader_read(legacyPath,HV_SHADER_LIMIT):nil;
+    NSDictionary *legacyReceipt=legacyPath?hv_shader_json([legacyPath stringByAppendingString:@".profile.json"]):nil;
+    if(legacy.length&&![legacy isEqualToData:cached]&&hv_shader_profile_validate(legacyReceipt,legacy,source,recipe,NULL))result=load(legacy,legacyReceipt,recipe);
+    if(result){if(route)*route=@"profiled-legacy";return result;}
+    if(!allowRequest)return nil;
+    NSData *converted=hv_shader_converted_bytes(root,source,function);
+    receipt=hv_shader_json([base stringByAppendingString:@".json"]);
+    if(converted.length&&![converted isEqualToData:cached]&&hv_shader_profile_validate(receipt,converted,source,recipe,NULL))result=load(converted,receipt,recipe);
+    if(result&&route)*route=@"profiled-broker";
     return result;
 }

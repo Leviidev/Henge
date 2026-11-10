@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "protocol": 3,
+  "profile_schema": 1,
+  "viewport_contract": "gl_half_range_v1",
+  "sources": {
+    "ios/scripts/recompile_guest_metallib_profiled.py": {
+      "sha256": "c48cc38b19c4dfae16dbf5679dbac04eb33453d9e45fa0dd439ed2e8e2dfe135",
+      "bytes": 3273
+    },
+    "ios/scripts/shader_companion_profiled.py": {
+      "sha256": "ac78467717fa6d355020ce9bfef5c4a8b003b6746820b37395510893a5c621d0",
+      "bytes": 10077
+    },
+    "ios/scripts/shader_compiler_peer_profiled.py": {
+      "sha256": "25f032a211fd39e00211da6bce3468a2443e023d6f207a015ae04050306bda9a",
+      "bytes": 8241
+    },
+    "ios/scripts/shader_profile.py": {
+      "sha256": "34a395a4c397bfccc41051547b79a2e4ab7fb67c40c486d054be36da72fb6d74",
+      "bytes": 2981
+    },
+    "ios/scripts/gl_position_lower.py": {
+      "sha256": "98043d65d669710dec2ddfe5c73135ce69bf1caff157a3b42d0c3a52cd9e3e1f",
+      "bytes": 3936
+    },
+    "ios/scripts/gl_position_plan.cpp": {
+      "sha256": "1f5de47886fea3e6925b52df54c5bd15ca4c4c18302b5fcafae26e2911e365e0",
+      "bytes": 4814
+    },
+    "ios/scripts/build_gl_position.py": {
+      "sha256": "0ab21488082bc6312416374eafa6db94776bdea83b5dc64b8606791c1cfaf496",
+      "bytes": 1416
+    },
+    "devices/pvg_shader_profile.h": {
+      "sha256": "04b420c3efdb366115799a3735fd996555c591b5e16ae6eeb7215a5e92fd5d28",
+      "bytes": 5685
+    },
+    "devices/pvg_shader_broker.h": {
+      "sha256": "c8143ddb9889b21bfe11a62a6c049fd33f8b17913e5bafcaef47bfc63020ee3b",
+      "bytes": 12284
+    }
+  },
+  "shared_catalog_sha256": "cc209c4b4132dc236bd0528ea91f22cbb6fb67f0c0a4c07070b7b85a1c6d189b",
+  "metal_integration_patch_sha256": "ea4513337ef25848c6ccf13947ad05eb4d48c60131fb6308e211e5cdeae315ba",
+  "viewport_patch_sha256": "4b855b6f5ca7fdf80e5e7ceae8f739e6a5890d08c05a31e1049b00db7a3842c3",
+  "build_policy": "No planner binary distributed; build_gl_position.py generates it locally. Recipe must be computed in the final compiler path and includes compiler/runtime identities; protocol2 caches are not relabelled."
+}

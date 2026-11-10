@@ -49,8 +49,10 @@ static int cursor_scale(void) {
 #include "pvg_surface_pages.h"
 #include "pvg_surface_copyback.h"
 #include "pvg_store_action.h"
+#include "pvg_viewport_replay.h"
 #if TARGET_OS_IPHONE
 #include "pvg_shader_broker.h"
+#include "pvg_shader_profile.h"
 #include "pvg_agx_journal.h"
 #endif
 
@@ -195,6 +197,7 @@ static BOOL task_cache_lifecycle(NSMutableDictionary *tasks, uint32_t op,
     id<MTLCommandBuffer> last_cb;
     double encode_time, gpu_wait_time;
     BOOL pipeline_set; /* in the open encoder */
+    HvPvgViewportReplay *viewport_replay;
     id<MTLComputePipelineState> active_compute_state;
     NSMutableArray *compute_audits;
     BOOL tess_factors; /* so is a tessellation factor buffer */
@@ -585,13 +588,20 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     NSString *convertedRoute = nil;
     BOOL usedConverted = NO;
     __block NSDictionary *agxSelected = nil;
+    __block NSDictionary *selectedProfileReceipt=nil;
+    __block NSData *selectedProfileBytes=nil;
+    __block NSString *selectedProfileRecipe=nil;
+    BOOL profileRequired=NO;
     const uint8_t *bytes = lib.bytes;
     BOOL macLibrary = lib.length >= 6 && !memcmp(bytes, "MTLB", 4) && bytes[4] == 1 && bytes[5] == 0x80;
-    id (^loadConvertedLibrary)(NSData *) = ^id(NSData *candidate) {
+    id (^loadConvertedLibrary)(NSData *, NSDictionary *, NSString *) = ^id(NSData *candidate, NSDictionary *receipt, NSString *recipe) {
         dispatch_data_t compiled = dispatch_data_create(candidate.bytes, candidate.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         NSError *loadError = nil;
         id loaded = [device newLibraryWithData:compiled error:&loadError];
-        if (loaded) agxSelected = hv_agx_library(candidate, libraryID, @"converted-candidate");
+        if (loaded) {
+            agxSelected = hv_agx_library(candidate, libraryID, @"converted-candidate");
+            selectedProfileReceipt=receipt;selectedProfileBytes=candidate;selectedProfileRecipe=recipe;
+        }
         if (!loaded) err = loadError ?: err;
         return loaded;
     };
@@ -610,9 +620,15 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
             [NSString stringWithFormat:@"sonoma-ioslib-%s.metallib", hex]];
         NSString *preferPath = [documents stringByAppendingPathComponent:
             [NSString stringWithFormat:@"sonoma-prefer-%s", hex]];
-        library = hv_shader_load_converted(documents, libraryID, convertedPath, nil,
-            [[NSFileManager defaultManager] fileExistsAtPath:preferPath], NO,
+        profileRequired=hv_shader_profile_required(documents);
+        if(profileRequired){
+            NSString *capture=[documents stringByAppendingPathComponent:[NSString stringWithFormat:@"sonoma-guestlib-%s.metallib",hex]];
+            if(![NSFileManager.defaultManager fileExistsAtPath:capture]&&![lib writeToFile:capture atomically:YES])return nil;
+        }
+        library = hv_shader_load_profiled(documents, libraryID, convertedPath, nil,
+            [[NSFileManager defaultManager] fileExistsAtPath:preferPath], profileRequired,
             loadConvertedLibrary, &convertedRoute);
+        if(profileRequired&&!library){[self complain:@"profiled Metal conversion unavailable; unprofiled fallback disabled for protocol3"];return nil;}
         usedConverted = library != nil;
         if (!library) {
             /* Keep a source available even when a present legacy file is
@@ -641,7 +657,7 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     }
 #if TARGET_OS_IPHONE
     if (!library && macLibrary) {
-        library = hv_shader_load_converted(convertedPath.stringByDeletingLastPathComponent,
+        library = hv_shader_load_profiled(convertedPath.stringByDeletingLastPathComponent,
             libraryID, convertedPath, nil, YES, YES, loadConvertedLibrary, &convertedRoute);
         usedConverted = library != nil;
     }
@@ -681,6 +697,9 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     }
     id<MTLFunction> function = [library newFunctionWithName:library.functionNames.firstObject];
 #if TARGET_OS_IPHONE
+    if (function && selectedProfileReceipt && !hv_shader_profile_attach(function,selectedProfileReceipt,selectedProfileBytes,libraryID,selectedProfileRecipe)) {
+        [self complain:@"profiled Metal function identity/type mismatch"];return nil;
+    }
     if (agxSelected && usedConverted) {
         NSMutableDictionary *selection=[agxSelected mutableCopy];
         selection[@"route"]=convertedRoute ?: @"converted-candidate";agxSelected=selection;
@@ -707,11 +726,12 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     NSString *digest = [identity componentsSeparatedByString:@":"].firstObject;
     NSString *route = nil;
     __block NSDictionary *agxSelected = nil;
-    id<MTLFunction> function = hv_shader_load_converted(path.stringByDeletingLastPathComponent,
-        digest, path, original.name, YES, YES, ^id(NSData *bytes) {
+    id<MTLFunction> function = hv_shader_load_profiled(path.stringByDeletingLastPathComponent,
+        digest, path, original.name, YES, YES, ^id(NSData *bytes, NSDictionary *receipt, NSString *recipe) {
             dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             id<MTLLibrary> alternate = [device newLibraryWithData:data error:nil];
             id<MTLFunction> selected=[alternate newFunctionWithName:original.name];
+            if(selected&&receipt&&!hv_shader_profile_attach(selected,receipt,bytes,digest,recipe))return nil;
             if (selected) agxSelected=hv_agx_library(bytes, digest, @"converted-retry");
             return selected;
         }, &route);
@@ -841,6 +861,14 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
                         (unsigned long)c.writeMask);
             }
         }
+#if TARGET_OS_IPHONE
+        if (state && tag == 0xe) {
+            /* descriptor contains the final selected functions, including
+               converted retry replacements. Never infer this from a name. */
+            MTLRenderPipelineDescriptor *rp = descriptor;
+            hv_pvg_pipeline_set_gl_clip(state, hv_shader_function_gl_clip(rp.vertexFunction));
+        }
+#endif
         if (state && tag == 0xe && getenv("HV_PVG_TRACE_FILE")) {
             MTLRenderPipelineDescriptor *rp = descriptor;
             objc_setAssociatedObject(state, "hvname", [NSString stringWithFormat:@"%@ / %@ -> fmt %lu blend %d", rp.vertexFunction.name, rp.fragmentFunction.name, (unsigned long)rp.colorAttachments[0].pixelFormat, (int)rp.colorAttachments[0].blendingEnabled], OBJC_ASSOCIATION_RETAIN);
@@ -1765,6 +1793,8 @@ typedef struct {
 #define U64(off) ({ uint64_t _v; memcpy(&_v, r.p + (off), 8); _v; })
 
 - (id<MTLRenderCommandEncoder>)beginPass:(Rec)r task:(uint32_t)task commandBuffer:(id<MTLCommandBuffer>)cb {
+    if (!viewport_replay) viewport_replay = [HvPvgViewportReplay new];
+    hv_pvg_viewport_reset(viewport_replay);
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
 #define ATTACH(a, o)                                                 \
     do {                                                             \
@@ -1971,6 +2001,7 @@ typedef struct {
     case 116: { /* Metal crashes on a missing pipeline, and on drawing without one */
         id state = [self get:U32(0) task:task];
         if (state) [e setRenderPipelineState:state];
+        hv_pvg_viewport_pipeline(viewport_replay, e, state);
         pipeline_set = state != nil;
         if (tracing) fprintf(stderr, "trace:  pipeline %u %s\n", U32(0), [objc_getAssociatedObject(state, "hvname") UTF8String]);
         break;
@@ -2043,9 +2074,8 @@ typedef struct {
         break;
     }
     case 130: {
-        MTLViewport v;
-        memcpy(&v, r.p, sizeof v);
-        [e setViewport:v];
+        if (r.size >= sizeof(MTLViewport))
+            hv_pvg_viewport_record(viewport_replay, e, r.p, 1, NO);
         break;
     }
     case 122: { /* {ref, offset, stride} */
@@ -2083,7 +2113,7 @@ typedef struct {
     }
     case 131: {
         uint32_t head = r.size % sizeof(MTLViewport), n = (r.size - head) / sizeof(MTLViewport);
-        if (n) [e setViewports:(const MTLViewport *)(r.p + head) count:n];
+        if (n) hv_pvg_viewport_record(viewport_replay, e, r.p + head, n, YES);
         break;
     }
     case 129: { /* vertex textures: {index, count}, refs */

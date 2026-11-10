@@ -32,4 +32,23 @@ python3 check.py --probe /path/guest-probe.json --matrix /path/guest-matrix \
 
 The checks cover clear, GLSL triangle, nearest texture, indexed primitive restart, blend/scissor, depth rejection and framebuffer blit. Five 65×49 RGBA images matched the native control exactly on the tested Sonoma14.6.1/iPadOS17 route. This is bounded accelerated-rendering evidence, not a general claim for every OpenGL application, extension, OS or iPad. This source package contains no system renderer binary, captured shader, guest image or credentials. Host-native reruns qualify build and controls only; another iPad still requires its own guest run and visible application check.
 
-Clipping remains experimental: the original OpenGL clip-space depth range differs from Metal's, and negative-depth clipping is not fixed by renderer discovery or late store actions. The five controls above do not qualify that range. Do not hide this with app shader substitution; broader clipping/application support requires a separately validated compiler/projection correction.
+Renderer discovery and late store actions alone do not repair OpenGL's different
+clip-space depth range. Use the separately paired [protocol3 shader/viewport
+integration](../../docs/compatibility/profiled-opengl.md), which passed the
+production lineage's unmodified21-case depth matrix twice and17 image cases.
+The five discovery controls alone do not establish that qualification.
+
+For prior Henge VLC installs, `--app` deliberately refuses a bundle whose
+`LSEnvironment` already sets `DYLD_INSERT_LIBRARIES` for the old software fallback.
+Keep that guard and the installed bundle unchanged. The explicitly selected
+executable route was tested successfully:
+
+```sh
+/path/launch --shim /path/registry-discovery.dylib \
+  --executable /Applications/VLC.app/Contents/MacOS/VLC \
+  --receipt /path/new-vlc-launch.json --log /path/new-vlc-launch.log -- /path/media.mp4
+```
+
+This fresh process does not import the bundle's old injection environment. The
+launcher removes `HENGE_CGL_SOFTWARE_FALLBACK` and adds only the reviewed explicit
+libraries. Opening the installed VLC normally preserves its prior fallback route.

@@ -185,7 +185,9 @@ missing renderer discovery property only within explicitly launched processes.
 With the separately tested late render-store-action fix, accelerated clear/GLSL
 and five bounded draw/readback cases passed on the tested Sonoma/iPad route.
 System renderer registration is unchanged; ordinary double-click applications
-without this opt-in route are not thereby repaired. No all-app OpenGL claim is made.
+without this opt-in route are not thereby repaired. The [paired protocol3
+compiler/viewport integration](profiled-opengl.md) adds independently validated
+clip/depth handling. No all-app OpenGL claim is made.
 
 The [AGX provenance journal](agx-journal.md) is opt-in diagnostics. It archives
 actually selected bytes and first/retry pipeline attempt metadata without a new
