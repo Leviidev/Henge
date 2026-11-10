@@ -77,6 +77,38 @@ never relabel an existing cache/kit with stronger provenance. Build paths, times
 and signing can make final IPA bytes differ. This is a reproducible source/build
 recipe with input verification, not an unsupported bit-for-bit IPA claim.
 
+## Cloud/FileProvider workspace builds
+
+If Xcode stalls before planning while reading a Desktop/cloud-managed project,
+move the entire committed source snapshot outside that managed tree. Moving only
+DerivedData did not resolve the observed `NSFileCoordinator` wait. The validated
+full builds used fresh `/tmp` source plus dependency/restore builds, one app build
+at a time. Do not restart shared Xcode services or stop unrelated processes.
+
+From a clean committed checkout, this preserves the exact source commit and tree:
+
+```sh
+set -e
+henge_source_root="$PWD"
+henge_source_commit=$(git rev-parse HEAD)
+henge_source_work=$(mktemp -d /tmp/henge-source.XXXXXX)
+mkdir "$henge_source_work/source"
+git archive --format=tar --output="$henge_source_work/source.tar" "$henge_source_commit"
+tar -xf "$henge_source_work/source.tar" -C "$henge_source_work/source"
+git -C "$henge_source_work/source" init
+git -C "$henge_source_work/source" fetch --depth=1 "$henge_source_root" "$henge_source_commit"
+git -C "$henge_source_work/source" reset --mixed "$henge_source_commit"
+shasum -a 256 "$henge_source_work/source.tar"
+cd "$henge_source_work/source"
+```
+
+Run the same dependency, `make ios-lib`, restore-library and packaging commands
+above from that snapshot. Keep `HUSK` explicit, select fresh `/tmp` DerivedData and
+write the TIPA/receipts to your private retained output directory. Git metadata
+allows the package's embedded build commit to remain exact. Preserve the archive
+hash, source commit/tree, dependency manifest and package identity. A cancelled
+or stalled build is unqualified; never package a stale earlier app.
+
 ## Authored regression assets
 
 ```sh
