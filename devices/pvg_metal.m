@@ -48,6 +48,7 @@ static int cursor_scale(void) {
 #include "pvg_texture_record.h"
 #include "pvg_surface_pages.h"
 #include "pvg_surface_copyback.h"
+#include "pvg_store_action.h"
 #if TARGET_OS_IPHONE
 #include "pvg_shader_broker.h"
 #endif
@@ -1861,6 +1862,11 @@ typedef struct {
     if (!pipeline_set && draw) return;
     if (tracing && draw) fprintf(stderr, "trace:  draw tag %u\n", tag);
     switch (tag) {
+    case 102: case 103: case 105: case 106: case 120: case 121:
+        if (!hv_pvg_apply_store_action(e, tag, r.p, r.size))
+            fprintf(stderr, "hengevm: pvg-metal: invalid store action tag %u (%u bytes)\n", tag, r.size);
+        else if (tracing) fprintf(stderr, "trace:  finalized store action tag %u\n", tag);
+        break;
     case 24: { /* {fence, stages} */
         id f = [self get:U32(0) task:task];
         if (f) [e updateFence:f afterStages:(MTLRenderStages)(U32(4) & 0xffff)];

@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_virtio_discard
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_virtio_discard $(B)/test_pvg_store_action
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -83,6 +83,13 @@ $(B)/test_jit_region: tests/test_jit_region.c $(B)/jit_region.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
+$(B)/test_pvg_store_action: tests/test_pvg_store_action.c devices/pvg_store_action.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_store_action_metal: tests/test_pvg_store_action.m devices/pvg_store_action.h | $(B)
+	$(CC) $(CFLAGS) -fobjc-arc -Wno-deprecated-declarations $< -framework AppKit -framework Metal -o $@
+test-pvg-store-action: $(B)/test_pvg_store_action $(B)/test_pvg_store_action_metal
+	$(B)/test_pvg_store_action
+	$(B)/test_pvg_store_action_metal $(B)/pvg-store-action-result.json
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
 
