@@ -219,7 +219,12 @@ and five bounded draw/readback cases passed on the tested Sonoma/iPad route.
 System renderer registration is unchanged; ordinary double-click applications
 without this opt-in route are not thereby repaired. The [paired protocol3
 compiler/viewport integration](profiled-opengl.md) adds independently validated
-clip/depth handling. No all-app OpenGL claim is made.
+clip/depth handling. The [VLC Hardware wrapper](../../compat/opengl-discovery/launcher-app/README.md)
+provides a separate clickable entry without modifying VLC. The paired production
+route passed unmodified depth controls, bounded draw/readback matrices, texture-first
+clears and visible H264/HEVC/10-bit HEVC playback. The final wrapper also passed
+normal foreground/File Open playback after the ordinary Downloads permission prompt.
+These checks do not establish all-app or all-media OpenGL compatibility.
 
 The [AGX provenance journal](agx-journal.md) is opt-in diagnostics. It archives
 actually selected bytes and first/retry pipeline attempt metadata without a new

@@ -11,9 +11,16 @@ python3 compat/opengl-discovery/build.py --output .compat-local/opengl-build
   --log /path/new-launch.log -- /path/media.mp4
 ```
 
-The built launcher is a macOS14+ arm64 Foundation executable. Guest Python or Xcode Command Line Tools are not required. Python is used only on the build/analysis host; `launch.py` remains a host-side equivalent.
+The built launcher is a macOS14+ arm64 Foundation/AppKit executable. Guest Python or Xcode Command Line Tools are not required. Python is used only on the build/analysis host; `launch.py` retains the original host-side CLI controls.
 
-Quit an existing app first and start a fresh process through the helper. Arguments after `--` go to the executable. `--executable` supports tools. `--dry-run` records preflight without launching. The app bundle is never modified. The launcher carries its `LSEnvironment` into the new process and removes the previous Henge software-fallback flag for this accelerated route. It refuses inherited DYLD injection; combine reviewed helpers with explicit repeated `--additional-dylib` arguments. Other helper-specific environment/configuration remains operator-supplied. It does not set global shell/login/LaunchServices variables.
+Quit an existing app first and start a fresh process through the helper. Arguments after `--` go to the executable. `--executable` supports tools. `--dry-run` records preflight without launching. The native launcher's optional
+`--activate` waits up to 15 seconds for the exact new child PID to finish
+launching, requests public AppKit activation, then observes foreground status
+for up to 2 seconds. It does not activate by app name or bundle identifier.
+The receipt publishes `child_pid` immediately after spawn and records request
+and observed-foreground results separately. Activation is best effort; it
+does not unlock the guest or dismiss permission prompts. The host Python
+helper does not implement this optional activation feature. The app bundle is never modified. The launcher carries its `LSEnvironment` into the new process and removes the previous Henge software-fallback flag for this accelerated route. It refuses inherited DYLD injection; combine reviewed helpers with explicit repeated `--additional-dylib` arguments. Other helper-specific environment/configuration remains operator-supplied. It does not set global shell/login/LaunchServices variables.
 
 Hardened runtime, library validation, SIP or app-specific launch restrictions may forbid injection. The launcher reports the known hardened-runtime restrictions; even a successful launch is not proof dyld accepted the library. Inspect the log for `CGLDISCOVERY` and verify the selected accelerated renderer/readback. Use an app build explicitly supporting injection; this package does not strip signatures, disable security features or re-sign arbitrary apps. Some applications require LaunchServices-specific startup beyond `LSEnvironment` and are outside this direct-launch route. Rollback is simply closing the launched app and opening it normally; no persistent registration exists to undo.
 
@@ -52,3 +59,5 @@ executable route was tested successfully:
 This fresh process does not import the bundle's old injection environment. The
 launcher removes `HENGE_CGL_SOFTWARE_FALLBACK` and adds only the reviewed explicit
 libraries. Opening the installed VLC normally preserves its prior fallback route.
+
+For a separate clickable VLC entry, build the [VLC Hardware wrapper](launcher-app/README.md). It preserves the original VLC bundle and fallback entry.

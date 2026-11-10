@@ -22,8 +22,12 @@ The logical changes are separate commits:
    crash repair or a change to Metal-object retention.
 8. Optional VLC source patches and independent source rebuild/export controls.
 9. Optional process-scoped OpenGL discovery and native app launcher; system renderer
-   registration remains unchanged and clip-space limitations remain explicit.
+   registration remains unchanged.
 10. Optional stateless compute dynamic-library adapter and authenticated compiler.
+11. Bounded ordinary texture records and paired protocol3 OpenGL position/viewport
+    handling, with portable parser/math/compiler controls and explicit activation order.
+12. A separate source-built VLC Hardware wrapper with exact-child activation receipts
+    and backup-preserving installation; the original VLC bundle is unchanged.
 
 Upstream reconciliation retains its trackpad finger-frame path, legacy record
 fallback, descriptor-reuse handling, planar aliases and ordered GPU teardown.
