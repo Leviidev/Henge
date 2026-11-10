@@ -5,7 +5,7 @@
 #include "henge-vm.h"
 #include "henge-ios-jit.h"
 
-#define HENGE_ENGINE_ABI 3
+#define HENGE_ENGINE_ABI 4
 
 #define HENGE_ENGINE_RESULTS(X) \
     X(int, henge_install_step, (void), (), -1) \
@@ -42,6 +42,9 @@
     X(henge_vm_mouse_move, (int dx, int dy), (dx, dy)) \
     X(henge_vm_mouse_button, (int button, int down), (button, down)) \
     X(henge_vm_mouse_scroll, (int dx, int dy), (dx, dy)) \
+    X(henge_vm_touch, (int finger, int phase, int x, int y, uint32_t ts_ms), (finger, phase, x, y, ts_ms)) \
+    X(henge_vm_touch_frame, (uint32_t ts_ms), (ts_ms)) \
+    X(henge_vm_touch_button, (int down), (down)) \
     X(henge_vm_set_display_layer, (void *layer), (layer))
 
 typedef struct HengeEngineAPI {

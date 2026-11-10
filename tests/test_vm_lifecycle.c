@@ -69,6 +69,12 @@ static void *read_ui(void *unused) {
         henge_vm_cpus_on();
         henge_vm_gpu_frames();
         henge_vm_balloon(-1);
+        henge_vm_touch(1, 0, 100, 100, 1);
+        henge_vm_touch(1, 1, 120, 110, 2);
+        henge_vm_touch_frame(2);
+        henge_vm_touch_button(1);
+        henge_vm_touch_button(0);
+        henge_vm_touch(1, 2, 120, 110, 3);
         henge_vm_set_display_layer(NULL);
         if (!henge_vm_boot_display(&pixels, &width, &height, &stride)) henge_vm_free_display(pixels);
         usleep(500);

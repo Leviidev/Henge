@@ -5,7 +5,7 @@ struct InstallView: View {
     @ObservedObject private var installer = Installer.shared
     @ObservedObject private var jit = JITCoordinator.shared
     @StateObject private var display = DisplayRouter()
-    @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
+    @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.recommended
     @State private var name = "Mac"
     @State private var ramGB = Device.suggestedRAMGB
     @State private var deleteAfter = false
@@ -22,6 +22,9 @@ struct InstallView: View {
                 VStack(spacing: 0) {
                     switch installer.phase {
                     case .idle: chooser
+                    case .checking:
+                        ProgressView("Preparing to install macOS…")
+                            .padding(20)
                     case .downloading, .preparing, .installing: progress
                     case .done(let text): finished(text)
                     case .failed(let text): failed(text)

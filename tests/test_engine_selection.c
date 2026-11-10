@@ -58,6 +58,10 @@ int main(int argc, char **argv) {
     henge_vm_set_display(1024, 768);
     henge_vm_set_display_mm(0, 0);
     henge_vm_key(4, 1);
+    henge_vm_touch(1, 0, 100, 100, 1);
+    henge_vm_touch_frame(1);
+    henge_vm_touch_button(1);
+    henge_vm_touch_button(0);
     henge_vm_stop();
     /* Both boot and installation must require relaunch after a setting change. */
     henge_vm_set_rosetta(!rosetta);
