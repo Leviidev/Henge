@@ -1,0 +1,40 @@
+<!doctype html><meta charset="utf-8"><title>Henge first-use shaders</title>
+<style>body{font:20px system-ui;background:#eee;color:#222;padding:24px}canvas{width:96px;height:96px;margin:8px;image-rendering:pixelated}pre{white-space:pre-wrap}</style>
+<h1>First-use shader output</h1><p>Each shader is generated from this run's seed. Each output is drawn and read exactly once.</p><div id="canvases"></div><pre id="status">Running…</pre>
+<script>
+(async()=>{
+const query=new URLSearchParams(location.search),seed=Number(query.get('seed'));
+if(!Number.isInteger(seed)||seed<1||seed>0xffffffff)throw Error('A 32-bit positive seed is required');
+let state=seed;function randomByte(){state=(Math.imul(state,1664525)+1013904223)>>>0;return (state>>>16)&255;}
+const report={schema:1,seed,userAgent:navigator.userAgent,time:new Date().toISOString(),drawsPerCase:1,renderers:{},results:[]};
+for(const kind of ['webgl','webgl2']){
+ const canvas=document.createElement('canvas');canvas.width=canvas.height=4;document.querySelector('#canvases').append(canvas);
+ const gl=canvas.getContext(kind,{antialias:false,alpha:false,preserveDrawingBuffer:true});
+ if(!gl){report.results.push({api:kind,status:'unavailable'});continue;}
+ const debug=gl.getExtension('WEBGL_debug_renderer_info');report.renderers[kind]=debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER);
+ const v2=kind==='webgl2',header=v2?'#version 300 es\n':'';
+ function shader(type,source){const value=gl.createShader(type);gl.shaderSource(value,source);gl.compileShader(value);if(!gl.getShaderParameter(value,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(value));return value;}
+ const vertexSource=header+(v2?'in':'attribute')+' vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
+ for(let index=0;index<4;index++){
+  const expected=[randomByte(),randomByte(),randomByte(),255];
+  const fragmentSource=header+'precision highp float;'+(v2?'out vec4 color;':'')+'void main(){'+(v2?'color':'gl_FragColor')+'=vec4('+expected.slice(0,3).map(x=>x+'.0/255.0').join(',')+',1.0);}';
+  const row={api:kind,index,expected,vertexSource,fragmentSource};report.results.push(row);
+  try{
+   const program=gl.createProgram(),vs=shader(gl.VERTEX_SHADER,vertexSource),fs=shader(gl.FRAGMENT_SHADER,fragmentSource);
+   gl.attachShader(program,vs);gl.attachShader(program,fs);gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));gl.useProgram(program);
+   const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+   const position=gl.getAttribLocation(program,'p');gl.enableVertexAttribArray(position);gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
+   gl.disable(gl.DITHER);gl.viewport(0,0,4,4);gl.clearColor(1,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);
+   const started=performance.now();gl.drawArrays(gl.TRIANGLES,0,3);
+   const bytes=new Uint8Array(64);gl.readPixels(0,0,4,4,gl.RGBA,gl.UNSIGNED_BYTE,bytes);
+   row.seconds=(performance.now()-started)/1000;row.actual=Array.from(bytes);row.glError=gl.getError();
+   row.status=row.glError===0&&row.actual.every((v,i)=>v===expected[i%4])?'exact_match':'wrong_pixels';
+   gl.deleteBuffer(buffer);gl.deleteProgram(program);gl.deleteShader(vs);gl.deleteShader(fs);
+  }catch(error){row.status='exception';row.error=String(error);}
+ }
+}
+report.status=report.results.length===8&&report.results.every(r=>r.status==='exact_match')?'exact_match':'failed';
+document.querySelector('#status').textContent=JSON.stringify(report,null,2);
+const run=query.get('run')||'guest';if(/^[a-z0-9-]+$/.test(run))await fetch('/results/first-use-'+run+'.json',{method:'POST',body:JSON.stringify(report,null,2)});
+})();
+</script>

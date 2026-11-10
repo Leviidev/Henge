@@ -1,0 +1,23 @@
+<!doctype html><meta charset="utf-8"><title>Henge browser graphics checks</title>
+<style>body{font:18px system-ui;background:#eef1f5;color:#162034;padding:24px}section{display:inline-block;vertical-align:top;margin:10px;padding:16px;background:white;border:1px solid #adb8c9}canvas{width:160px;height:160px;image-rendering:pixelated;border:1px solid black}pre{white-space:pre-wrap;font-size:15px}.effects{background:linear-gradient(45deg,red,blue);width:160px;height:80px;filter:blur(1px) saturate(1.4);transform:rotate(2deg)}</style>
+<h1>Browser graphics checks</h1><p>Each square should be solid red. Text and the gradient should remain readable.</p><div id="panels"></div><section><div class="effects"></div><p>CSS gradient + blur</p></section><pre id="status">Running…</pre>
+<script>
+(async()=>{
+const report={schema:1,userAgent:navigator.userAgent,results:[],time:new Date().toISOString()};
+function canvas(name){const s=document.createElement('section');const h=document.createElement('h2');h.textContent=name;const c=document.createElement('canvas');c.width=c.height=16;s.append(h,c);document.querySelector('#panels').append(s);return c;}
+const c=canvas('Canvas 2D');try{const ctx=c.getContext('2d');ctx.fillStyle='#ff0000';ctx.fillRect(0,0,16,16);const pixel=Array.from(ctx.getImageData(8,8,1,1).data);report.results.push({test:'canvas2d',status:JSON.stringify(pixel)==='[255,0,0,255]'?'pass':'wrong-pixels',pixel});}catch(e){report.results.push({test:'canvas2d',status:'exception',error:String(e)});}
+for(const kind of ['webgl','webgl2']){
+const c=canvas(kind),r={test:kind};report.results.push(r);let creationError='';c.addEventListener('webglcontextcreationerror',e=>creationError=e.statusMessage);
+try{const gl=c.getContext(kind,{antialias:false,alpha:false,preserveDrawingBuffer:true});if(!gl){r.status='context-unavailable';r.error=creationError;continue;}
+r.renderer=gl.getParameter(gl.RENDERER);r.version=gl.getParameter(gl.VERSION);const debug=gl.getExtension('WEBGL_debug_renderer_info');if(debug)r.unmaskedRenderer=gl.getParameter(debug.UNMASKED_RENDERER_WEBGL);
+const v=kind==='webgl2'?'#version 300 es\nin vec2 p;void main(){gl_Position=vec4(p,0.,1.);}':'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
+const f=kind==='webgl2'?'#version 300 es\nprecision highp float;out vec4 color;void main(){color=vec4(1.,0.,0.,1.);}':'precision highp float;void main(){gl_FragColor=vec4(1.,0.,0.,1.);}';
+function shader(type,source){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
+const p=gl.createProgram();gl.attachShader(p,shader(gl.VERTEX_SHADER,v));gl.attachShader(p,shader(gl.FRAGMENT_SHADER,f));gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(p));gl.useProgram(p);
+const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);const loc=gl.getAttribLocation(p,'p');gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);gl.viewport(0,0,16,16);gl.clearColor(0,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,0,3);
+const pixel=new Uint8Array(4);gl.readPixels(8,8,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);r.pixel=Array.from(pixel);r.glError=gl.getError();r.status=JSON.stringify(r.pixel)==='[255,0,0,255]'&&r.glError===0?'pass':'wrong-pixels';
+}catch(e){r.status='exception';r.error=String(e);}}
+document.querySelector('#status').textContent=JSON.stringify(report,null,2);
+const name=new URLSearchParams(location.search).get('run')||'guest';if(/^[a-z0-9-]+$/.test(name))try{await fetch('/results/web-graphics-'+name+'.json',{method:'POST',body:JSON.stringify(report,null,2)});}catch(e){document.querySelector('#status').textContent+='\nUpload failed: '+e;}
+})();
+</script>

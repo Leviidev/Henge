@@ -1,0 +1,28 @@
+<!doctype html><meta charset="utf-8"><title>Henge WebGL output matrix</title><style>body{font:18px system-ui;background:#eef1f5;color:#162034;padding:24px}canvas{width:160px;height:160px;image-rendering:pixelated;border:1px solid #333;margin:12px}pre{white-space:pre-wrap}</style><h1>WebGL output matrix</h1><p>Tests drawing, blending, indexed geometry, texture uploads, texture updates and offscreen render targets.</p><div id="canvases"></div><pre id="status">Running…</pre>
+<script>
+(async()=>{
+const report={schema:1,userAgent:navigator.userAgent,time:new Date().toISOString(),results:[]};
+for(const kind of ['webgl','webgl2']){
+const c=document.createElement('canvas');c.width=c.height=16;document.querySelector('#canvases').append(c);
+const gl=c.getContext(kind,{antialias:false,alpha:false,preserveDrawingBuffer:true});
+if(!gl){report.results.push({api:kind,test:'context',status:'unavailable'});continue;}
+const version=kind==='webgl2',header=version?'#version 300 es\n':'';
+const vertex=header+(version?'in':'attribute')+' vec2 p;'+(version?'out':'varying')+' vec2 uv;void main(){gl_Position=vec4(p,0.,1.);uv=p*.5+.5;}';
+function program(body,extra=''){const frag=header+'precision highp float;'+(version?'in':'varying')+' vec2 uv;'+extra+(version?'out vec4 outputColor;':'')+'void main(){'+(version?'outputColor':'gl_FragColor')+'='+body+';}';
+ function shader(type,text){const s=gl.createShader(type);gl.shaderSource(s,text);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
+ const p=gl.createProgram();gl.attachShader(p,shader(gl.VERTEX_SHADER,vertex));gl.attachShader(p,shader(gl.FRAGMENT_SHADER,frag));gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(p));return p;}
+function setup(p){gl.useProgram(p);const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);const loc=gl.getAttribLocation(p,'p');gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);gl.viewport(0,0,16,16);}
+function sample(x,y){const a=new Uint8Array(4);gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,a);return Array.from(a);}
+function record(test,expected,points=[[8,8]],tolerance=0){const actual=points.map(([x,y])=>sample(x,y));const error=gl.getError();const pass=error===0&&actual.every((p,i)=>p.every((v,j)=>Math.abs(v-expected[i][j])<=tolerance));report.results.push({api:kind,test,status:pass?'pass':'wrong-pixels',actual,expected,tolerance,glError:error});}
+try{
+ const solid=program('color','uniform vec4 color;');setup(solid);gl.uniform4f(gl.getUniformLocation(solid,'color'),1,0,0,1);gl.clearColor(0,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);record('solid',[[255,0,0,255]]);
+ gl.clear(gl.COLOR_BUFFER_BIT);gl.enable(gl.BLEND);gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.uniform4f(gl.getUniformLocation(solid,'color'),1,0,0,.5);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);record('alpha-blend',[[128,0,127,255]],[[8,8]],1);gl.disable(gl.BLEND);
+ gl.uniform4f(gl.getUniformLocation(solid,'color'),1,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);const indices=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,indices);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2,2,1,3]),gl.STATIC_DRAW);gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);record('indexed-quad',[[255,0,0,255]]);
+ const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,2,2,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([255,0,0,255,0,255,0,255,0,0,255,255,255,255,255,255]));
+ const texture=program((version?'texture':'texture2D')+'(image,uv)','uniform sampler2D image;');setup(texture);gl.uniform1i(gl.getUniformLocation(texture,'image'),0);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);record('texture-rgba',[[255,0,0,255],[0,255,0,255],[0,0,255,255],[255,255,255,255]],[[4,4],[12,4],[4,12],[12,12]]);
+ gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([255,255,0,255]));gl.drawArrays(gl.TRIANGLE_STRIP,0,4);record('texture-subimage',[[255,255,0,255]],[[4,4]]);
+ const target=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,target);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,16,16,0,gl.RGBA,gl.UNSIGNED_BYTE,null);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);const fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,target,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw Error('incomplete FBO');setup(solid);gl.uniform4f(gl.getUniformLocation(solid,'color'),1,0,0,1);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);record('offscreen-fbo',[[255,0,0,255]]);gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}catch(e){report.results.push({api:kind,test:'matrix',status:'exception',error:String(e)});}}
+document.querySelector('#status').textContent=JSON.stringify(report,null,2);const name=new URLSearchParams(location.search).get('run')||'guest';if(/^[a-z0-9-]+$/.test(name))await fetch('/results/webgl-matrix-'+name+'.json',{method:'POST',body:JSON.stringify(report,null,2)});
+})();
+</script>
