@@ -72,7 +72,8 @@ assert len(apps)==1 and len(helpers)==1, 'Ambiguous/missing app or TrollStore he
 app,info=apps[0];executable=app/info['CFBundleExecutable']
 assert executable.parent==app and executable.is_file()
 log=(data/'Documents/henge.log').read_bytes()
-halted=log.rstrip().endswith((b'henge: the machine stopped (halt)', b'henge: the machine stopped (guest shut down, halt reason 1); CPU threads ended, disks flushed, machine released'))
+events=[line for line in log.splitlines() if line.startswith((b'henge: booting with ', b'henge: the machine stopped ('))]
+halted=bool(events) and events[-1] in (b'henge: the machine stopped (halt)', b'henge: the machine stopped (guest shut down, halt reason 1); CPU threads ended, disks flushed, machine released')
 if cfg.get('require_halt',True):assert halted, 'Guest must halt normally before update'
 files={}
 for name in ['disk.img','auxiliary.bin']:
