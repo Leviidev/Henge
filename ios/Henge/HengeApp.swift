@@ -30,7 +30,12 @@ struct HengeApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
+                .onAppear { henge_vm_set_app_active(scenePhase == .active ? 1 : 0) }
                 .onOpenURL { url in HengeLog.log("app", "opened with \(url.absoluteString)") } // henge:// back from LocalDevVPN
+        }
+        .onChange(of: scenePhase) { phase in
+            // App-level phase aggregates scenes, including external displays.
+            henge_vm_set_app_active(phase == .active ? 1 : 0)
         }
     }
 }

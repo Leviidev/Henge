@@ -17,6 +17,8 @@
 #include "net_slirp.h"
 #include "dns_proxy.h"
 #include "vm.h"
+#include "lifecycle_gate.h"
+#include <dispatch/dispatch.h>
 #include "install.h"
 
 #include <fcntl.h>
@@ -195,6 +197,51 @@ static int lock_running(void) {
     pthread_rwlock_unlock(&api_lock);
     return 0;
 }
+static _Atomic uint64_t lifecycle_epoch;
+typedef struct { uint64_t lifecycle, machine; } ResumeRequest;
+static void resume_after_gpu(void *opaque, int cancelled) {
+    ResumeRequest request = *(ResumeRequest *)opaque;
+    free(opaque);
+    if (cancelled) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (request.lifecycle != atomic_load(&lifecycle_epoch) ||
+            request.machine != atomic_load(&generation) ||
+            !hv_lifecycle_allowed(&hv_app_lifecycle) || !lock_running()) return;
+        pthread_mutex_lock(&hv_lifecycle_state_mu);
+        int reopen = request.machine == atomic_load(&generation) && request.lifecycle == atomic_load(&lifecycle_epoch) && hv_lifecycle_allowed(&hv_app_lifecycle);
+        if (reopen) hv_lifecycle_set_active(&hv_cpu_lifecycle, 1);
+        pthread_mutex_unlock(&hv_lifecycle_state_mu);
+        if (reopen) hv_vm_refresh_display();
+        pthread_rwlock_unlock(&api_lock);
+    });
+}
+void henge_vm_set_app_active(int active) {
+    pthread_mutex_lock(&hv_lifecycle_state_mu);
+    uint64_t epoch = atomic_fetch_add(&lifecycle_epoch, 1) + 1;
+    if (!active) hv_lifecycle_set_active(&hv_cpu_lifecycle, 0);
+    hv_lifecycle_set_active(&hv_app_lifecycle, active);
+    pthread_mutex_unlock(&hv_lifecycle_state_mu);
+    fprintf(stderr, "henge: lifecycle active=%d state=%d epoch=%llu", active != 0, atomic_load(&state), (unsigned long long)epoch); fputc(10, stderr);
+    if (!active) return;
+    /* GPU first, then CPUs: wall-clock guest watchdogs must see completed
+       accepted GPU work when guest execution resumes. Main thread never waits. */
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (epoch != atomic_load(&lifecycle_epoch) || !hv_lifecycle_allowed(&hv_app_lifecycle)) return;
+        if (!lock_running()) {
+            pthread_mutex_lock(&hv_lifecycle_state_mu);
+            if (epoch == atomic_load(&lifecycle_epoch)) hv_lifecycle_set_active(&hv_cpu_lifecycle, 1);
+            pthread_mutex_unlock(&hv_lifecycle_state_mu);
+            return;
+        }
+        ResumeRequest *request = malloc(sizeof *request);
+        if (request) {
+            *request = (ResumeRequest){ epoch, atomic_load(&generation) };
+            hv_vm_resume_drain(resume_after_gpu, request);
+        } else fprintf(stderr, "henge: lifecycle resume allocation failed; guest remains paused");
+        pthread_rwlock_unlock(&api_lock);
+    });
+}
+
 void henge_vm_stop(void) {
     if (!lock_running()) return;
     hv_vm_stop();
@@ -322,6 +369,11 @@ void henge_vm_set_display_layer(void *layer) {
     /* vm.c serializes this with unpublishing the old display before free.
        Main-thread layer detachment need not wait for disk/GPU teardown. */
     hv_vm_set_display_layer(layer);
+}
+int henge_vm_render_status(char *message,uint32_t length){
+    if(!lock_running()){if(message&&length)message[0]=0;return 0;}
+    int result=hv_vm_render_status(message,length);
+    pthread_rwlock_unlock(&api_lock);return result;
 }
 uint64_t henge_vm_gpu_frames(void) {
     if (!lock_running()) return 0;

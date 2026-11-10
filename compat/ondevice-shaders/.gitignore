@@ -1,0 +1,9 @@
+llvm-source/
+llvm-native/
+llvm-ios/
+lib-*/
+HGOnDeviceCompilerRecipe.h
+compiler-recipe.json
+build-provider.json
+native_provider_tests
+__pycache__/

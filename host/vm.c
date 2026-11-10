@@ -1,4 +1,5 @@
 #include "vm.h"
+#include "lifecycle_gate.h"
 #include "pvg_lite.h"
 
 #include <TargetConditionals.h>
@@ -22,6 +23,13 @@
 #include "dispatch.h"
 #include "net_slirp.h"
 
+HvLifecycleGate hv_app_lifecycle = HV_LIFECYCLE_INITIALIZER;
+HvLifecycleGate hv_cpu_lifecycle = HV_LIFECYCLE_INITIALIZER;
+pthread_mutex_t hv_lifecycle_state_mu = PTHREAD_MUTEX_INITIALIZER;
+static int host_run_allowed(void) {
+    return atomic_load(&hv_cpu_lifecycle.active) || atomic_load(&hv_cpu_lifecycle.cancelled);
+}
+static void host_wait_run(void) { (void)hv_lifecycle_wait(&hv_cpu_lifecycle); }
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
 static int ncpus = 1;
@@ -226,6 +234,32 @@ void hv_vm_set_display_layer(void *layer) {
     if (previous) CFRelease(previous);
 }
 
+void hv_vm_resume_drain(void (*done)(void *, int), void *opaque) {
+    /* CPU dispatchers park outside all guest/device locks. No producer may
+       enqueue more guest work after this point until the drain callback. */
+    while (!atomic_load(&hv_cpu_lifecycle.cancelled) && !atomic_load(&hv_cpu_lifecycle.active)) {
+        int all = 1;
+        for (int i = 0; i < ncpus; i++)
+            if (cpus[i].pc_state && __atomic_load_n(&cpus[i].pc_state->active, __ATOMIC_SEQ_CST)) all = 0;
+        if (all) break;
+        usleep(1000);
+    }
+    if (atomic_load(&hv_cpu_lifecycle.cancelled)) { done(opaque, 1); return; }
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    hv_pvg_lite_drain(pvg, done, opaque);
+}
+
+void hv_vm_refresh_display(void) {
+    os_unfair_lock_lock(&display_lock);
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    if (pvg && display_layer_set) hv_pvg_lite_set_layer(pvg, (void *)display_layer);
+    os_unfair_lock_unlock(&display_lock);
+}
+
+int hv_vm_render_status(char *message,uint32_t length){
+    HvPvgLite *pvg=atomic_load_explicit(&display_pvg,memory_order_acquire);
+    return hv_pvg_lite_render_status(pvg,message,length);
+}
 uint64_t hv_vm_gpu_frames(void) {
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
     return pvg ? hv_pvg_lite_gpu_frames(pvg) : 0;
@@ -254,6 +288,13 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)768 << 20;
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
+    pthread_mutex_lock(&hv_lifecycle_state_mu);
+    hv_lifecycle_restart(&hv_app_lifecycle);
+    hv_lifecycle_restart(&hv_cpu_lifecycle);
+    hv_lifecycle_set_active(&hv_cpu_lifecycle, atomic_load(&hv_app_lifecycle.active));
+    pthread_mutex_unlock(&hv_lifecycle_state_mu);
+    m.host_run_allowed = host_run_allowed;
+    m.host_wait_run = host_wait_run;
     m.log = c->log;
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
@@ -394,6 +435,9 @@ static void *cpu0_thread(void *unused) {
     (void)unused;
     hv_vm_cpu_qos();
     int r = hv_vm_run_cpu0();
+    hv_lifecycle_cancel(&hv_app_lifecycle);
+    /* Natural primary exit must also release lifecycle-parked secondaries. */
+    hv_lifecycle_cancel(&hv_cpu_lifecycle);
     /* Finish CPU activity before flushing or telling the UI the Mac stopped.
        CPU 0 can also leave for a fatal execution error. */
     hv_machine_halt(&m, HV_HALT_HOST);
@@ -432,6 +476,8 @@ int hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
     pthread_attr_destroy(&attr);
     return 0;
 failed:
+    hv_lifecycle_cancel(&hv_app_lifecycle);
+    hv_lifecycle_cancel(&hv_cpu_lifecycle);
     pthread_attr_destroy(&attr);
     hv_machine_halt(&m, HV_HALT_HOST);
     atomic_store(&kicker_stopped, 1);
@@ -444,6 +490,8 @@ failed:
 }
 
 void hv_vm_stop(void) {
+    hv_lifecycle_cancel(&hv_app_lifecycle);
+    hv_lifecycle_cancel(&hv_cpu_lifecycle);
     hv_machine_halt(&m, HV_HALT_HOST);
 }
 

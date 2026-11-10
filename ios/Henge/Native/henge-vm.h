@@ -39,6 +39,8 @@ enum HengeVmOutcome {
 };
 int henge_vm_exit_outcome(void);
 void henge_vm_stop(void);
+/* App-wide lifecycle publication; never waits for VM/GPU work. */
+void henge_vm_set_app_active(int active);
 /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
 int henge_vm_knob(const char *name, int value);
 /* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
@@ -88,6 +90,8 @@ int henge_vm_snapshot(uint8_t *bgra, int width, int height);
 void henge_vm_set_display_layer(void *layer);
 /// How many frames have gone to it.
 uint64_t henge_vm_gpu_frames(void);
+/* Nonblocking renderer status snapshot: 0 normal, 1 preparing, 2 fault. */
+int henge_vm_render_status(char *message,uint32_t length);
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
 void henge_vm_free_display(const uint8_t *pixels);
 

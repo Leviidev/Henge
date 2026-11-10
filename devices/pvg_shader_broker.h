@@ -86,6 +86,55 @@ static NSData *hv_shader_cached_bytes(NSString *root, NSString *source) {
     return config ? hv_shader_cache(root, source, config[@"recipe"]) : nil;
 }
 
+/* Nonblocking control-plane API. These functions do not permit an exec stamp
+ * to complete while its shaders are pending. The current legacy wait remains
+ * unchanged until an ordered, side-effect-free replay preflight is integrated. */
+static NSDictionary *hv_shader_enqueue_request(NSString *root, NSString *source, NSString *function) {
+    if (!hv_shader_digest_valid(source)) return nil;
+    NSDictionary *config=hv_shader_compiler_config(root);
+    if (!config) return nil;
+    NSString *recipe=config[@"recipe"];
+    NSDictionary *lease=hv_shader_lease(root,recipe);
+    if (!lease) return nil;
+    NSString *owner=lease[@"owner"];
+    static NSObject *guard;static dispatch_once_t once;
+    dispatch_once(&once, ^{guard=[NSObject new];});
+    @synchronized(guard) {
+        NSString *folder=[root stringByAppendingPathComponent:[config[@"protocol"]isEqual:@3]?@"shader-requests-v3":@"shader-requests-v2"];
+        NSString *path=[folder stringByAppendingPathComponent:[source stringByAppendingString:@".json"]];
+        NSDictionary *existing=hv_shader_json(path);
+        if(hv_shader_config_valid(existing)&&[existing[@"protocol"]isEqual:config[@"protocol"]]&&
+           [existing[@"recipe"]isEqual:recipe]&&[existing[@"sha256"]isEqual:source]&&
+           [existing[@"owner"]isEqual:owner]&&[existing[@"request"]isKindOfClass:NSString.class]&&
+           [[NSUUID alloc]initWithUUIDString:existing[@"request"]])return existing;
+        NSDictionary *request=@{@"protocol":config[@"protocol"],@"target":config[@"target"],
+            @"recipe":recipe,@"sha256":source,@"owner":owner,@"request":NSUUID.UUID.UUIDString,
+            @"function":function?:@"(preflight)"};
+        [NSFileManager.defaultManager createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
+        NSData *encoded=[NSJSONSerialization dataWithJSONObject:request options:0 error:nil];
+        return [encoded writeToFile:path options:NSDataWritingAtomic error:nil]?request:nil;
+    }
+}
+
+static NSDictionary *hv_shader_poll_request(NSString *root, NSDictionary *request) {
+    NSDictionary *active=hv_shader_compiler_config(root);
+    NSString *source=request[@"sha256"],*recipe=request[@"recipe"];
+    if(!hv_shader_config_valid(request)||!hv_shader_digest_valid(source)||
+       ![active[@"recipe"]isEqual:recipe]||![active[@"protocol"]isEqual:request[@"protocol"]])
+        return @{@"state":@"stale"};
+    NSData *bytes=hv_shader_cache(root,source,recipe);
+    if(bytes)return @{@"state":@"ready",@"bytes":bytes};
+    NSString *base=[[[root stringByAppendingPathComponent:@"shader-cache"]stringByAppendingPathComponent:recipe]stringByAppendingPathComponent:source];
+    NSDictionary *receipt=hv_shader_json([base stringByAppendingString:@".json"]);
+    if([receipt[@"request"]isEqual:request[@"request"]]&&[receipt[@"owner"]isEqual:request[@"owner"]]&&
+       [receipt[@"recipe"]isEqual:recipe]&&[receipt[@"sha256"]isEqual:source]&&
+       [receipt[@"protocol"]isEqual:request[@"protocol"]]&&[receipt[@"status"]isEqual:@"failed"])
+        return @{@"state":[receipt[@"retryable"]isEqual:@YES]?@"retrying":@"failed",@"receipt":receipt};
+    if(![hv_shader_lease(root,recipe)[@"owner"]isEqual:request[@"owner"]])
+        return @{@"state":@"offline"};
+    return @{@"state":@"pending"};
+}
+
 static NSData *hv_shader_converted_bytes(NSString *root, NSString *source, NSString *function) {
     if (!hv_shader_digest_valid(source)) return nil;
     NSDictionary *config = hv_shader_compiler_config(root);

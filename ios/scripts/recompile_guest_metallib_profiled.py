@@ -6,6 +6,7 @@ HERE=Path(__file__).resolve().parent
 from catalog_metallibs import inspect_metallib
 from gl_position_lower import get_plan,lower
 from shader_profile import CONTRACT,check_profile
+from shader_compile_runtime import run_tool
 
 def rebuild(source,destination,target):
  data=source.read_bytes();r=inspect_metallib(data)
@@ -15,12 +16,12 @@ def rebuild(source,destination,target):
   root=Path(t);air=root/'original.air';a=r['air_regions'][0];air.write_bytes(data[a['offset']:a['offset']+a['size']]);plan=get_plan(air);input_air=air
   profile=dict(schema=1,gl_clip_zero_to_one=False,vertex_functions=[],viewport_contract=None)
   if plan['gl_clip_zero_to_one']:
-   text=root/'original.ll';subprocess.run(['xcrun','--sdk','macosx','metal','-x','ir','-S','-emit-llvm',str(air),'-target',plan['target_triple'],'-o',str(text)],check=True,timeout=10)
+   text=root/'original.ll';run_tool(['xcrun','--sdk','macosx','metal','-x','ir','-S','-emit-llvm',str(air),'-target',plan['target_triple'],'-o',str(text)],stage='disassemble',check=True)
    changed=root/'normalized.ll';result=lower(text,changed);input_air=changed
    profile.update(gl_clip_zero_to_one=True,vertex_functions=result['profile']['vertex_functions'],viewport_contract=CONTRACT)
   ios=root/'ios.air';candidate=root/'candidate.metallib'
-  subprocess.run(['xcrun','--sdk','iphoneos','metal','-x','ir','-c',str(input_air),'-target',target,'-o',str(ios)],check=True,timeout=10)
-  subprocess.run(['xcrun','--sdk','iphoneos','metallib',str(ios),'-o',str(candidate)],check=True,timeout=10)
+  run_tool(['xcrun','--sdk','iphoneos','metal','-x','ir','-c',str(input_air),'-target',target,'-o',str(ios)],stage='compile-ios',check=True)
+  run_tool(['xcrun','--sdk','iphoneos','metallib',str(ios),'-o',str(candidate)],stage='link-metallib',check=True)
   b=candidate.read_bytes();converted=inspect_metallib(b)
   inventory=lambda q:sorted((f['name'],f['type_raw'])for f in q['functions'])
   if converted['malformed_records']or converted['integrity_mismatches']or inventory(converted)!=inventory(r):raise ValueError('output inventory/integrity mismatch')

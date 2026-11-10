@@ -103,6 +103,18 @@ $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 $(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
 	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -o $@
 
+$(B)/test_lifecycle_gate: tests/test_lifecycle_gate.c host/lifecycle_gate.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+
+$(B)/test_vm_pause: tests/test_vm_pause.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
+	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -o $@
+
+test-vm-pause: $(B)/test_lifecycle_gate $(B)/test_vm_pause
+	$(B)/test_lifecycle_gate
+	$(B)/test_vm_pause
+	python3 tests/test_vm_natural_exit_paused.py
+.PHONY: test-vm-pause
+
 test-vm-lifecycle: $(B)/test_vm_lifecycle
 	$(B)/test_vm_lifecycle
 .PHONY: test-vm-lifecycle
@@ -264,3 +276,17 @@ test-pvg-task-lifecycle:
 test-pvg-ordinary-texture:
 	python3 tests/test_pvg_ordinary_texture.py
 .PHONY: test-pvg-ordinary-texture
+
+# CPU/file-protocol controls for deferred replay; no Metal dispatch or guest.
+test-ordered-replay:
+	python3 tests/test_pvg_replay_queue.py
+	python3 tests/test_pvg_task_view.py
+	python3 tests/test_pvg_mapper_queue.py
+	python3 tests/test_pvg_preflight.py
+	python3 tests/test_pvg_local_provider_binding.py
+	python3 tests/test_pvg_shader_request_api.py
+	python3 tests/test_shader_compile_policy.py
+	python3 tests/test_pvg_render_status.py
+	python3 tests/test_pvg_merged_lifecycle_queue.py
+	python3 tests/test_pvg_complaint_concurrency.py
+.PHONY: test-ordered-replay

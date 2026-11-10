@@ -48,6 +48,13 @@ jobs:
           repository: Leviidev/Husk
           path: Husk
 
+      - name: Check out pinned on-device shader compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: gzorin/floor_llvm
+          ref: 6a133d69154dfaffa04a6339a3178db328bd98a5
+          path: floor-llvm
+
       - name: Cache Husk's sources and prebuilt iOS pieces
         uses: actions/cache@v4
         with:
@@ -59,7 +66,7 @@ jobs:
       - name: Install build tools
         run: |
           set -euxo pipefail
-          brew install xcodegen meson ninja pkg-config
+          brew install xcodegen cmake meson ninja pkg-config
           # Runner images ship rustup; add the iOS target if it's missing.
           rustup target add aarch64-apple-ios || {
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -92,6 +99,13 @@ jobs:
       - name: Build the restore stack (libirecovery, usbmuxd, idevicerestore)
         working-directory: Henge
         run: zsh tools/build_ios_restore.sh
+
+      - name: Build and stage the on-device shader provider
+        working-directory: Henge
+        run: |
+          python3 tools/compat/build_ondevice_provider.py \
+            --llvm-source "$GITHUB_WORKSPACE/floor-llvm" \
+            --output "$RUNNER_TEMP/henge-ondevice-provider" --jobs 4
 
       - name: Build the engine
         working-directory: Henge

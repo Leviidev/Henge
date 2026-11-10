@@ -44,14 +44,18 @@ static int cursor_scale(void) {
 #include <string.h>
 
 #include "pvg_lite.h"
+#include "lifecycle_gate.h"
 #include "metallib.h"
 #include "pvg_texture_record.h"
 #include "pvg_surface_pages.h"
 #include "pvg_surface_copyback.h"
 #include "pvg_store_action.h"
 #include "pvg_viewport_replay.h"
+#include "pvg_replay_queue.h"
+#include "pvg_render_status.h"
 #if TARGET_OS_IPHONE
 #include "pvg_shader_broker.h"
+#import "HGOnDeviceShaderProvider.h"
 #include "pvg_shader_profile.h"
 #include "pvg_agx_journal.h"
 #endif
@@ -172,6 +176,14 @@ static BOOL task_cache_lifecycle(NSMutableDictionary *tasks, uint32_t op,
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     dispatch_queue_t worker;
+    HvOrderedReplay *ordered;
+    HvRenderStatus *renderStatus;
+#if TARGET_OS_IPHONE
+    HGOnDeviceShaderProvider *shaderProvider;
+    NSString *shaderProviderError;
+#endif
+    HvReplayCommand *activeCommand;
+    BOOL preflighting,preflightWaiting,pollScheduled;
     NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, HvObject *> *> *tasks;
     uint64_t task_generations[512]; /* worker-owned cache epochs */
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *mapped_textures;
@@ -233,6 +245,7 @@ static BOOL task_cache_lifecycle(NSMutableDictionary *tasks, uint32_t op,
     os_unfair_lock screen_lock; /* what to show, and the pointer as the presenter reads it */
     id<MTLTexture> screen_tex;
     BOOL screen_half, screen_dirty, presenter_running;
+    BOOL presenter_barrier; /* screen_lock: mapper/drain waits cannot admit later presentation */
     BOOL drawable_retry_pending;
     double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
     uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
@@ -245,6 +258,9 @@ static BOOL task_cache_lifecycle(NSMutableDictionary *tasks, uint32_t op,
     dispatch_source_t shot_timer;
 }
 - (void)complain:(NSString *)what;
+- (void)pumpCommands;
+- (void)performCommand:(HvReplayCommand *)item;
+- (int)shaderRead:(uint64_t)offset task:(uint32_t)task to:(void *)to length:(uint32_t)length;
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
 - (void)drawCursor;
 - (BOOL)hasDisplayLayer;
@@ -255,6 +271,29 @@ static BOOL task_cache_lifecycle(NSMutableDictionary *tasks, uint32_t op,
 @end
 
 /* What Metal asks while it reads a serialized pipeline. */
+/* All commits, including helper clears, participate in the completion group.
+   No gate mutex is held over a driver call, and the UI never waits here. */
+static BOOL lifecycle_commit(HvReplay *r, id<MTLCommandBuffer> cb, BOOL wait) {
+    for (;;) {
+        if (wait && !hv_lifecycle_wait_stoppable(&hv_app_lifecycle, &r->stopping)) return NO;
+        if (atomic_load(&r->stopping) || atomic_load(&hv_app_lifecycle.cancelled)) return NO;
+        if (!hv_lifecycle_allowed(&hv_app_lifecycle)) {
+            if (wait) continue;
+            return NO;
+        }
+        atomic_fetch_add(&r->inflight, 1);
+        dispatch_group_enter(r->completions);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            atomic_fetch_sub(&r->inflight, 1);
+            dispatch_group_leave(r->completions);
+        }];
+        [cb commit];
+        if (wait) [cb waitUntilScheduled]; /* presenter waits after releasing screen_lock */
+        return YES;
+    }
+}
+
 @interface HvContext : NSObject {
 @public
     __unsafe_unretained HvReplay *replay;
@@ -548,8 +587,12 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
 @implementation HvReplay
 
 - (void)complain:(NSString *)what {
-    if ([complaints containsObject:what]) return;
-    [complaints addObject:what];
+    /* Replay and the display presenter can report errors concurrently. Keep
+       deduplication atomic without holding this lock during Metal calls. */
+    @synchronized (complaints) {
+        if ([complaints containsObject:what]) return;
+        [complaints addObject:what];
+    }
     fprintf(stderr, "hengevm: pvg-metal: %s\n", what.UTF8String);
 }
 
@@ -567,19 +610,60 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     return stand_in;
 }
 
+#if TARGET_OS_IPHONE
+/* Retain the exact verified result for this batch, independent of provider LRU. */
+- (HGOnDeviceShaderResult *)retainLocalResult:(HGOnDeviceShaderResult *)result source:(NSString *)source {
+    if(result.status!=HGOnDeviceShaderReady)return result;
+    if(![result.sourceSHA isEqual:source]||!hv_shader_profile_validate(result.receipt,result.output,source,result.recipe,NULL)){
+        activeCommand->error=@"The local shader result failed identity/profile verification.";return nil;
+    }
+    HGOnDeviceShaderResult *retained=activeCommand->localResults[source];if(retained)return retained;
+    NSData *pending=activeCommand->localSources[source];
+    if(pending){activeCommand->snapshotBytes-=pending.length;[activeCommand->localSources removeObjectForKey:source];}
+    if(result.output.length>(128u<<20)-MIN(activeCommand->snapshotBytes,(NSUInteger)(128u<<20))){
+        activeCommand->error=@"The required shader results exceed the graphics snapshot budget.";return nil;
+    }
+    activeCommand->snapshotBytes+=result.output.length;activeCommand->localResults[source]=result;
+    return result;
+}
+
+- (HGOnDeviceShaderResult *)requestLocalShader:(NSData *)source sourceSHA:(NSString *)sourceSHA {
+    HGOnDeviceShaderResult *result=activeCommand->localResults[sourceSHA];if(result)return result;
+    if(!shaderProvider){activeCommand->error=shaderProviderError?:@"The local shader compiler is unavailable.";return nil;}
+    result=[shaderProvider snapshotForSourceSHA:sourceSHA];
+    if(result.status==HGOnDeviceShaderReady)return [self retainLocalResult:result source:sourceSHA];
+    if(result.status==HGOnDeviceShaderFailed){activeCommand->error=result.error.localizedDescription?:@"The local shader compiler rejected this shader.";return result;}
+    if(!activeCommand->localSources[sourceSHA]){
+        if(source.length>(128u<<20)-MIN(activeCommand->snapshotBytes,(NSUInteger)(128u<<20))){
+            activeCommand->error=@"The pending shader inputs exceed the graphics snapshot budget.";return nil;
+        }
+        activeCommand->localSources[sourceSHA]=[source copy];activeCommand->snapshotBytes+=source.length;
+    }
+    if([result.route isEqual:@"not-requested"]||[result.route isEqual:@"backpressure"]){
+        __weak HvReplay *weak=self;
+        result=[shaderProvider requestSource:source sourceSHA:sourceSHA completionQueue:worker completion:^{
+            HvReplay *r=weak;if(r&&!atomic_load(&r->stopping))[r pumpCommands];
+        }];
+    }
+    if(result.status==HGOnDeviceShaderReady)return [self retainLocalResult:result source:sourceSHA];
+    if(result.status==HGOnDeviceShaderFailed)activeCommand->error=result.error.localizedDescription?:@"The local shader compiler rejected this shader.";
+    return result;
+}
+#endif
+
 - (id)makeFunction:(uint64_t)at task:(uint32_t)task {
     if (getenv("HV_PVG_FAIL_LIBS")) { /* testing: every library refused, as an OS that cannot load them does */
         [self complain:@"library: refused (HV_PVG_FAIL_LIBS)"];
         return nil;
     }
     struct __attribute__((packed)) { uint64_t off; uint32_t len; uint32_t tag, size; } h;
-    if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return nil;
+    if ([self shaderRead:at task:task to:&h length:sizeof h]) return nil;
     if (h.len > 32u * 1024u * 1024u) {
         [self complain:@"library exceeds the 32 MiB replay limit"];
         return nil;
     }
     NSMutableData *lib = [NSMutableData dataWithLength:h.len];
-    if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
+    if ([self shaderRead:h.off task:task to:lib.mutableBytes length:h.len]) return nil;
     __block NSError *err = nil;
     id<MTLLibrary> library = nil;
 #if TARGET_OS_IPHONE
@@ -591,7 +675,6 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     __block NSDictionary *selectedProfileReceipt=nil;
     __block NSData *selectedProfileBytes=nil;
     __block NSString *selectedProfileRecipe=nil;
-    BOOL profileRequired=NO;
     const uint8_t *bytes = lib.bytes;
     BOOL macLibrary = lib.length >= 6 && !memcmp(bytes, "MTLB", 4) && bytes[4] == 1 && bytes[5] == 0x80;
     id (^loadConvertedLibrary)(NSData *, NSDictionary *, NSString *) = ^id(NSData *candidate, NSDictionary *receipt, NSString *recipe) {
@@ -620,15 +703,27 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
             [NSString stringWithFormat:@"sonoma-ioslib-%s.metallib", hex]];
         NSString *preferPath = [documents stringByAppendingPathComponent:
             [NSString stringWithFormat:@"sonoma-prefer-%s", hex]];
-        profileRequired=hv_shader_profile_required(documents);
-        if(profileRequired){
-            NSString *capture=[documents stringByAppendingPathComponent:[NSString stringWithFormat:@"sonoma-guestlib-%s.metallib",hex]];
-            if(![NSFileManager.defaultManager fileExistsAtPath:capture]&&![lib writeToFile:capture atomically:YES])return nil;
+        /* Local conversion is enabled independently of any Mac compiler config.
+           An old verified protocol3 cache remains an optional warm-first source. */
+        if(activeCommand && !preflighting){
+            activeCommand->error=@"A shader dependency was discovered after replay preflight; the uncommitted batch is retained.";
+            return nil;
         }
-        library = hv_shader_load_profiled(documents, libraryID, convertedPath, nil,
-            [[NSFileManager defaultManager] fileExistsAtPath:preferPath], profileRequired,
-            loadConvertedLibrary, &convertedRoute);
-        if(profileRequired&&!library){[self complain:@"profiled Metal conversion unavailable; unprofiled fallback disabled for protocol3"];return nil;}
+        HGOnDeviceShaderResult *pinned=activeCommand->localResults[libraryID];
+        if(pinned){
+            library=loadConvertedLibrary(pinned.output,pinned.receipt,pinned.recipe);convertedRoute=pinned.route;
+            if(!library){activeCommand->error=err.localizedDescription?:@"The retained shader could not be loaded.";return nil;}
+        }else if(hv_shader_profile_required(documents))
+            library=hv_shader_load_profiled(documents,libraryID,convertedPath,nil,
+                [[NSFileManager defaultManager]fileExistsAtPath:preferPath],NO,loadConvertedLibrary,&convertedRoute);
+        if(!library){
+            HGOnDeviceShaderResult *result=[self requestLocalShader:lib sourceSHA:libraryID];
+            if(activeCommand->error)return nil;
+            if(result.status!=HGOnDeviceShaderReady){preflightWaiting=YES;return nil;}
+            library=loadConvertedLibrary(result.output,result.receipt,result.recipe);
+            convertedRoute=result.route;
+            if(!library){activeCommand->error=err.localizedDescription?:@"The converted shader could not be loaded.";return nil;}
+        }
         usedConverted = library != nil;
         if (!library) {
             /* Keep a source available even when a present legacy file is
@@ -662,8 +757,8 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
         usedConverted = library != nil;
     }
     if (usedConverted)
-        fprintf(stderr, "hengevm: shader-broker: selected %s source=%s before function creation\n",
-                convertedRoute.UTF8String, libraryID.UTF8String);
+        fprintf(stderr, "hengevm: shader-broker: selected %s source=%s recipe=%s before function creation\n",
+                convertedRoute.UTF8String, libraryID.UTF8String, selectedProfileRecipe.UTF8String?:"unknown");
 #endif
     if (!library && !getenv("HV_PVG_NO_RELABEL")) {
         int first = forcedRelabelStage ?: 1;
@@ -749,7 +844,7 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
 - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
     if (size < sizeof(uint32_t)) return nil;
     NSMutableData *all = [NSMutableData dataWithLength:size];
-    if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return nil;
+    if ([self shaderRead:at task:task to:all.mutableBytes length:size]) return nil;
     const uint32_t *w = all.bytes;
     uint32_t tag = w[0];
     if ((tag == 0xe || tag == 0x33 || tag == 0xb) && (size < 16 || w[3] > size - 16)) {
@@ -1330,7 +1425,7 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLRenderCommandEncoder> encoder = [cb renderCommandEncoderWithDescriptor:clear];
         [encoder endEncoding];
-        [cb commit];
+        lifecycle_commit(self, cb, YES);
         break;
     }
     default: break;
@@ -1352,7 +1447,7 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
                        toTexture:o->object destinationSlice:0 destinationLevel:0
                destinationOrigin:MTLOriginMake(0, 0, 0)];
             [blit endEncoding];
-            [cb commit];
+            lifecycle_commit(self, cb, YES);
             fprintf(stderr, "hengevm: pvg-metal: seeded scanout map %llu from displayed texture\n",
                     (unsigned long long)mapping);
         }
@@ -1495,7 +1590,7 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
     return surface ? surface : [self newSurface:mapping];
 }
 
-static void probe_yuv_texture(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> texture) {
+static void probe_yuv_texture(HvReplay *replay, id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLTexture> texture) {
     static unsigned probes;
     if (!getenv("HV_PVG_YUV_PROBE") || !texture || probes++ >= 4) return;
     NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -1512,7 +1607,7 @@ static void probe_yuv_texture(id<MTLDevice> device, id<MTLCommandQueue> queue, i
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:state]; [e setTexture:texture atIndex:0]; [e setBuffer:values offset:0 atIndex:0];
     [e dispatchThreads:MTLSizeMake(4,1,1) threadsPerThreadgroup:MTLSizeMake(4,1,1)];
-    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    [e endEncoding]; if (!lifecycle_commit(replay, cb, YES)) return; [cb waitUntilCompleted];
     const float *v = values.contents;
     fprintf(stderr, "yuv-probe fmt %lu status %lu error %s samples:", (unsigned long)texture.pixelFormat, (unsigned long)cb.status, cb.error.localizedDescription.UTF8String ?: "none");
     for (unsigned i = 0; i < 16; i++) fprintf(stderr, " %.4f", v[i]);
@@ -1621,7 +1716,7 @@ static void probe_yuv_texture(id<MTLDevice> device, id<MTLCommandQueue> queue, i
     } else {
         [fallback_textures removeObjectForKey:key];
     }
-    if (surface->iosurface && surface->plane_count > 1) probe_yuv_texture(device, queue, o->object);
+    if (surface->iosurface && surface->plane_count > 1) probe_yuv_texture(self, device, queue, o->object);
     if (!plane) mapped_textures[key] = o->object;
 }
 
@@ -1630,7 +1725,8 @@ static void probe_yuv_texture(id<MTLDevice> device, id<MTLCommandQueue> queue, i
     task_cache_generation(tasks, task_generations, task, hv_pvg_lite_task_generation(lite, task));
     uint64_t list = hv_pvg_lite_task_objects(lite, task);
     uint32_t e[3];
-    if (!list || hv_pvg_lite_task_read(lite, task, list + (uint64_t)ref * 12, e, 12)) return nil;
+    if (!list || [self shaderRead:list + (uint64_t)ref * 12 task:task to:e length:12]) return nil;
+    if(preflighting && (e[0]&0xff)!=OBJ_FUNCTION && (e[0]&0xff)!=OBJ_SERIALIZED) { activeCommand->error=@"non-function dependency in shader preflight"; return nil; }
     NSMutableDictionary *objs = tasks[@(task)];
     if (!objs) tasks[@(task)] = objs = [NSMutableDictionary new];
     HvObject *o = objs[@(ref)];
@@ -1868,7 +1964,7 @@ typedef struct {
                 if (!ref || [self get:ref task:task]) continue;
                 uint64_t list = hv_pvg_lite_task_objects(lite, task);
                 uint32_t e[3] = {0}, w[24] = {0};
-                if (list) hv_pvg_lite_task_read(lite, task, list + (uint64_t)ref * 12, e, 12);
+                if (list) [self shaderRead:list + (uint64_t)ref * 12 task:task to:e length:12];
                 uint64_t at = (uint64_t)e[2] << 32 | e[1];
                 if (at) hv_pvg_lite_task_read(lite, task, at, w, sizeof w);
                 fprintf(stderr, "passdump:   missing ref %u (slot %d): type %u size %u at 0x%llx:", ref, i, e[0] & 0xff, e[0] >> 8, (unsigned long long)at);
@@ -2627,18 +2723,18 @@ typedef struct {
     static int sync = -1; /* HV_PVG_SYNC: wait for the GPU after every batch */
     if (sync < 0) sync = getenv("HV_PVG_SYNC") != NULL;
     HvPvgLite *l = lite;
-    atomic_fetch_add(&inflight, 1);
-    dispatch_group_enter(completions);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (done.error) {
             self->failed++;
             fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
         }
         if (complete) hv_pvg_lite_complete(l, ch, stamp);
-        atomic_fetch_sub(&self->inflight, 1);
-        dispatch_group_leave(self->completions);
     }];
-    [cb commit];
+    if (!lifecycle_commit(self, cb, YES)) {
+        /* Only explicit VM stop cancels replay; pause preserves this call.
+           No completion handler runs for an uncommitted command buffer. */
+        return;
+    }
     last_cb = cb;
     if (sync) [cb waitUntilCompleted];
 }
@@ -2652,7 +2748,8 @@ typedef struct {
     [self commit:[queue commandBuffer] channel:ch stamp:stamp complete:YES];
 }
 
-/* Returns YES if the GPU's completion gives the stamp back. */
+/* YES means the caller must not emit a stamp: GPU completion owns it, or
+ * ordered->faulted retains an uncommitted fatal batch. */
 - (BOOL)exec:(const uint32_t *)a length:(uint32_t)len channel:(uint32_t)ch stamp:(uint32_t)stamp {
     uint32_t task = a[0], nres = a[1], nbuf = a[2];
     if (12 + nres * 8ull + nbuf * 16ull > len) { /* never quietly: a lost job is a frame that never gets drawn */
@@ -2742,8 +2839,10 @@ typedef struct {
         memcpy(&off, bufs + b * 16, 8);
         memcpy(&blen, bufs + b * 16 + 8, 8);
         if (blen > (64u << 20) || blen < 8) continue;
-        NSMutableData *copy = [NSMutableData dataWithLength:(NSUInteger)blen];
-        if (hv_pvg_lite_task_read(lite, task, off, copy.mutableBytes, (uint32_t)blen)) { [self complain:@"command buffer unreadable"]; continue; }
+        NSData *copy = activeCommand->buffers[@(b)];
+        if(!copy) { NSMutableData *live=[NSMutableData dataWithLength:(NSUInteger)blen];
+            if(hv_pvg_lite_task_read(lite,task,off,live.mutableBytes,(uint32_t)blen)){[self complain:@"command buffer unreadable"];continue;} copy=live; }
+        if(copy.length!=blen){[self complain:@"preflight command size changed"];return NO;}
         const uint8_t *p = copy.bytes, *end = p + blen;
         uint32_t seglen, info;
         memcpy(&seglen, p, 4), memcpy(&info, p + 4, 4);
@@ -2802,6 +2901,12 @@ typedef struct {
         if (!more && e) { [e endEncoding]; e = nil; }
     }
     if (e) [e endEncoding];
+    if(activeCommand && activeCommand->error){
+        ordered->faulted=YES;[renderStatus setCode:2 message:activeCommand->error];
+        /* Encoders have ended, but this buffer is never committed. The FIFO
+           retains this fatal batch and emits no completion stamp. */
+        return YES;
+    }
     if (copiedWrites.count) {
         id<MTLBlitCommandEncoder> back = [cb blitCommandEncoder];
         for (HvObject *surface in copiedWrites.keyEnumerator) {
@@ -3056,7 +3161,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
    this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
 - (void)kickPresenter:(BOOL)fresh {
     /* screen_lock held */
-    if (atomic_load(&stopping)) return;
+    if (atomic_load(&stopping) || presenter_barrier || !hv_lifecycle_allowed(&hv_app_lifecycle) || !hv_lifecycle_allowed(&hv_cpu_lifecycle)) return;
     if (fresh) screen_requests++;
     if (presenter_running || !layer || !screen_tex || drawable_retry_pending) return;
     if (drawable_retry_cooldown) {
@@ -3120,7 +3225,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 - (void)presentLoop {
     for (;;) @autoreleasepool {
         os_unfair_lock_lock(&screen_lock);
-        if (!screen_dirty || !layer) {
+        if (!screen_dirty || !layer || presenter_barrier || atomic_load(&stopping) || !hv_lifecycle_allowed(&hv_app_lifecycle) || !hv_lifecycle_allowed(&hv_cpu_lifecycle)) {
             presenter_running = NO;
             os_unfair_lock_unlock(&screen_lock);
             return;
@@ -3254,14 +3359,28 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         // Serialize the final check and commit with set_layer: a switch that has
         // returned must not be followed by a commit to its old target.
         os_unfair_lock_lock(&screen_lock);
-        if (layer_generation == generation && layer == target) {
+        BOOL submitted = NO;
+        if (layer_generation == generation && layer == target && !presenter_barrier && hv_lifecycle_allowed(&hv_app_lifecycle) && hv_lifecycle_allowed(&hv_cpu_lifecycle)) {
             [cb presentDrawable:drawable];
-            [cb commit];
-            gpu_frames++;
+            if (lifecycle_commit(self, cb, NO)) { gpu_frames++; submitted = YES; }
+            else {
+                // Presentation may coalesce; guest replay may not. Do not wait
+                // for foreground or another submission while holding screen_lock.
+                screen_dirty = YES;
+                presenter_running = NO;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), presenter, ^{
+                    os_unfair_lock_lock(&self->screen_lock);
+                    [self kickPresenter:NO];
+                    os_unfair_lock_unlock(&self->screen_lock);
+                });
+                os_unfair_lock_unlock(&screen_lock);
+                return;
+            }
         } else {
             screen_dirty = YES;
         }
         os_unfair_lock_unlock(&screen_lock);
+        if (submitted) [cb waitUntilScheduled];
     }
 }
 
@@ -3377,102 +3496,163 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 }
 #endif
 
-@end
-
-HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
-    @autoreleasepool {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        if (!dev) return NULL;
-        if (![dev respondsToSelector:@selector(newRenderPipelineDescriptorWithSerializedData:deserializationContext:)]) {
-            fprintf(stderr, "hengevm: pvg-metal: this Metal cannot read serialized pipelines; no drawing\n");
-            return NULL;
-        }
-        Protocol *proto = objc_getProtocol("MTLDeserializationContext");
-        if (proto) class_addProtocol([HvContext class], proto);
-        HvReplay *r = [HvReplay new];
-        r->lite = lite;
-        r->completions = dispatch_group_create();
-        r->device = dev;
-        r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
-        r->worker = dispatch_queue_create("hengevm.pvg", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-        r->presenter = dispatch_queue_create("hengevm.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-        r->screen_lock = OS_UNFAIR_LOCK_INIT;
-        r->tasks = [NSMutableDictionary new];
-        r->mapped_textures = [NSMutableDictionary new];
-        r->fallback_textures = [NSMutableDictionary new];
-        fprintf(stderr, "hengevm: pvg-metal: unconditional mapped fallback diagnostics enabled\n");
-        r->scanout_mappings = [NSMutableSet new];
-        r->surfaces = [NSMutableDictionary new];
-        r->planar = [NSMutableDictionary new];
-        r->planar_uses = [NSMutableDictionary new];
-        r->complaints = [NSMutableSet new];
-        r->shot = getenv("HV_PVG_SHOT");
-        cp_start(r);
-#if !TARGET_OS_IPHONE
-        if (getenv("HV_PVG_GPU_TEST")) r->layer = [CAMetalLayer layer];
-#endif
-#if !TARGET_OS_IPHONE
-        if (r->shot) {
-            double every = getenv("HV_PVG_SHOT_SECS") ? atof(getenv("HV_PVG_SHOT_SECS")) : 5;
-            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, r->worker);
-            dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(every * NSEC_PER_SEC)), (uint64_t)(every * NSEC_PER_SEC), NSEC_PER_SEC / 10);
-            HvReplay *__weak weak = r;
-            dispatch_source_set_event_handler(timer, ^{ [weak saveShot]; });
-            dispatch_resume(timer);
-            r->shot_timer = timer;
-        }
-#endif
-        fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
-        return (HvPvgMetal *)CFBridgingRetain(r);
-    }
+/* Snapshot descriptor/function reads, then reuse them through parked retries.
+ * Other resources remain guest-owned until the withheld completion stamp. */
+- (int)shaderRead:(uint64_t)offset task:(uint32_t)task to:(void *)to length:(uint32_t)n {
+    if(!activeCommand)return hv_pvg_lite_task_read(lite,task,offset,to,n);
+    NSString *key=[NSString stringWithFormat:@"%u:%llu:%u",task,offset,n];
+    NSData *saved=activeCommand->reads[key];
+    if(saved){memcpy(to,saved.bytes,n);return 0;}
+    if(n>(128u<<20)-MIN(activeCommand->snapshotBytes,(NSUInteger)(128u<<20))){activeCommand->error=@"shader snapshot exceeds128MiB";return -1;}
+    if(hv_pvg_lite_task_read(lite,task,offset,to,n))return -1;
+    activeCommand->reads[key]=[NSData dataWithBytes:to length:n];activeCommand->snapshotBytes+=n;return 0;
 }
 
-void hv_pvg_metal_destroy(HvPvgMetal *m) {
-    if (!m) return;
-    @autoreleasepool {
-        HvReplay *r = CFBridgingRelease(m);
-        atomic_store(&r->stopping, 1);
-        if (r->shot_timer) { dispatch_source_cancel(r->shot_timer); r->shot_timer = nil; }
-        if (cp.timer) { dispatch_source_cancel(cp.timer); cp.timer = nil; }
-        os_unfair_lock_lock(&r->screen_lock);
-        r->layer = nil;
-        r->layer_generation++;
-        r->screen_dirty = NO;
-        os_unfair_lock_unlock(&r->screen_lock);
-        /* No CPU can enqueue more work. Delayed presentation blocks see
-           stopping before touching guest memory; already queued work drains. */
-        dispatch_sync(r->worker, ^{ r->late = NO; });
-        dispatch_sync(r->presenter, ^{});
-        id<MTLCommandBuffer> fence = [r->queue commandBuffer];
-        [fence commit];
-        [fence waitUntilCompleted];
-        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
-        /* GPU completions may have enqueued a final readback on the worker. */
-        dispatch_sync(r->worker, ^{
-            r->lite = NULL;
-            r->tasks = nil;
-            r->surfaces = nil;
-            r->mapped_textures = nil;
-            r->planar = nil;
-            r->screen_tex = nil;
-            r->cursor_tex = nil;
-            r->last_cb = nil;
-            r->readback = r->test_readback = nil;
-            free(r->frame); r->frame = NULL;
-            free(r->base); r->base = NULL;
-            free(r->cursor); r->cursor = NULL;
-            for (NSValue *old in r->retired_frames) free(old.pointerValue);
-            r->retired_frames = nil;
-            free(cp.pend_src); cp.pend_src = NULL;
-            cp.on = 0;
+- (void)preflightReference:(uint32_t)ref task:(uint32_t)task {
+    if(!ref||activeCommand->error)return;
+    uint64_t list=hv_pvg_lite_task_objects(lite,task);uint32_t e[3];
+    if(!list||[self shaderRead:list+(uint64_t)ref*12 task:task to:e length:12]){activeCommand->error=@"preflight object entry unreadable";return;}
+    unsigned type=e[0]&255;if(type!=OBJ_FUNCTION&&type!=OBJ_SERIALIZED)return;
+    HvObject *o=[self object:ref task:task];
+    if((!o||!o->object)&&!preflightWaiting&&!activeCommand->error)
+        activeCommand->error=[NSString stringWithFormat:@"shader/pipeline ref%u unavailable without pending conversion",ref];
+}
+
+- (HvReplayReadiness)preflightCommand:(HvReplayCommand*)item {
+#if !TARGET_OS_IPHONE
+    return HvReplayReady;
+#else
+    if(item->error)return HvReplayFault;
+    const uint32_t *cmd=item->command.bytes;NSUInteger len=item->command.length;
+    if(len<12){item->error=@"short command";return HvReplayFault;}
+    uint32_t op=cmd[0]&0xffff,skip=(cmd[0]>>16)*8;
+    if(op!=0x43&&op!=0x45&&op!=0x37)return HvReplayReady;
+    NSString *documents=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+    if(!shaderProvider&&!shaderProviderError&&!hv_shader_profile_required(documents))return HvReplayReady;
+    /* Ready results are pinned by the packet; pending capacity is retried without
+       duplicating a running compile or trusting an evictable provider entry. */
+    if(item->localSources.count){
+        activeCommand=item;
+        @try{
+            for(NSString *source in item->localSources.allKeys){
+                HGOnDeviceShaderResult *result=[self requestLocalShader:item->localSources[source] sourceSHA:source];
+                if(item->error)return HvReplayFault;
+                if(result.status!=HGOnDeviceShaderReady)return HvReplayPark;
+            }
+        }@finally{activeCommand=nil;}
+    }
+    NSDictionary *config=hv_shader_compiler_config(documents);
+    if(item->awaitingLease&&!hv_shader_lease(documents,config[@"recipe"]))return HvReplayPark;
+    item->awaitingLease=NO;
+    for(NSString *source in item->requests.allKeys){
+        NSDictionary *request=item->requests[source];
+        NSDictionary *state=hv_shader_poll_request(documents,request);
+        NSString *kind=state[@"state"];
+        if([kind isEqual:@"ready"]){[item->requests removeObjectForKey:source];continue;}
+        if([kind isEqual:@"failed"]||[kind isEqual:@"stale"]){item->error=[NSString stringWithFormat:@"shader %@ %@: %@",source,kind,state[@"receipt"][@"error"]?:@""];return HvReplayFault;}
+        if([kind isEqual:@"offline"]){NSDictionary *renewed=hv_shader_enqueue_request(documents,source,nil);if(renewed)item->requests[source]=renewed;}
+        return HvReplayPark;
+    }
+    if(len<12ull+skip+12){item->error=@"short exec";return HvReplayFault;}
+    const uint32_t *a=(const uint32_t*)((const uint8_t*)cmd+12+skip);
+    uint32_t task=a[0],nres=a[1],nbuf=a[2],stride=op==0x37?24:8;
+    if(task>=512||12ull+nres*(uint64_t)stride+nbuf*16ull>len-12-skip){item->error=@"invalid exec ranges";return HvReplayFault;}
+    if(hv_pvg_lite_task_generation(lite,task)!=item->generation){item->error=@"task generation changed while accepted command was pending; refusing wrong-owner replay";return HvReplayFault;}
+    activeCommand=item;preflighting=YES;preflightWaiting=NO;
+    @try{
+        /* Failed preflight objects are provisional. Retain all successful objects. */
+        NSMutableDictionary *objects=tasks[@(task)];
+        for(NSNumber *ref in objects.allKeys){HvObject *o=objects[ref];if(!o->object&&((o->entry[0]&255)==OBJ_FUNCTION||(o->entry[0]&255)==OBJ_SERIALIZED))[objects removeObjectForKey:ref];}
+        const uint8_t *resources=(const uint8_t*)(a+3),*buffers=resources+(uint64_t)nres*stride;
+        for(uint32_t i=0;i<nres;i++){uint32_t ref;memcpy(&ref,resources+(uint64_t)i*stride,4);[self preflightReference:ref task:task];}
+        for(uint32_t b=0;b<nbuf&&!item->error;b++){
+            uint64_t off,blen;memcpy(&off,buffers+b*16,8);memcpy(&blen,buffers+b*16+8,8);
+            if(blen<8||blen>(64u<<20)){item->error=@"invalid command segment size";break;}
+            NSData *copy=item->buffers[@(b)];
+            if(!copy){if(blen>(128u<<20)-MIN(item->snapshotBytes,(NSUInteger)(128u<<20))){item->error=@"command snapshots exceed128MiB";break;}
+                NSMutableData *data=[NSMutableData dataWithLength:(NSUInteger)blen];if(hv_pvg_lite_task_read(lite,task,off,data.mutableBytes,(uint32_t)blen)){item->error=@"preflight command segment unreadable";break;}
+                item->buffers[@(b)]=copy=data;item->snapshotBytes+=blen;}
+            const uint8_t *p=copy.bytes,*end=p+copy.length;uint32_t seglen,info;memcpy(&seglen,p,4);memcpy(&info,p+4,4);p+=8;
+            if((info&255)==5){if(end-p<16){item->error=@"short protection segment";break;}p+=8;memcpy(&seglen,p,4);memcpy(&info,p+4,4);p+=8;}
+            if(seglen<(uint64_t)(end-p))end=p+seglen;
+            uint32_t type=info&255;
+            while(end-p>=8){uint32_t tag,size;memcpy(&tag,p,4);memcpy(&size,p+4,4);if(size<8||size>(uint64_t)(end-p)){item->error=@"malformed preflight record";break;}
+                BOOL reference=(type==0&&tag==116)||(type==1&&tag==208)||(type==4&&tag!=451&&tag!=469);
+                if(reference){if(size<12){item->error=@"short pipeline/query reference";break;}uint32_t ref;memcpy(&ref,p+8,4);[self preflightReference:ref task:task];}
+                p+=size;
+            }
+        }
+    }@catch(NSException *exception){item->error=[NSString stringWithFormat:@"preflight exception: %@",exception.reason];}
+    @finally{preflighting=NO;activeCommand=nil;}
+    if(item->error){[self complain:item->error];return HvReplayFault;}
+    return preflightWaiting?HvReplayPark:HvReplayReady;
+#endif
+}
+
+- (void)pumpCommands {
+    if(!hv_lifecycle_wait_stoppable(&hv_app_lifecycle,&stopping)){
+        [ordered stop];activeCommand=nil;return;
+    }
+    __weak HvReplay *weak=self;
+    [ordered pump:^HvReplayReadiness(HvReplayCommand *item){
+        /* Check every head: app activity can change during a FIFO pump. */
+        if(!hv_lifecycle_wait_stoppable(&hv_app_lifecycle,&self->stopping)){
+            [self->ordered stop];self->activeCommand=nil;return HvReplayPark;
+        }
+        if(item->taskView)hv_pvg_lite_use_task_view(self->lite,item->taskView.bytes);
+        @try{
+            HvReplayReadiness readiness=[self preflightCommand:item];
+            if(readiness==HvReplayPark)[self->renderStatus setCode:1 message:item->awaitingLease
+                ? @"Waiting for the shader compiler to connect."
+                : @"Preparing a shader required by this Mac. Graphics will continue when it is ready."];
+            else if(readiness==HvReplayFault)[self->renderStatus setCode:2 message:item->error?:@"A required graphics operation could not be prepared."];
+            else [self->renderStatus setCode:0 message:nil];
+            return readiness;
+        }@finally{hv_pvg_lite_use_task_view(self->lite,NULL);}
+    } execute:^(HvReplayCommand *item){
+        self->activeCommand=item;
+        if(item->taskView)hv_pvg_lite_use_task_view(self->lite,item->taskView.bytes);
+        @try{[self performCommand:item];}@finally{self->activeCommand=nil;hv_pvg_lite_use_task_view(self->lite,NULL);}
+    } barrier:^(HvReplayCommand *item){
+        /* No later FIFO entry commits while this marker waits for prior work.
+           Final presenter commits hold this same lock: close admission before
+           observing the group, including a drawable already being prepared. */
+        os_unfair_lock_lock(&self->screen_lock);
+        self->presenter_barrier=YES;
+        os_unfair_lock_unlock(&self->screen_lock);
+        /* A drawable can be prepared outside screen_lock. Let that serial
+           presenter reach its guarded final check and exit before releasing
+           mappings, even if the completion group was already empty. */
+        dispatch_async(self->presenter,^{
+        dispatch_group_notify(self->completions,self->worker,^{
+            HvReplay *r=weak;if(!r||r->ordered->stopped)return;
+            if(r->ordered->entries.firstObject!=item)return;
+            if(atomic_load(&r->stopping)||atomic_load(&hv_app_lifecycle.cancelled)){
+                [r->ordered stop];r->activeCommand=nil;return;
+            }
+            [r->ordered->entries removeObjectAtIndex:0];r->ordered->waiting=NO;
+            atomic_fetch_sub(&r->ordered->reserved,item->command.length);[item complete:0];
+            /* Keep presentation suppressed through mapper unmap/IRQ publication. */
+            os_unfair_lock_lock(&r->screen_lock);
+            r->presenter_barrier=NO;[r kickPresenter:NO];
+            os_unfair_lock_unlock(&r->screen_lock);
+            [r pumpCommands];
+        });
+        });
+    }];
+    if(ordered->faulted){[self complain:@"ordered replay stopped on unresolved shader error; no incomplete stamp acknowledged"];return;}
+    if(ordered->entries.count&&!ordered->waiting&&!pollScheduled){
+        pollScheduled=YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,50*NSEC_PER_MSEC),worker,^{
+            HvReplay *r=weak;if(!r)return;r->pollScheduled=NO;
+            if(!atomic_load(&r->stopping))[r pumpCommands];
         });
     }
 }
 
-void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *cmd, uint32_t len) {
-    HvReplay *r = (__bridge HvReplay *)m;
-    dispatch_async(r->worker, ^{
-        @autoreleasepool {
+- (void)performCommand:(HvReplayCommand *)item {
+    HvReplay *r=self; HvPvgLite *lite=self->lite; uint32_t ch=item->channel;
+    uint32_t len=(uint32_t)item->command.length;const uint32_t *cmd=item->command.bytes;
             uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8; /* the barriers come first */
             const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
             uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
@@ -3526,10 +3706,140 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
             } @catch (NSException *x) {
                 [r complain:[NSString stringWithFormat:@"exception: %@", x.reason]];
             }
-            if (!gpu_completes) [r finishChannel:ch stamp:cmd[2]];
-            free(cmd);
+            if(item->error){
+                r->ordered->faulted=YES;[r->renderStatus setCode:2 message:item->error];
+            }else if (!gpu_completes) [r finishChannel:ch stamp:cmd[2]];
+
+}
+
+@end
+
+HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) return NULL;
+        if (![dev respondsToSelector:@selector(newRenderPipelineDescriptorWithSerializedData:deserializationContext:)]) {
+            fprintf(stderr, "hengevm: pvg-metal: this Metal cannot read serialized pipelines; no drawing\n");
+            return NULL;
         }
-    });
+        Protocol *proto = objc_getProtocol("MTLDeserializationContext");
+        if (proto) class_addProtocol([HvContext class], proto);
+        HvReplay *r = [HvReplay new];
+        r->lite = lite;
+        r->completions = dispatch_group_create();
+        r->ordered=[HvOrderedReplay new];
+        r->renderStatus=[HvRenderStatus new];
+#if TARGET_OS_IPHONE
+        NSError *providerError=nil;
+        NSString *documents=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+        r->shaderProvider=[[HGOnDeviceShaderProvider alloc]initWithDocuments:documents error:&providerError];
+        if(!r->shaderProvider)r->shaderProviderError=providerError.localizedDescription?:@"The local shader compiler could not start.";
+#endif
+        r->device = dev;
+        r->queue = [dev newCommandQueueWithMaxCommandBufferCount:64];
+        r->worker = dispatch_queue_create("hengevm.pvg", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+        r->presenter = dispatch_queue_create("hengevm.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+        r->screen_lock = OS_UNFAIR_LOCK_INIT;
+        r->tasks = [NSMutableDictionary new];
+        r->mapped_textures = [NSMutableDictionary new];
+        r->fallback_textures = [NSMutableDictionary new];
+        fprintf(stderr, "hengevm: pvg-metal: unconditional mapped fallback diagnostics enabled\n");
+        r->scanout_mappings = [NSMutableSet new];
+        r->surfaces = [NSMutableDictionary new];
+        r->planar = [NSMutableDictionary new];
+        r->planar_uses = [NSMutableDictionary new];
+        r->complaints = [NSMutableSet new];
+        r->shot = getenv("HV_PVG_SHOT");
+        cp_start(r);
+#if !TARGET_OS_IPHONE
+        if (getenv("HV_PVG_GPU_TEST")) r->layer = [CAMetalLayer layer];
+#endif
+#if !TARGET_OS_IPHONE
+        if (r->shot) {
+            double every = getenv("HV_PVG_SHOT_SECS") ? atof(getenv("HV_PVG_SHOT_SECS")) : 5;
+            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, r->worker);
+            dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(every * NSEC_PER_SEC)), (uint64_t)(every * NSEC_PER_SEC), NSEC_PER_SEC / 10);
+            HvReplay *__weak weak = r;
+            dispatch_source_set_event_handler(timer, ^{ [weak saveShot]; });
+            dispatch_resume(timer);
+            r->shot_timer = timer;
+        }
+#endif
+        fprintf(stderr, "hengevm: pvg-metal: drawing on %s\n", dev.name.UTF8String);
+        return (HvPvgMetal *)CFBridgingRetain(r);
+    }
+}
+
+
+
+void hv_pvg_metal_destroy(HvPvgMetal *m) {
+    if (!m) return;
+    @autoreleasepool {
+        HvReplay *r = CFBridgingRelease(m);
+        atomic_store(&r->stopping, 1);
+#if TARGET_OS_IPHONE
+        [r->shaderProvider invalidate];
+#endif
+        pthread_cond_broadcast(&hv_app_lifecycle.cv);
+        if (r->shot_timer) { dispatch_source_cancel(r->shot_timer); r->shot_timer = nil; }
+        if (cp.timer) { dispatch_source_cancel(cp.timer); cp.timer = nil; }
+        os_unfair_lock_lock(&r->screen_lock);
+        r->layer = nil;
+        r->layer_generation++;
+        r->screen_dirty = NO;
+        os_unfair_lock_unlock(&r->screen_lock);
+        /* No CPU can enqueue more work. Delayed presentation blocks see
+           stopping before touching guest memory; already queued work drains. */
+        dispatch_sync(r->worker, ^{ r->late = NO; [r->ordered stop]; r->activeCommand=nil; });
+        dispatch_sync(r->presenter, ^{});
+        /* Wait only for previously submitted GPU work; never submit a
+           background teardown fence. lifecycle_commit owns the group. */
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+        /* GPU completions may have enqueued a final readback on the worker. */
+        dispatch_sync(r->worker, ^{
+            r->lite = NULL;
+            r->tasks = nil;
+            r->surfaces = nil;
+            r->mapped_textures = nil;
+            r->planar = nil;
+            r->screen_tex = nil;
+            r->cursor_tex = nil;
+            r->last_cb = nil;
+            r->readback = r->test_readback = nil;
+            free(r->frame); r->frame = NULL;
+            free(r->base); r->base = NULL;
+            free(r->cursor); r->cursor = NULL;
+            for (NSValue *old in r->retired_frames) free(old.pointerValue);
+            r->retired_frames = nil;
+            free(cp.pend_src); cp.pend_src = NULL;
+            cp.on = 0;
+        });
+    }
+}
+
+int hv_pvg_metal_render_status(HvPvgMetal *m,char *message,uint32_t length){
+    if(!m){if(message&&length)message[0]=0;return 0;}
+    HvReplay *r=(__bridge HvReplay*)m;return [r->renderStatus copyMessage:message length:length];
+}
+int hv_pvg_metal_reserve(HvPvgMetal *m,uint32_t length) {
+    HvReplay *r=(__bridge HvReplay*)m;
+    return !atomic_load(&r->stopping) && [r->ordered reserve:length];
+}
+void hv_pvg_metal_submit(HvPvgMetal *m,HvPvgLite *lite,uint32_t ch,uint32_t *cmd,uint32_t len) {
+    HvReplay *r=(__bridge HvReplay*)m;HvReplayCommand *item=[HvReplayCommand new];
+    item->command=[NSData dataWithBytesNoCopy:cmd length:len freeWhenDone:YES];item->channel=ch;
+    uint32_t skip=(cmd[0]>>16)*8,op=cmd[0]&0xffff;
+    if(((op==0x43||op==0x45||op==0x37)&&len>=12ull+skip+12)||((op==0x35||op==0x3e)&&len>=12ull+skip+8)){
+        const uint32_t *args=(const uint32_t*)((const uint8_t*)cmd+12+skip);item->task=args[0];
+        HvPvgTaskView view;
+        if(!hv_pvg_lite_task_view(lite,item->task,&view)){item->generation=view.generation;item->taskView=[NSData dataWithBytes:&view length:sizeof view];}
+        else item->error=@"task metadata unavailable at command acceptance";
+    }
+    dispatch_async(r->worker,^{@autoreleasepool{[r->ordered enqueue:item];[r pumpCommands];}});
+}
+void hv_pvg_metal_drain(HvPvgMetal *m,void(*done)(void*,int),void *opaque){
+    HvReplay *r=(__bridge HvReplay*)m;HvReplayCommand *item=[HvReplayCommand new];item->barrier=done;item->opaque=opaque;
+    dispatch_async(r->worker,^{[r->ordered enqueue:item];[r pumpCommands];});
 }
 
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
@@ -3546,7 +3856,7 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
     [r kickPresenter:YES];
     os_unfair_lock_unlock(&r->screen_lock);
     dispatch_async(r->worker, ^{
-        if (r->on_screen) [r present:r->on_screen];
+        if (hv_lifecycle_allowed(&hv_app_lifecycle) && r->on_screen) [r present:r->on_screen];
     });
 }
 
@@ -3569,9 +3879,13 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
     });
 }
 
-void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
-    HvReplay *r = (__bridge HvReplay *)m;
-    dispatch_async(r->worker, ^{
+void hv_pvg_metal_mapper(HvPvgMetal *m,uint32_t operation,uint32_t mapping,uint64_t completed_index) {
+    HvReplay *r=(__bridge HvReplay*)m;HvReplayCommand *item=[HvReplayCommand new];
+    uint32_t bytes[4]={operation,mapping,(uint32_t)completed_index,(uint32_t)(completed_index>>32)};
+    item->command=[NSData dataWithBytes:bytes length:sizeof bytes];
+    __weak HvReplay *weak=r;
+    item->completion=^(int cancelled){HvReplay *r=weak;if(cancelled||!r||atomic_load(&r->stopping))return;
+        if(operation==2){
         release_planar_alias(r->planar, r->planar_uses, r->surfaces[@(mapping)]);
         id<MTLTexture> fallback = r->fallback_textures[@(mapping)];
         if (fallback && getenv("HV_PVG_TRACE_FILE"))
@@ -3583,7 +3897,10 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
            private fallback belongs to the old surface, even when the next
            surface happens to have the same size and pixel format. */
         [r->fallback_textures removeObjectForKey:@(mapping)];
-    });
+        }
+        hv_pvg_lite_mapper_complete(r->lite,completed_index);
+    };
+    dispatch_async(r->worker,^{[r->ordered enqueue:item];[r pumpCommands];});
 }
 
 /* A small picture of what the display shows, BGRA with no padding, for the app's home screen.

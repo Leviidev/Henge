@@ -22,6 +22,7 @@ import time
 
 from catalog_metallibs import inspect_metallib
 from shader_profile import envelope, verify_envelope
+from shader_compile_runtime import run_converter
 from shader_compiler_peer_profiled import LIMIT, TARGET, atomic, digest, sha
 
 HERE = Path(__file__).resolve().parent
@@ -41,7 +42,7 @@ def recipe_manifest():
     tools['llvm_runtime']=[dict(path=str(Path(p).resolve()),sha256=sha(Path(p).read_bytes())) for p in llvm_files]
     return dict(protocol=3, target=TARGET, developer=developer, sdk_build=sdk, tools=tools,
                 sources={name: sha((HERE / name).read_bytes()) for name in
-                         ('recompile_guest_metallib_profiled.py','catalog_metallibs.py','shader_companion_profiled.py','shader_compiler_peer_profiled.py','shader_profile.py','gl_position_lower.py','gl_position_plan.cpp')})
+                         ('recompile_guest_metallib_profiled.py','catalog_metallibs.py','shader_companion_profiled.py','shader_compiler_peer_profiled.py','shader_profile.py','gl_position_lower.py','gl_position_plan.cpp','shader_compile_runtime.py')})
 
 
 def inventory(data):
@@ -77,15 +78,9 @@ def compile_request(request, cache, recipe):
         source_path.write_bytes(source)
         command = [sys.executable, str(HERE / 'recompile_guest_metallib_profiled.py'), str(source_path),
                    '--output-dir', str(root), '--target', TARGET]
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        try:
-            _, errors = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
-            raise TimeoutError('compiler exceeded 10 seconds')
-        if process.returncode:
-            raise ValueError(errors.decode(errors='replace')[-2048:])
+        # Diagnostics survive temporary conversion cleanup; one bounded record/source.
+        diagnostics = folder / (source_sha + '.attempt.json')
+        run_converter(command, diagnostics)
         output = (root / ('profiled-ioslib-' + source_sha + '.metallib')).read_bytes()
         if len(output) > LIMIT or inventory(output) != expected:
             raise ValueError('output structure or function inventory mismatch')
@@ -174,6 +169,7 @@ def main():
                         publication.update(output=base64.b64encode(output).decode(), output_sha256=sha(output),transformation_profile=compiled['transformation_profile'])
                     except Exception as error:
                         publication['error'] = str(error)
+                        publication['retryable'] = isinstance(error, TimeoutError)
                     result = connection.call(publication)
                     print(json.dumps(dict(event='published', **result)), flush=True)
                     del pending[source]

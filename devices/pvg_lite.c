@@ -80,6 +80,8 @@ struct HvPvgLite {
     os_unfair_lock layer_lock;
     int layer_set; /* an explicit NULL also overrides the renderer's Mac test layer */
     uint64_t task_generation[512]; /* creation epoch, including reused roots */
+    uint64_t mapper_submitted; /* accepted, not yet necessarily completed */
+    int mapper_pending;
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
     int old_driver; /* macOS 14's (and older?) GPU driver: object lists at a fixed place, compact surface descriptions */
@@ -103,7 +105,29 @@ static void task_created(HvPvgLite *p, uint32_t task, uint32_t root) {
     __atomic_add_fetch(&p->task_generation[task], 1, __ATOMIC_RELEASE);
 }
 
+static _Thread_local HvPvgLite *view_owner;
+static _Thread_local HvPvgTaskView worker_view;
+static int task_view_selected(HvPvgLite *p,uint32_t task){return view_owner==p&&worker_view.task==task;}
+void hv_pvg_lite_use_task_view(HvPvgLite *p,const HvPvgTaskView *view){
+    view_owner=view?p:NULL;if(view)worker_view=*view;
+}
+int hv_pvg_lite_task_view(HvPvgLite *p,uint32_t task,HvPvgTaskView *view){
+    if(task>=512||!p->task_root[task])return -1;
+    uint32_t *root=hv_phys_ptr(p->m,(uint64_t)p->task_root[task]<<14,0x4000);
+    if(!root||root[1]<1||root[1]>3)return -1;
+    *view=(HvPvgTaskView){.task=task,.top=root[0],.depth=root[1],.legacy=!p->task_objects[task],
+        .objects=p->task_objects[task]?:0x4000,.generation=__atomic_load_n(&p->task_generation[task],__ATOMIC_ACQUIRE)};
+    return 0;
+}
+static int task_tree(HvPvgLite *p,uint32_t task,uint32_t *top,uint32_t *depth){
+    if(task_view_selected(p,task)){*top=worker_view.top;*depth=worker_view.depth;return 0;}
+    if(task>=512||!p->task_root[task])return -1;
+    uint32_t *root=hv_phys_ptr(p->m,(uint64_t)p->task_root[task]<<14,0x4000);
+    if(!root)return -1;*top=root[0];*depth=root[1];return *depth<1||*depth>3?-1:0;
+}
+
 uint64_t hv_pvg_lite_task_generation(HvPvgLite *p, uint32_t task) {
+    if(task_view_selected(p,task))return worker_view.generation;
     return task < 512 ? __atomic_load_n(&p->task_generation[task], __ATOMIC_ACQUIRE) : 0;
 }
 
@@ -294,11 +318,7 @@ static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
    32-bit page numbers, so one level maps 64 MB. Returns a host pointer valid
    to the end of the guest's 16 KB page. */
 static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *avail) {
-    if (task >= 512 || !p->task_root[task]) return NULL;
-    uint32_t *root = hv_phys_ptr(p->m, (uint64_t)p->task_root[task] << 14, 0x4000);
-    if (!root) return NULL;
-    uint32_t page = root[0], depth = root[1];
-    if (depth < 1 || depth > 3) return NULL;
+    uint32_t page,depth;if(task_tree(p,task,&page,&depth))return NULL;
     uint64_t vpn = off >> 14;
     for (int level = (int)depth - 1; level >= 0; level--) {
         uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
@@ -329,11 +349,7 @@ int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t task, uint64_t offset, void *to
 }
 
 uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset) {
-    if (task >= 512 || !p->task_root[task]) return 0;
-    uint32_t *root = hv_phys_ptr(p->m, (uint64_t)p->task_root[task] << 14, 0x4000);
-    if (!root) return 0;
-    uint32_t page = root[0], depth = root[1];
-    if (depth < 1 || depth > 3) return 0;
+    uint32_t page,depth;if(task_tree(p,task,&page,&depth))return 0;
     uint64_t vpn = offset >> 14;
     for (int level = (int)depth - 1; level >= 0; level--) {
         uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
@@ -346,11 +362,7 @@ uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset) {
 /* n pages' numbers from a task page on, 0 for those not mapped: a table at a time, for it is asked often. */
 void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_t n, uint32_t *out) {
     memset(out, 0, n * 4);
-    if (task >= 512 || !p->task_root[task]) return;
-    uint32_t *root = hv_phys_ptr(p->m, (uint64_t)p->task_root[task] << 14, 0x4000);
-    if (!root) return;
-    uint32_t top = root[0], depth = root[1];
-    if (depth < 1 || depth > 3) return;
+    uint32_t top,depth;if(task_tree(p,task,&top,&depth))return;
     for (uint64_t i = 0; i < n;) {
         uint64_t vpn = first + i;
         uint32_t page = top;
@@ -379,6 +391,7 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length) {
    seen) never send it: their list is at task offset 0x4000, the same 12-byte entries (found by probing). */
 #define OLD_DRIVER_OBJECTS 0x4000
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
+    if(task_view_selected(p,task))return worker_view.objects;
     if (task >= 512) return 0;
     if (!p->task_objects[task] && p->task_root[task]) {
         if (!p->old_driver) {
@@ -391,6 +404,7 @@ uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
 }
 
 int hv_pvg_lite_legacy_surfaces(HvPvgLite *p, uint32_t task) {
+    if(task_view_selected(p,task))return worker_view.legacy;
     return task < 512 && !p->task_objects[task] && hv_pvg_lite_task_objects(p, task) == 0x4000;
 }
 
@@ -407,6 +421,16 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t ch, uint32_t stamp) {
     __atomic_fetch_or(&p->status, 1u << ch, __ATOMIC_ACQ_REL);
     hv_gicv3_pend(p->gic, p->gfx_irq);
     if (p->m->ncpus == 1) hv_machine_wake(p->m);
+}
+
+int hv_pvg_lite_render_status(HvPvgLite *p,char *message,uint32_t length){
+    HvPvgMetal *metal=p?atomic_load_explicit(&p->metal,memory_order_acquire):NULL;
+    return hv_pvg_metal_render_status(metal,message,length);
+}
+void hv_pvg_lite_drain(HvPvgLite *p, void (*done)(void *, int), void *opaque) {
+    HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
+    if (metal) hv_pvg_metal_drain(metal, done, opaque);
+    else done(opaque, 0);
 }
 
 void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer) {
@@ -682,11 +706,15 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
             }
         }
         if (blocked) break;
+        uint32_t *copy=NULL;
+        if(p->metal){
+            copy=malloc(hdr[1]);
+            if(!copy||!hv_pvg_metal_reserve(p->metal,hdr[1])){free(copy);p->chan_pending|=1u<<ch;break;}
+            ring_read(p,table,size,rd,copy,hdr[1]);
+        }
         channel_command(p, table, size, rd, hdr);
         p->submitted[ch] = hdr[2];
         if (p->metal) {
-            uint32_t *copy = malloc(hdr[1]);
-            ring_read(p, table, size, rd, copy, hdr[1]);
             hv_pvg_metal_submit(p->metal, p, ch, copy, hdr[1]);
         } else {
             last = hdr[2], any = 1;
@@ -706,7 +734,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
 static void do_mapper(HvPvgLite *p) {
     if (p->tally) {
         uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+        for (uint64_t i = __atomic_load_n(&p->io_regs[0x20 / 8],__ATOMIC_ACQUIRE); i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
             if (!e || !t) continue;
@@ -724,20 +752,30 @@ static void do_mapper(HvPvgLite *p) {
             }
         }
     }
-    if (p->metal) {
-        uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
-            uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
-            if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
+    uint64_t ring=p->io_regs[0],size=p->io_regs[0x8/8],want=p->io_regs[0x18/8];
+    if(p->metal){
+        p->mapper_pending=0;
+        for(uint64_t i=p->mapper_submitted;i<want&&size;i++){
+            uint32_t *e=hv_phys_ptr(p->m,ring+(i%size)*16,16);
+            if(!e||!hv_pvg_metal_reserve(p->metal,16)){p->mapper_pending=1;break;}
+            hv_pvg_metal_mapper(p->metal,e[0],e[1],i+1);p->mapper_submitted=i+1;
         }
+    }else{
+        p->mapper_submitted=want;
+        __atomic_store_n(&p->io_regs[0x20/8],want,__ATOMIC_RELEASE);
+        hv_gicv3_pend(p->gic,p->iosfc_irq);
     }
-    p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
-    hv_gicv3_pend(p->gic, p->iosfc_irq);
+}
+
+void hv_pvg_lite_mapper_complete(HvPvgLite *p,uint64_t completed_index){
+    __atomic_store_n(&p->io_regs[0x20/8],completed_index,__ATOMIC_RELEASE);
+    hv_gicv3_pend(p->gic,p->iosfc_irq);
 }
 
 /* Device work no doorbell took care of: a channel that had to wait for another one's work. */
 void hv_pvg_lite_poll(HvPvgLite *p) {
     if (!p) return;
+    if(p->mapper_pending)do_mapper(p);
     uint32_t chans = p->chan_pending;
     if (chans) {
         p->chan_pending = 0;
@@ -788,6 +826,7 @@ static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
     HvPvgLite *p = opaque;
     (void)size;
     if (off == 0x1028) return 1;
+    if (off == 0x1020) return __atomic_load_n(&p->io_regs[0x20/8],__ATOMIC_ACQUIRE);
     return off >= 0x1000 && off < 0x1040 ? p->io_regs[(off - 0x1000) / 8] : 0;
 }
 

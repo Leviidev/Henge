@@ -4,12 +4,13 @@ Requires paired viewport profile handling. Never deploy vertex-only.
 """
 import argparse,hashlib,json,re,subprocess
 from pathlib import Path
+from shader_compile_runtime import run_tool
 ROOT=Path(__file__).resolve().parent
 MARKER='henge.gl_clip_zero_to_one'
 class Unsupported(ValueError):pass
 def sha(b):return hashlib.sha256(b).hexdigest()
 def get_plan(path,tool=None):
- p=subprocess.run([str(tool or ROOT/'gl-position-plan'),str(path)],capture_output=True,text=True,timeout=10)
+ p=run_tool([str(tool or ROOT/'gl-position-plan'),str(path)],stage='inspect-position',capture_output=True,text=True)
  if p.returncode:raise Unsupported(p.stderr.strip())
  return json.loads(p.stdout)
 def apply(text,plan):

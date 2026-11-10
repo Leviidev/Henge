@@ -14,6 +14,7 @@ import re
 import sys
 import tempfile
 import uuid
+import time
 from shader_profile import verify_envelope
 
 PROTOCOL = 3
@@ -110,7 +111,9 @@ class Peer:
                         receipt = json.loads(read_file(receipt_path, 8192))
                         if receipt.get('request') == request['request']:
                             if receipt.get('status') == 'failed':
-                                continue
+                                if (not receipt.get('retryable') or receipt.get('attempt', 1) >= 2
+                                        or time.time() < receipt.get('retry_after', 0)):
+                                    continue
                             if receipt.get('status') == 'ready':
                                 try:
                                     cached = read_file(self.cache / (path.stem + '.metallib'))
@@ -144,9 +147,17 @@ class Peer:
         request = self.request(source)
         if command['request'] != request['request']:
             raise ValueError('request superseded')
-        receipt = dict(self.config, sha256=source, request=request['request'], owner=self.owner)
+        previous_path = self.cache / (source + '.json')
+        previous = {}
+        if previous_path.exists():
+            try: previous = json.loads(read_file(previous_path, 8192))
+            except (ValueError, OSError): pass
+        attempt = (previous.get('attempt', 0) if previous.get('request') == request['request'] else 0) + 1
+        receipt = dict(self.config, sha256=source, request=request['request'], owner=self.owner, attempt=attempt)
         if 'error' in command:
-            receipt.update(status='failed', error=str(command['error'])[:2048])
+            receipt.update(status='failed', error=str(command['error'])[:2048],
+                           retryable=command.get('retryable') is True and attempt < 2,
+                           retry_after=time.time()+2)
         else:
             output = base64.b64decode(command['output'], validate=True)
             if not 4 <= len(output) <= LIMIT or not output.startswith(b'MTLB'):

@@ -14,6 +14,10 @@ OUT="$HOME/Desktop/Henge.ipa"
 OUT="${HENGE_IPA_OUTPUT:-$OUT}"
 mkdir -p "$(dirname "$OUT")"
 [ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
+[ -f "$IOS/deps/lib/libHGOnDeviceShader.a" ] || {
+    echo "Missing on-device shader provider. See compat/ondevice-shaders/README.md and tools/compat/build_ondevice_provider.py." >&2
+    exit 1
+}
 cd "$IOS"
 xcodegen generate >/dev/null
 DD="${HENGE_DERIVED_DATA:-$IOS/build/DerivedData}"

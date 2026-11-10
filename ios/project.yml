@@ -63,6 +63,8 @@ targets:
           - "$(SRCROOT)/../build/ios"
           - "$(SRCROOT)/deps/lib"
         OTHER_LDFLAGS:
+          - "-lHGOnDeviceShader"
+          - "-lc++"
           - "$(inherited)"
           # The engine (make ios-lib) and what its network needs (scripts/fetch_deps.sh).
           - "-lhengevm"

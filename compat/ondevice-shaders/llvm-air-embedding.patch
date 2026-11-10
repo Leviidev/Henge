@@ -1,0 +1,199 @@
+--- a/llvm/include/llvm/Support/ErrorHandling.h
++++ b/llvm/include/llvm/Support/ErrorHandling.h
+@@ -13,10 +13,16 @@
+ 
+ #ifndef LLVM_SUPPORT_ERRORHANDLING_H
+ #define LLVM_SUPPORT_ERRORHANDLING_H
++#include <cstdint>
+ 
+ #include "llvm/Support/Compiler.h"
+ 
+ namespace llvm {
++// Scoped cooperative resource budget for the isolated AIR embedding.
++void hengeAirBudgetBegin(uint64_t operations, uint64_t milliseconds);
++void hengeAirBudgetEnd();
++bool hengeAirBudgetActive();
++void hengeAirBudgetCheck();
+   class StringRef;
+   class Twine;
+ 
+@@ -130,7 +136,13 @@
+ ///
+ /// Use this instead of assert(0).  It conveys intent more clearly and
+ /// allows compilers to omit some unnecessary code.
+-#ifndef NDEBUG
++#if defined(HENGE_AIR_EMBEDDED)
++#ifdef NDEBUG
++#define llvm_unreachable(msg) ::llvm::report_fatal_error("unreachable AIR compiler state")
++#else
++#define llvm_unreachable(msg) ::llvm::report_fatal_error(msg)
++#endif
++#elif !defined(NDEBUG)
+ #define llvm_unreachable(msg) \
+   ::llvm::llvm_unreachable_internal(msg, __FILE__, __LINE__)
+ #elif defined(LLVM_BUILTIN_UNREACHABLE)
+--- a/llvm/lib/Support/ErrorHandling.cpp
++++ b/llvm/lib/Support/ErrorHandling.cpp
+@@ -28,6 +28,7 @@
+ #include <cstdlib>
+ #include <mutex>
+ #include <new>
++#include <chrono>
+ 
+ #if defined(HAVE_UNISTD_H)
+ # include <unistd.h>
+@@ -197,6 +198,9 @@
+ 
+ void llvm::llvm_unreachable_internal(const char *msg, const char *file,
+                                      unsigned line) {
++#ifdef HENGE_AIR_EMBEDDED
++  report_fatal_error(msg ? msg : "unreachable AIR compiler state");
++#endif
+   // This code intentionally doesn't call the ErrorHandler callback, because
+   // llvm_unreachable is intended to be used to indicate "impossible"
+   // situations, and not legitimate runtime errors.
+@@ -301,3 +305,23 @@
+ }
+ 
+ #endif
++
++namespace {
++thread_local bool HengeBudgetActive = false;
++thread_local uint64_t HengeOperations = 0;
++thread_local std::chrono::steady_clock::time_point HengeDeadline;
++}
++void llvm::hengeAirBudgetBegin(uint64_t operations, uint64_t milliseconds) {
++  HengeOperations = operations;
++  HengeDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
++  HengeBudgetActive = true;
++}
++void llvm::hengeAirBudgetEnd() { HengeBudgetActive = false; }
++bool llvm::hengeAirBudgetActive() { return HengeBudgetActive; }
++void llvm::hengeAirBudgetCheck() {
++  if (!HengeBudgetActive) return;
++  if (HengeOperations == 0) report_fatal_error("AIR reader operation budget exceeded");
++  --HengeOperations;
++  if ((HengeOperations & 1023) == 0 && std::chrono::steady_clock::now() > HengeDeadline)
++    report_fatal_error("AIR reader cooperative deadline exceeded");
++}
+--- a/llvm/lib/Bitstream/Reader/BitstreamReader.cpp
++++ b/llvm/lib/Bitstream/Reader/BitstreamReader.cpp
+@@ -19,6 +19,8 @@
+ 
+ /// Having read the ENTER_SUBBLOCK abbrevid, enter the block.
+ Error BitstreamCursor::EnterSubBlock(unsigned BlockID, unsigned *NumWordsP) {
++  hengeAirBudgetCheck();
++  if (hengeAirBudgetActive() && BlockScope.size() >= 64) report_fatal_error("AIR nesting limit");
+   // Save the current block's state on BlockScope.
+   BlockScope.push_back(Block(CurCodeSize));
+   BlockScope.back().PrevAbbrevs.swap(CurAbbrevs);
+@@ -90,6 +92,7 @@
+ /// skipRecord - Read the current record and discard it.
+ Expected<unsigned> BitstreamCursor::skipRecord(unsigned AbbrevID) {
+   // Skip unabbreviated records by reading past their entries.
++  hengeAirBudgetCheck();
+   if (AbbrevID == bitc::UNABBREV_RECORD) {
+     Expected<uint32_t> MaybeCode = ReadVBR(6);
+     if (!MaybeCode)
+@@ -205,6 +208,7 @@
+ Expected<unsigned> BitstreamCursor::readRecord(unsigned AbbrevID,
+                                                SmallVectorImpl<uint64_t> &Vals,
+                                                StringRef *Blob) {
++  hengeAirBudgetCheck();
+   if (AbbrevID == bitc::UNABBREV_RECORD) {
+     Expected<uint32_t> MaybeCode = ReadVBR(6);
+     if (!MaybeCode)
+@@ -214,6 +218,7 @@
+     if (!MaybeNumElts)
+       return MaybeNumElts.takeError();
+     uint32_t NumElts = MaybeNumElts.get();
++    if (hengeAirBudgetActive() && NumElts > 262144) report_fatal_error("AIR record operand limit");
+     Vals.reserve(Vals.size() + NumElts);
+ 
+     for (unsigned i = 0; i != NumElts; ++i)
+@@ -264,7 +269,8 @@
+       if (!MaybeNumElts)
+         return MaybeNumElts.takeError();
+       uint32_t NumElts = MaybeNumElts.get();
+-      Vals.reserve(Vals.size() + NumElts);
++      if (hengeAirBudgetActive() && NumElts > 262144) report_fatal_error("AIR record operand limit");
++    Vals.reserve(Vals.size() + NumElts);
+ 
+       // Get the element encoding.
+       if (i + 2 != e)
+@@ -345,11 +351,14 @@
+ }
+ 
+ Error BitstreamCursor::ReadAbbrevRecord() {
++  hengeAirBudgetCheck();
++  if (hengeAirBudgetActive() && CurAbbrevs.size() >= 4096) report_fatal_error("AIR abbreviation count limit");
+   auto Abbv = std::make_shared<BitCodeAbbrev>();
+   Expected<uint32_t> MaybeNumOpInfo = ReadVBR(5);
+   if (!MaybeNumOpInfo)
+     return MaybeNumOpInfo.takeError();
+   unsigned NumOpInfo = MaybeNumOpInfo.get();
++  if (hengeAirBudgetActive() && NumOpInfo > 256) report_fatal_error("AIR abbreviation operand limit");
+   for (unsigned i = 0; i != NumOpInfo; ++i) {
+     Expected<word_t> MaybeIsLiteral = Read(1);
+     if (!MaybeIsLiteral)
+--- a/llvm/lib/Bitcode/Reader/ValueList.h
++++ b/llvm/lib/Bitcode/Reader/ValueList.h
+@@ -56,9 +56,10 @@
+   // vector compatibility methods
+   unsigned size() const { return ValuePtrs.size(); }
+   void resize(unsigned N) {
++    if (hengeAirBudgetActive() && N > 131072) report_fatal_error("AIR value table limit");
+     ValuePtrs.resize(N);
+   }
+-  void push_back(Value *V) { ValuePtrs.emplace_back(V); }
++  void push_back(Value *V) { if (hengeAirBudgetActive() && ValuePtrs.size() >= 131072) report_fatal_error("AIR value table limit"); ValuePtrs.emplace_back(V); }
+ 
+   void clear() {
+     assert(ResolveConstants.empty() && "Constants not resolved?");
+@@ -78,6 +79,7 @@
+ 
+   void shrinkTo(unsigned N) {
+     assert(N <= size() && "Invalid shrinkTo request!");
++    if (hengeAirBudgetActive() && N > 131072) report_fatal_error("AIR value table limit");
+     ValuePtrs.resize(N);
+   }
+ 
+--- a/llvm/lib/Bitcode/Reader/MetadataLoader.cpp
++++ b/llvm/lib/Bitcode/Reader/MetadataLoader.cpp
+@@ -138,8 +138,8 @@
+ 
+   // vector compatibility methods
+   unsigned size() const { return MetadataPtrs.size(); }
+-  void resize(unsigned N) { MetadataPtrs.resize(N); }
+-  void push_back(Metadata *MD) { MetadataPtrs.emplace_back(MD); }
++  void resize(unsigned N) { if (hengeAirBudgetActive() && N > 131072) report_fatal_error("AIR metadata table limit"); MetadataPtrs.resize(N); }
++  void push_back(Metadata *MD) { if (hengeAirBudgetActive() && MetadataPtrs.size() >= 131072) report_fatal_error("AIR metadata table limit"); MetadataPtrs.emplace_back(MD); }
+   void clear() { MetadataPtrs.clear(); }
+   Metadata *back() const { return MetadataPtrs.back(); }
+   void pop_back() { MetadataPtrs.pop_back(); }
+@@ -733,6 +733,7 @@
+         else
+           return MaybeRecord.takeError();
+         unsigned NumStrings = Record[0];
++        if (hengeAirBudgetActive() && NumStrings > 131072) report_fatal_error("AIR metadata string limit");
+         MDStringRef.reserve(NumStrings);
+         auto IndexNextMDString = [&](StringRef Str) {
+           MDStringRef.push_back(Str);
+--- a/llvm/lib/Bitcode/Reader/BitcodeReader.cpp
++++ b/llvm/lib/Bitcode/Reader/BitcodeReader.cpp
+@@ -1719,6 +1719,7 @@
+       // type list.  This allows us to reserve space.
+       if (Record.empty())
+         return error("Invalid record");
++      if (hengeAirBudgetActive() && Record[0] > 16384) return error("AIR type table limit");
+       TypeList.resize(Record[0]);
+       continue;
+     case bitc::TYPE_CODE_VOID:      // VOID
+@@ -4060,6 +4061,7 @@
+       if (Record.empty() || Record[0] == 0)
+         return error("Invalid record");
+       // Create all the basic blocks for the function.
++      if (hengeAirBudgetActive() && Record[0] > 16384) return error("AIR basic block limit");
+       FunctionBBs.resize(Record[0]);
+ 
+       // See if anything took the address of blocks in this function.
