@@ -35,7 +35,7 @@ int hv_pvg_lite_snapshot(HvPvgLite *p, uint8_t *bgra, uint32_t width, uint32_t h
 int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *width, uint32_t *height);
 /* Worker-local view of producer metadata, captured when a command is accepted.
  * Guest-owned page mappings remain valid until its completion stamp. */
-typedef struct {uint32_t task,top,depth,legacy;uint64_t objects,generation;} HvPvgTaskView;
+typedef struct {uint32_t task,top,depth;uint64_t objects,generation;} HvPvgTaskView;
 int hv_pvg_lite_task_view(HvPvgLite *p,uint32_t task,HvPvgTaskView *view);
 void hv_pvg_lite_use_task_view(HvPvgLite *p,const HvPvgTaskView *view);
 int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t task, uint64_t offset, void *to, uint32_t length);
@@ -45,11 +45,9 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length);
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task);
 /* Changes on each create, even when the root/table addresses are reused. */
 uint64_t hv_pvg_lite_task_generation(HvPvgLite *p, uint32_t task);
-/* The guest's GPU driver is an older one (macOS 14 seen): no object list command, compact surface descriptions. */
-int hv_pvg_lite_old_driver(HvPvgLite *p);
-/* Sonoma's older guest protocol has a fixed object table and surface layout. */
-int hv_pvg_lite_legacy_surfaces(HvPvgLite *p, uint32_t task);
-/* A surface's descriptor (1 KB), or NULL if the mapper has none for it. */
+/* The mapper selected compact 512-byte descriptors instead of 1 KiB descriptors. */
+int hv_pvg_lite_compact_surfaces(HvPvgLite *p);
+/* A surface descriptor in the mapper's selected format, or NULL. */
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping);
 /* Mapper entries complete behind preceding accepted GPU work. */
 void hv_pvg_metal_mapper(HvPvgMetal *m,uint32_t operation,uint32_t mapping,uint64_t completed_index);

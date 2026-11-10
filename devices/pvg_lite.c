@@ -84,7 +84,6 @@ struct HvPvgLite {
     int mapper_pending;
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
-    int old_driver; /* macOS 14's (and older?) GPU driver: object lists at a fixed place, compact surface descriptions */
     uint8_t obj_seen[512][8192];
     int tally;
     uint64_t counts[6][256];
@@ -115,7 +114,7 @@ int hv_pvg_lite_task_view(HvPvgLite *p,uint32_t task,HvPvgTaskView *view){
     if(task>=512||!p->task_root[task])return -1;
     uint32_t *root=hv_phys_ptr(p->m,(uint64_t)p->task_root[task]<<14,0x4000);
     if(!root||root[1]<1||root[1]>3)return -1;
-    *view=(HvPvgTaskView){.task=task,.top=root[0],.depth=root[1],.legacy=!p->task_objects[task],
+    *view=(HvPvgTaskView){.task=task,.top=root[0],.depth=root[1],
         .objects=p->task_objects[task]?:0x4000,.generation=__atomic_load_n(&p->task_generation[task],__ATOMIC_ACQUIRE)};
     return 0;
 }
@@ -393,22 +392,15 @@ void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length) {
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task) {
     if(task_view_selected(p,task))return worker_view.objects;
     if (task >= 512) return 0;
-    if (!p->task_objects[task] && p->task_root[task]) {
-        if (!p->old_driver) {
-            p->old_driver = 1;
-            fprintf(stderr, "hengevm: pvg-lite: an older guest GPU driver (no object list command): its own layouts\n");
-        }
-        return OLD_DRIVER_OBJECTS;
-    }
+    if (!p->task_objects[task] && p->task_root[task]) return OLD_DRIVER_OBJECTS;
     return p->task_objects[task];
 }
 
-int hv_pvg_lite_legacy_surfaces(HvPvgLite *p, uint32_t task) {
-    if(task_view_selected(p,task))return worker_view.legacy;
-    return task < 512 && !p->task_objects[task] && hv_pvg_lite_task_objects(p, task) == 0x4000;
+int hv_pvg_lite_compact_surfaces(HvPvgLite *p) {
+    /* The mapper negotiates descriptor layout independently of GPU task
+       object tables. Async replay can use captured object tables exclusively. */
+    return !(__atomic_load_n(&p->io_regs[0x30 / 8], __ATOMIC_ACQUIRE) & 1);
 }
-
-int hv_pvg_lite_old_driver(HvPvgLite *p) { return p->old_driver; }
 
 /* A stamp Metal finished: the guest sees it and the next poll raises the interrupt. */
 void hv_pvg_lite_complete(HvPvgLite *p, uint32_t ch, uint32_t stamp) {
@@ -616,7 +608,7 @@ const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping) {
        register is clear, and 0x400-byte descriptors when it is set. Using
        0x400 unconditionally makes slot 2 read slot 4's descriptor in the
        first form, pairing a scanout view with an unrelated small surface. */
-    uint32_t stride = (p->io_regs[0x30 / 8] & 1) ? 0x400 : 0x200;
+    uint32_t stride = hv_pvg_lite_compact_surfaces(p) ? 0x200 : 0x400;
     uint32_t per_page = 0x4000 / stride;
     uint32_t *e = table ? hv_phys_ptr(p->m, table + (mapping / per_page) * 4ull, 4) : NULL;
     if (!e || !(*e & 1)) return NULL;
@@ -738,7 +730,7 @@ static void do_mapper(HvPvgLite *p) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
             if (!e || !t) continue;
-            uint32_t stride = (p->io_regs[0x30 / 8] & 1) ? 0x400 : 0x200;
+            uint32_t stride = hv_pvg_lite_compact_surfaces(p) ? 0x200 : 0x400;
             uint32_t per_page = 0x4000 / stride;
             fprintf(stderr, "pvgmap op %u id %u form %u table %x %x %x %x\n",
                     e[0], e[1], stride, t[0], t[1], t[2], t[3]);
@@ -827,13 +819,15 @@ static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
     (void)size;
     if (off == 0x1028) return 1;
     if (off == 0x1020) return __atomic_load_n(&p->io_regs[0x20/8],__ATOMIC_ACQUIRE);
+    if (off == 0x1030) return __atomic_load_n(&p->io_regs[0x30 / 8], __ATOMIC_ACQUIRE);
     return off >= 0x1000 && off < 0x1040 ? p->io_regs[(off - 0x1000) / 8] : 0;
 }
 
 static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvPvgLite *p = opaque;
     (void)size;
-    if (off >= 0x1000 && off < 0x1040) p->io_regs[(off - 0x1000) / 8] = v;
+    if (off == 0x1030) __atomic_store_n(&p->io_regs[0x30 / 8], v, __ATOMIC_RELEASE);
+    else if (off >= 0x1000 && off < 0x1040) p->io_regs[(off - 0x1000) / 8] = v;
     if (off == 0x1018) do_mapper(p);
 }
 

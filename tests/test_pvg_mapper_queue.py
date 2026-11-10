@@ -18,7 +18,7 @@ static void*hv_phys_ptr(Machine*m,uint64_t at,uint64_t n){return at+n<=sizeof m-
 static int hv_pvg_metal_reserve(void*m,uint32_t n){(void)m;(void)n;if(!budget)return 0;budget--;return 1;}
 static void hv_pvg_metal_mapper(void*m,uint32_t op,uint32_t mapping,uint64_t index){(void)m;(void)op;(void)mapping;sent[count++]=index;}
 static void hv_gicv3_pend(void*g,int n){(void)g;(void)n;irq++;}
-'''+function('do_mapper')+function('hv_pvg_lite_mapper_complete')+'''
+'''+function('hv_pvg_lite_compact_surfaces')+function('do_mapper')+function('hv_pvg_lite_mapper_complete')+'''
 #define C(x)do{checks++;if(!(x)){fprintf(stderr,"failed:%d\\n",__LINE__);return 1;}}while(0)
 int main(){unsigned checks=0;Machine m={0};HvPvgLite p={.m=&m,.metal=(void*)1};p.io_regs[0]=16;p.io_regs[1]=8;p.io_regs[3]=3;for(int i=0;i<3;i++){uint32_t*e=(uint32_t*)(m.mem+16+i*16);e[0]=i+1;e[1]=99;}
  budget=1;do_mapper(&p);C(count==1&&sent[0]==1);C(p.mapper_submitted==1);C(p.mapper_pending);C(p.io_regs[4]==0&&irq==0);

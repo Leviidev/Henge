@@ -39,6 +39,12 @@ typedef struct HvPvgLite {
 '''
 body = preamble
 body += function(lite, 'static void task_created(')
+if 'task_view_selected(p,task)' in function(lite, 'uint64_t hv_pvg_lite_task_generation('):
+    body += """typedef struct { uint32_t task; uint64_t generation; } HvPvgTaskView;
+static _Thread_local HvPvgLite *view_owner;
+static _Thread_local HvPvgTaskView worker_view;
+"""
+    body += function(lite, 'static int task_view_selected(')
 body += function(lite, 'uint64_t hv_pvg_lite_task_generation(')
 body += function(metal, 'static void task_cache_generation(')
 body += function(metal, 'static BOOL task_cache_lifecycle(')

@@ -1474,7 +1474,7 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
     /* macOS 15 and later: u64 allocation, width, height and row at 0x18..0x30, plane count at 0x3e, first byte at 0x60.
        macOS 14's driver writes a compact one: u32 allocation at 0x10, width and height << 8 at 0x14 and 0x18, u32 row
        at 0x1c, bytes per pixel at 0x20 (BGRA 1920x1080: 007ec000 00078080 00043880 00001e00 00000004); one plane. */
-    BOOL compact = hv_pvg_lite_old_driver(lite) != 0;
+    BOOL compact = hv_pvg_lite_compact_surfaces(lite) != 0;
     uint32_t compact_planes = 1;
     if (compact) memcpy(&compact_planes, desc + 0x24, 4);
     uint8_t planes = compact ? (uint8_t)MIN(MAX(compact_planes, 1u), 4u) : desc[0x3e];
@@ -1578,7 +1578,7 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
    strip, then the 1920x1080 half-float screen). */
 - (HvObject *)currentSurface:(uint64_t)mapping {
     HvObject *surface = surfaces[@(mapping)];
-    if (surface && hv_pvg_lite_old_driver(lite)) {
+    if (surface && hv_pvg_lite_compact_surfaces(lite)) {
         const uint8_t *now = hv_pvg_lite_surface(lite, (uint32_t)mapping);
         if (now && (now[0] | now[0x10]) && memcmp(surface->described, now, sizeof surface->described)) {
             release_planar_alias(planar, planar_uses, surface);
@@ -1733,7 +1733,7 @@ static void probe_yuv_texture(HvReplay *replay, id<MTLDevice> device, id<MTLComm
     if (o && !memcmp(o->entry, e, 12)) {
         /* macOS 14's driver names a surface before it writes the surface's description: try again a while.
            And it reuses surface ids: a texture over a surface that has since been replaced is made again. */
-        BOOL replaced = o->object && (e[0] & 0xff) == OBJ_MAPPED_TEXTURE && hv_pvg_lite_old_driver(lite) &&
+        BOOL replaced = o->object && (e[0] & 0xff) == OBJ_MAPPED_TEXTURE && hv_pvg_lite_compact_surfaces(lite) &&
                         o->surface != canonical_surface([self currentSurface:o->on_mapping]);
         if (replaced) o->retries = 0;
         if ((!o->object || replaced) && (e[0] & 0xff) == OBJ_MAPPED_TEXTURE && o->retries < 600) {
@@ -3190,7 +3190,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 }
 
 - (void)showOnLayer:(uint64_t)mapping {
-    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_compact_surfaces(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
@@ -3437,7 +3437,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         return;
     }
     late = NO;
-    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_compact_surfaces(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     last_capture = now;
     [last_cb waitUntilCompleted]; /* the CPU copies the pixels here, so the GPU must be done with them */
