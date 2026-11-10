@@ -111,17 +111,17 @@ static const void *surface_read_physical(void *context, uint64_t address, uint64
     uint32_t first;
     uint32_t surface_w, surface_h, fourcc; /* its own, whatever views the guest makes of it */
     id<MTLTexture> scanout; /* the same pixels, as the display reads them */
-    /* Multi-plane surfaces cannot sit on a buffer: a real IOSurface, kept up to date from the guest's pages. */
+    /* Surfaces that cannot sit on a linear Metal buffer use a copied IOSurface. */
     IOSurfaceRef iosurface;
     uint64_t alloc;
     id<MTLBuffer> surface_shadow_buffer;
     uint8_t *surface_shadow; /* shared buffer: last uploaded or GPU-copied guest contents */
     BOOL surface_shadow_valid;
     __weak id<MTLCommandBuffer> surface_pending; /* only this surface's preceding copyback */
-    /* Source layout for a multi-plane video surface. */
+    /* Source layout of each copied plane in the guest's pages. */
     uint32_t plane_count;
     uint64_t plane_from[4], plane_row[4], plane_h[4], plane_w[4], plane_bpe[4];
-    HvObject *surface_owner; /* shared planar pixels and copyback state */
+    HvObject *surface_owner; /* shared IOSurface pixels and copyback state */
     id<MTLTexture> plane_textures[4]; /* canonical full-plane views, never HvObject parents */
     /* A heap: private memory, a buffer over all of it. */
     id<MTLBuffer> heap_whole;
@@ -1301,6 +1301,42 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
     return made;
 }
 
+/* The guest can use 16-byte row alignment for small RGBA/BGRA surfaces.
+   Give Metal its preferred stride while preserving the guest layout for copyback. */
+static IOSurfaceRef make_packed_iosurface(HvObject *surface, id<MTLDevice> device,
+                                        uint64_t width, uint64_t height, uint64_t alloc) {
+    if (!surface->object || (surface->fourcc != 'RGBA' && surface->fourcc != 'BGRA')) return NULL;
+    MTLPixelFormat format = surface->fourcc == 'RGBA' ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatBGRA8Unorm;
+    NSUInteger alignment = [device minimumLinearTextureAlignmentForPixelFormat:format];
+    if (!alignment || (surface->row % alignment == 0 && surface->first % alignment == 0)) return NULL;
+    HvPvgSurfaceCopyback plan;
+    if (!hv_pvg_surface_copyback_plan(surface->first, alloc, surface->length, 0,
+                                     surface->row, width, height, 4, &plan)) return NULL;
+    size_t hostRow = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow,
+                                          (plan.active_row + alignment - 1) / alignment * alignment);
+    NSDictionary *plane = @{(__bridge id)kIOSurfacePlaneWidth:@(width),
+        (__bridge id)kIOSurfacePlaneHeight:@(height), (__bridge id)kIOSurfacePlaneBytesPerElement:@4,
+        (__bridge id)kIOSurfacePlaneBytesPerRow:@(hostRow), (__bridge id)kIOSurfacePlaneOffset:@0,
+        (__bridge id)kIOSurfacePlaneSize:@(hostRow * height)};
+    NSDictionary *properties = @{(__bridge id)kIOSurfaceWidth:@(width),
+        (__bridge id)kIOSurfaceHeight:@(height), (__bridge id)kIOSurfacePixelFormat:@(surface->fourcc),
+        (__bridge id)kIOSurfacePlaneInfo:@[plane]};
+    IOSurfaceRef made = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+    if (!made) return NULL;
+    if (IOSurfaceGetPlaneCount(made) != 1 || IOSurfaceGetWidthOfPlane(made, 0) != width ||
+        IOSurfaceGetHeightOfPlane(made, 0) != height || IOSurfaceGetBytesPerElementOfPlane(made, 0) != 4 ||
+        IOSurfaceGetBytesPerRowOfPlane(made, 0) < plan.active_row) {
+        CFRelease(made);
+        return NULL;
+    }
+    surface->plane_count = 1;
+    surface->plane_w[0] = width;
+    surface->plane_h[0] = height;
+    surface->plane_row[0] = surface->row;
+    surface->plane_bpe[0] = 4;
+    return made;
+}
+
 static HvObject *canonical_surface(HvObject *surface) {
     return surface && surface->surface_owner ? surface->surface_owner : surface;
 }
@@ -1527,9 +1563,10 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
                                            deallocator:^(void *at, NSUInteger size) { vm_deallocate(mach_task_self(), (vm_address_t)at, size); }];
     surface->mapping_in_buffer = surface->object != nil;
     surfaces[key] = surface;
-    if (planes >= 2) {
+    IOSurfaceRef made = planes >= 2 ? make_iosurface(surface, desc, alloc, compact)
+                                    : make_packed_iosurface(surface, device, sw, sh, alloc);
+    if (made) {
         surface->alloc = alloc;
-        IOSurfaceRef made = make_iosurface(surface, desc, alloc, compact);
         /* The same guest memory, format and size under another mapping id (another process): the same host
            IOSurface, or what that process drew is not what this one sees. Its pixels are already there (or
            drawn over since), so they are not copied again now. */
@@ -1551,7 +1588,7 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
         NSString *pk = [NSString stringWithFormat:@"%@/%08x/%llux%llu/%llu/%u/%llu", pageID, surface->fourcc,
                         sw, sh, alloc, first, row];
         HvObject *shared = planar[pk];
-        if (shared && made) {
+        if (shared) {
             CFRelease(made);
             surface->surface_owner = shared;
             surface->iosurface = (IOSurfaceRef)CFRetain(shared->iosurface);
@@ -1559,12 +1596,10 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
             planar_uses[pk] = @(planar_uses[pk].unsignedIntValue + 1);
         } else {
             surface->iosurface = made;
-            if (made) {
-                if (planar.count >= 512) [planar removeAllObjects], [planar_uses removeAllObjects];
-                planar[pk] = surface;
-                planar_uses[pk] = @1;
-                surface->planar_key = pk;
-            }
+            if (planar.count >= 512) [planar removeAllObjects], [planar_uses removeAllObjects];
+            planar[pk] = surface;
+            planar_uses[pk] = @1;
+            surface->planar_key = pk;
         }
         sync_iosurface(surface, device);
     }
@@ -1678,6 +1713,14 @@ static void probe_yuv_texture(HvReplay *replay, id<MTLDevice> device, id<MTLComm
             t.width > IOSurfaceGetWidthOfPlane(surface->iosurface, plane) ||
             t.height > IOSurfaceGetHeightOfPlane(surface->iosurface, plane)) {
             [self complain:[NSString stringWithFormat:@"surface %llu: invalid plane %lu for view %lux%lu", h.mapping, (unsigned long)plane, (unsigned long)t.width, (unsigned long)t.height]];
+            return;
+        }
+        if (surface->plane_count == 1 &&
+            (t.textureType != MTLTextureType2D || t.mipmapLevelCount != 1 || t.sampleCount != 1 ||
+             t.arrayLength != 1 || (t.pixelFormat != MTLPixelFormatRGBA8Unorm &&
+             t.pixelFormat != MTLPixelFormatRGBA8Unorm_sRGB && t.pixelFormat != MTLPixelFormatBGRA8Unorm &&
+             t.pixelFormat != MTLPixelFormatBGRA8Unorm_sRGB))) {
+            [self complain:[NSString stringWithFormat:@"surface %llu: incompatible packed RGB view", h.mapping]];
             return;
         }
         o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:plane];
@@ -3201,10 +3244,13 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
                                                                                      width:surface->surface_w height:surface->surface_h mipmapped:NO];
         t.storageMode = MTLStorageModeShared;
         t.usage = MTLTextureUsageShaderRead;
-        if (linear_texture_fits(device, t, surface->first, surface->row, ((id<MTLBuffer>)surface->object).length))
+        if (surface->iosurface && surface->plane_count == 1)
+            surface->scanout = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:0];
+        else if (linear_texture_fits(device, t, surface->first, surface->row, ((id<MTLBuffer>)surface->object).length))
             surface->scanout = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
         if (!surface->scanout) { [self complain:[NSString stringWithFormat:@"no scanout for surface %llu, row %llu", mapping, surface->row]]; return; }
     }
+    if (surface->iosurface && surface->plane_count == 1) sync_iosurface(surface, device);
     os_unfair_lock_lock(&screen_lock);
     screen_tex = surface->scanout, screen_half = half, screen_w = surface->surface_w, screen_h = surface->surface_h;
     screen_dirty = YES;
