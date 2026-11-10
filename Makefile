@@ -254,3 +254,8 @@ $(B)/agx_journal_%.metallib: tests/agx_journal/normal_%.metal | $(B)
 	xcrun -sdk macosx metallib $(B)/agx_journal_$*.air -o $@
 test-agx-journal: $(B)/test_agx_journal $(B)/agx_journal_a.metallib $(B)/agx_journal_b.metallib
 	$(B)/test_agx_journal $(B)/agx-journal-$$(date +%s)-$$$$ $(B)/agx_journal_a.metallib $(B)/agx_journal_b.metallib
+
+# Execute the actual replay lifetime helpers without GPU or device calls.
+test-pvg-task-lifecycle:
+	python3 tests/test_pvg_task_lifecycle.py
+.PHONY: test-pvg-task-lifecycle

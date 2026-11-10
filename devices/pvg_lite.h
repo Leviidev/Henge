@@ -31,6 +31,8 @@ uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset);
 uint8_t *hv_pvg_lite_page(HvPvgLite *p, uint32_t guest_page);
 void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length);
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task);
+/* Changes on each create, even when the root/table addresses are reused. */
+uint64_t hv_pvg_lite_task_generation(HvPvgLite *p, uint32_t task);
 /* The guest's GPU driver is an older one (macOS 14 seen): no object list command, compact surface descriptions. */
 int hv_pvg_lite_old_driver(HvPvgLite *p);
 /* Sonoma's older guest protocol has a fixed object table and surface layout. */

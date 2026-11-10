@@ -14,14 +14,16 @@ The logical changes are separate commits:
    lifetime/layout and GPU copyback, with authored controls.
 4. Portable diagnostic sources and fixture generation, configurable dependencies,
    source/build manifests and guarded TrollStore update/health/rollback tools.
-5. Late render attachment store actions, independently checked by parser/native
+5. Replay task create/destroy identity and epoch invalidation, with an actual
+   four-process ABBA reuse gate and portable Foundation-only controls.
+6. Late render attachment store actions, independently checked by parser/native
    Metal controls and actual guest clear/GLSL/readback evidence.
-6. Opt-in AGX selected-byte/pipeline provenance. This is diagnostics, not a driver
+7. Opt-in AGX selected-byte/pipeline provenance. This is diagnostics, not a driver
    crash repair or a change to Metal-object retention.
-7. Optional VLC source patches and independent source rebuild/export controls.
-8. Optional process-scoped OpenGL discovery and native app launcher; system renderer
+8. Optional VLC source patches and independent source rebuild/export controls.
+9. Optional process-scoped OpenGL discovery and native app launcher; system renderer
    registration remains unchanged and clip-space limitations remain explicit.
-9. Optional stateless compute dynamic-library adapter and authenticated compiler.
+10. Optional stateless compute dynamic-library adapter and authenticated compiler.
 
 Upstream reconciliation retains its trackpad finger-frame path, legacy record
 fallback, descriptor-reuse handling, planar aliases and ordered GPU teardown.

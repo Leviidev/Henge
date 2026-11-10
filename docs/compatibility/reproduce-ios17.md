@@ -145,8 +145,10 @@ python3 tools/compat/ipad_update.py update --plan .compat-local/preflight \
   --output .compat-local/update-receipt
 ```
 
-Use your own paths; neither command above has been run against another device by
-this packaging work. `--app-control` and `--host-key-alias` are configurable.
+Use your own paths. This generic preflight/update/identity flow passed on the
+tested iPad: installer exit0, unchanged disk identity, exact auxiliary hash and
+correct normalized installed code. Another target still needs its own preflight
+and manual acceptance. `--app-control` and `--host-key-alias` are configurable.
 Preflight is read-only. Update saves private candidate/rollback packages and an
 auxiliary backup, rechecks the halted state, verifies transferred bytes, performs
 an in-place install, and compares normalized executable code despite resigning.

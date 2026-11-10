@@ -79,6 +79,7 @@ struct HvPvgLite {
     CFTypeRef layer; /* retained until replaced; layer_lock serializes lazy replay handoff */
     os_unfair_lock layer_lock;
     int layer_set; /* an explicit NULL also overrides the renderer's Mac test layer */
+    uint64_t task_generation[512]; /* creation epoch, including reused roots */
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
     int old_driver; /* macOS 14's (and older?) GPU driver: object lists at a fixed place, compact surface descriptions */
@@ -91,6 +92,20 @@ struct HvPvgLite {
     int metal_tried;
     uint32_t stamps_pending; /* channels Metal finished, for the next poll */
 };
+
+/* A create starts a new identity even if the allocator reuses the root page.
+   Called only on the device side; never clear these fields from a delayed
+   Metal-worker destroy, which might follow publication of a newer create. */
+static void task_created(HvPvgLite *p, uint32_t task, uint32_t root) {
+    p->task_objects[task] = 0;
+    p->task_placement[task] = 0;
+    p->task_root[task] = root;
+    __atomic_add_fetch(&p->task_generation[task], 1, __ATOMIC_RELEASE);
+}
+
+uint64_t hv_pvg_lite_task_generation(HvPvgLite *p, uint32_t task) {
+    return task < 512 ? __atomic_load_n(&p->task_generation[task], __ATOMIC_ACQUIRE) : 0;
+}
 
 /* What the guest's GetDeviceInfo asks for: key, value pairs, as the framework
    answers on an Apple GPU. */
@@ -128,7 +143,7 @@ static void do_root(HvPvgLite *p) {
             uint32_t *id = guest32(p, buf + off + (at + 12) % ring), *page = guest32(p, buf + off + (at + 24) % ring);
             if (id && page && *id >> 1 < 512) {
                 uint32_t task = *id >> 1;
-                p->task_root[task] = *page;
+                task_created(p, task, *page);
             }
         }
         if ((hdr[0] & 0xffff) == 0x3a && hdr[1] >= 24) {
@@ -541,11 +556,11 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
             fprintf(stderr, "\n");
         }
     }
-    if (op == 0x38) {
+    if (op == 0x38 && n >= 16) {
         ring_read(p, table, size, rd + 12 + skip, args, 16);
         if (args[0] >> 1 < 512) {
             uint32_t task = args[0] >> 1;
-            p->task_root[task] = args[3];
+            task_created(p, task, args[3]);
         }
         return;
     }

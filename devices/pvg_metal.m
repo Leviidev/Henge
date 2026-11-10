@@ -138,6 +138,30 @@ static const void *surface_read_physical(void *context, uint64_t address, uint64
 }
 @end
 
+/* Worker-owned object identities must not survive a task lifetime. Root-ring
+   creates are noticed through the device creation epoch as well. */
+static void task_cache_generation(NSMutableDictionary *tasks, uint64_t *seen,
+                                  uint32_t task, uint64_t generation) {
+    if (seen[task] != generation) {
+        [tasks removeObjectForKey:@(task)];
+        seen[task] = generation;
+    }
+}
+
+static BOOL task_cache_lifecycle(NSMutableDictionary *tasks, uint32_t op,
+                                 const uint32_t *args, uint32_t n) {
+    if (op == 0x20 && n >= 4) {
+        /* Destroy carries the direct task ID; only create encodes ID << 1. */
+        [tasks removeObjectForKey:@(args[0])];
+        return YES;
+    }
+    if (op == 0x38 && n >= 16) {
+        [tasks removeObjectForKey:@(args[0] >> 1)];
+        return YES;
+    }
+    return NO;
+}
+
 @class HvContext;
 
 @interface HvReplay : NSObject {
@@ -147,6 +171,7 @@ static const void *surface_read_physical(void *context, uint64_t address, uint64
     id<MTLCommandQueue> queue;
     dispatch_queue_t worker;
     NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, HvObject *> *> *tasks;
+    uint64_t task_generations[512]; /* worker-owned cache epochs */
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *mapped_textures;
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *fallback_textures;
     NSMutableSet<NSNumber *> *scanout_mappings;
@@ -1573,7 +1598,8 @@ static void probe_yuv_texture(id<MTLDevice> device, id<MTLCommandQueue> queue, i
 }
 
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task {
-    if (!ref) return nil;
+    if (!ref || task >= 512) return nil;
+    task_cache_generation(tasks, task_generations, task, hv_pvg_lite_task_generation(lite, task));
     uint64_t list = hv_pvg_lite_task_objects(lite, task);
     uint32_t e[3];
     if (!list || hv_pvg_lite_task_read(lite, task, list + (uint64_t)ref * 12, e, 12)) return nil;
@@ -3448,8 +3474,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                 } else if (op == 0x3f) {
                     /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                        until the system needs the memory. Here they just stay. */
-                } else if (op == 0x20 && n >= 4) {
-                    [r->tasks removeObjectForKey:@(args[0] >> 1)];
+                } else if (task_cache_lifecycle(r->tasks, op, args, n)) {
+                    /* Ordered invalidation; guest stamps still follow normal completion. */
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
