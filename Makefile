@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_virtio_discard
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -102,6 +102,13 @@ test-vm-lifecycle: $(B)/test_vm_lifecycle
 
 $(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) -fobjc-arc $^ $(METAL_LIBS) -o $@
+
+# Offline auxiliary DISCARD test; the backend wrapper injects ordered stalls and
+# I/O failures while retaining the actual file implementation and block worker.
+$(B)/test_discard_disk.o: host/disk.c host/disk.h core/machine.h | $(B)
+	$(CC) $(CFLAGS) -Dhv_disk_write=fixture_disk_write_real -Dhv_disk_flush=fixture_disk_flush_real -c $< -o $@
+$(B)/test_virtio_discard: tests/test_virtio_discard.c $(B)/virtio.o $(B)/virtio_blk.o $(B)/test_discard_disk.o
+	$(CC) $(CFLAGS) $^ -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@

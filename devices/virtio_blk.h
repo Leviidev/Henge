@@ -36,7 +36,7 @@ typedef struct HvVirtioBlk {
     uint32_t completed;  /* workers: requests done (in any order) */
     uint32_t claimed;    /* workers: requests taken (under mu) */
     int inflight;        /* taken, not done */
-    int fence;           /* a flush or barrier waits for everything before it: nothing else is taken meanwhile */
+    int fence;           /* flush/discard/barrier waits for earlier work; nothing else is taken meanwhile */
     pthread_cond_t done_cv;
     uint32_t published;  /* CPU thread: completions pushed to the used ring */
     pthread_mutex_t mu;

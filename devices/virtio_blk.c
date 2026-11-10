@@ -10,12 +10,21 @@
 #define F_RO (1ull << 5)
 #define F_BLK_SIZE (1ull << 6)
 #define F_FLUSH (1ull << 9)
+#define F_DISCARD (1ull << 13)
 
 #define T_IN 0
 #define T_OUT 1
 #define T_FLUSH 4
 #define T_GET_ID 8
+#define T_DISCARD 11
 #define T_APPLE_BARRIER 0x10000
+
+/* Only offered on writable auxiliary storage. Apple's panic-log reader clears
+   its namespace through DISCARD; without it the guest reports a successful
+   no-op and exports the same old panic again at every boot. Deterministic zero
+   reads are our stronger compatibility behavior, not a generic DISCARD promise. */
+#define DISCARD_MAX_SECTORS 65536u /* 32 MiB per range */
+#define DISCARD_MAX_SEG 8u
 
 #define S_OK 0
 #define S_IOERR 1
@@ -53,6 +62,51 @@ static uint32_t readable(const HvVirtqElem *e) {
     return n;
 }
 
+static uint8_t discard(HvVirtioBlk *b, const HvVirtqElem *e) {
+    struct { uint64_t sector; uint32_t num_sectors, flags; } ranges[DISCARD_MAX_SEG];
+    HvVirtio *v = &b->vio;
+    if (b->disk->readonly) return S_IOERR;
+    if (!(v->features & v->driver_features & F_DISCARD)) return S_UNSUPP;
+
+    /* Validate the entire chain and take a bounded snapshot before changing the
+       file. A malformed later range must not erase an earlier valid range. */
+    if (e->nseg < 2 || e->nseg > HV_VIRTQ_MAX_SEGS) return S_IOERR;
+    uint64_t bytes = 0;
+    for (int s = 0; s < e->nseg; s++) {
+        const HvVirtqSeg *g = &e->seg[s];
+        if (s == e->nseg - 1) {
+            if (!g->write || g->len != 1) return S_IOERR;
+        } else {
+            if (g->write) return S_IOERR;
+            bytes += g->len;
+            if (bytes > 16 + sizeof ranges) return S_IOERR;
+        }
+        if (g->len && (g->addr > UINT64_MAX - g->len || !hv_phys_ptr(v->m, g->addr, g->len))) return S_IOERR;
+    }
+    if (bytes <= 16 || (bytes - 16) % sizeof ranges[0]) return S_IOERR;
+    uint32_t count = (uint32_t)((bytes - 16) / sizeof ranges[0]);
+    if (hv_virtq_read(v, e, 16, ranges, (uint32_t)(bytes - 16)) != bytes - 16) return S_IOERR;
+    uint64_t capacity = b->disk->size / 512;
+    /* All writes also have to fit the signed file-offset type used by pwrite. */
+    if (b->disk->offset > INT64_MAX || b->disk->size > (uint64_t)INT64_MAX - b->disk->offset) return S_IOERR;
+    for (uint32_t i = 0; i < count; i++) {
+        if (ranges[i].flags) return S_UNSUPP; /* including the WRITE_ZEROES-only unmap bit */
+        if (ranges[i].num_sectors > DISCARD_MAX_SECTORS || ranges[i].sector > capacity ||
+            ranges[i].num_sectors > capacity - ranges[i].sector) return S_IOERR;
+    }
+    static const uint8_t zero[64 * 1024];
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t off = ranges[i].sector * 512, left = (uint64_t)ranges[i].num_sectors * 512;
+        while (left) {
+            uint64_t n = left < sizeof zero ? left : sizeof zero;
+            if (hv_disk_write(b->disk, off, zero, n)) return S_IOERR;
+            off += n;
+            left -= n;
+        }
+    }
+    return S_OK;
+}
+
 /* Worker thread. */
 static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
     HvVirtio *v = &b->vio;
@@ -63,6 +117,9 @@ static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
     uint32_t data = wlen - 1; /* the status byte is the last writable one */
     uint8_t status = S_OK;
     switch (hdr.type) {
+    case T_DISCARD:
+        status = discard(b, e);
+        break;
     case T_IN:
         if (seg_io(b, e, 1, 0, hdr.sector * 512, data) != 0) status = S_IOERR;
         else *written = data;
@@ -107,7 +164,7 @@ static uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
-/* Workers take requests in order and run them in parallel; a flush or an
+/* Workers take requests in order and run them in parallel; a flush, discard or
    Apple barrier first waits for every request before it to finish, and nothing
    after it starts until it is done, so their ordering meaning holds. */
 static void *worker(void *opaque) {
@@ -128,7 +185,7 @@ static void *worker(void *opaque) {
         HvVblkReq *r = &b->ring[b->claimed % HV_VBLK_RING];
         uint32_t type = 0;
         hv_virtq_read(&b->vio, &r->e, 0, &type, 4);
-        int fence = type == T_FLUSH || type == T_APPLE_BARRIER;
+        int fence = type == T_FLUSH || type == T_APPLE_BARRIER || type == T_DISCARD;
         b->claimed++;
         if (fence) {
             b->fence = 1;
@@ -245,7 +302,9 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
     HvVirtioBlk *b = calloc(1, sizeof *b);
     if (!b) return NULL;
     HvVirtio *v = &b->vio;
-    hv_virtio_init(v, m, 2, 0x010000, 1, F_SEG_MAX | F_BLK_SIZE | F_FLUSH | (disk->readonly ? F_RO : 0));
+    int discard_enabled = apple_variant == HV_VBLK_AUX && !disk->readonly;
+    hv_virtio_init(v, m, 2, 0x010000, 1, F_SEG_MAX | F_BLK_SIZE | F_FLUSH |
+                   (disk->readonly ? F_RO : 0) | (discard_enabled ? F_DISCARD : 0));
     v->dev = b;
     v->notify = notify;
     b->disk = disk;
@@ -275,6 +334,12 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
     memcpy(v->config + 12, &seg_max, 4);
     memcpy(v->config + 20, &blk_size, 4);
     memcpy(v->config + 34, &num_queues, 2);
+    if (discard_enabled) {
+        uint32_t max_sectors = DISCARD_MAX_SECTORS, max_seg = DISCARD_MAX_SEG, alignment = 1;
+        memcpy(v->config + 36, &max_sectors, 4);
+        memcpy(v->config + 40, &max_seg, 4);
+        memcpy(v->config + 44, &alignment, 4);
+    }
     memcpy(v->config + 60, &apple_type, 4);
     v->config_len = 96;
     if (apple_variant) {

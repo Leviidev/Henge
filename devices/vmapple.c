@@ -1,5 +1,6 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
+#include "panic_candidates.h"
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -31,29 +32,13 @@ static void pvpanic_write(void *opaque, uint64_t off, uint64_t v, unsigned size)
     HvVmapple *b = opaque;
     b->panic_events = v;
     fprintf(stderr, "hengevm: guest reported a panic (pvpanic event %llx)\n", (unsigned long long)v);
-    /* The panic text, wherever the kernel formatted it (pram is not always
-       where the log ends up, e.g. in the restore OS). */
-    const char key[] = "panic(cpu ";
-    for (uint8_t *p = b->ram, *end = b->ram + b->ram_size; p && p < end;) {
-        p = memmem(p, (size_t)(end - p), key, sizeof key - 1);
-        if (!p) break;
-        size_t n = 0;
-        while (p + n < end && n < 3000 && (p[n] == '\n' || p[n] == '\t' || (p[n] >= 32 && p[n] < 127))) n++;
-        if (n > 80) {
-            /* The log goes on past NULs (backtrace, kexts): print what reads as text. */
-            char out[6001];
-            size_t k = 0;
-            for (size_t i = 0; i < 6000 && p + i < end && k < 6000; i++) {
-                uint8_t c = p[i];
-                if (c == '\n' || c == '\t' || (c >= 32 && c < 127)) out[k++] = (char)c;
-                else if (c == 0 && k && out[k - 1] != '\n') out[k++] = '\n';
-            }
-            out[k] = 0;
-            fprintf(stderr, "hengevm: panic text at PA %llx:\n%s\n", (unsigned long long)(VMAPPLE_MEM + (uint64_t)(p - b->ram)), out);
-            break;
-        }
-        p += sizeof key - 1;
-    }
+    HvPanicCandidate candidates[16];
+    size_t count=hv_panic_candidates(b->ram,b->ram_size,candidates,16);
+    fprintf(stderr,"hengevm: %zu panic text candidates (up to 16 retained; cached reports may be stale)\n",count);
+    for(size_t i=0;i<count;i++)
+        fprintf(stderr,"hengevm: panic candidate %zu at PA %llx, contiguous bytes %zu:\n%.*s\n",i,
+            (unsigned long long)(VMAPPLE_MEM+(uint64_t)(candidates[i].text-b->ram)),
+            candidates[i].length,(int)candidates[i].length,candidates[i].text);
     if (v & 1) hv_machine_halt(b->m, HV_HALT_PANIC);
 }
 
