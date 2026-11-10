@@ -245,3 +245,12 @@ test-sonoma-compat: $(COMPAT_TESTS) $(B)/test_virtio_discard
 	python3 -m unittest discover -s ios/scripts -p 'test_*.py'
 	python3 -m unittest discover -s ios/scripts -p '*_test.py'
 .PHONY: test-sonoma-compat
+
+# Opt-in provenance helper: two successful authored compiles, no GPU dispatch.
+$(B)/test_agx_journal: tests/agx_journal/normal_journal_test.m devices/pvg_agx_journal.h | $(B)
+	$(CC) $(CFLAGS) -fobjc-arc -Wno-deprecated-declarations $< -framework Foundation -framework Metal -o $@
+$(B)/agx_journal_%.metallib: tests/agx_journal/normal_%.metal | $(B)
+	xcrun -sdk macosx metal -c $< -o $(B)/agx_journal_$*.air
+	xcrun -sdk macosx metallib $(B)/agx_journal_$*.air -o $@
+test-agx-journal: $(B)/test_agx_journal $(B)/agx_journal_a.metallib $(B)/agx_journal_b.metallib
+	$(B)/test_agx_journal $(B)/agx-journal-$$(date +%s)-$$$$ $(B)/agx_journal_a.metallib $(B)/agx_journal_b.metallib

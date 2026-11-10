@@ -51,6 +51,7 @@ static int cursor_scale(void) {
 #include "pvg_store_action.h"
 #if TARGET_OS_IPHONE
 #include "pvg_shader_broker.h"
+#include "pvg_agx_journal.h"
 #endif
 
 #if !TARGET_OS_IPHONE
@@ -446,7 +447,12 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         auditFunctions[[NSString stringWithFormat:@"%llu", ref]] = @{
             @"name": function.name ?: @"",
             @"function_type": @(function.functionType),
-            @"library_identity": objc_getAssociatedObject(function, "hvLibraryID") ?: @"unknown"
+            @"library_identity": objc_getAssociatedObject(function, "hvLibraryID") ?: @"unknown",
+            @"reference_u64": [NSString stringWithFormat:@"%llu",ref],
+            @"resolved_reference_u32": @((uint32_t)ref),
+            @"object_entry_kind": @(o->entry[0] & 0xff),
+            @"object_entry_size": @(o->entry[0] >> 8),
+            @"host_class": NSStringFromClass([o->object class])
         };
     }
     return o->object;
@@ -461,6 +467,7 @@ static void capture_pipeline_attempt(NSData *bytes, NSDictionary *functions,
                                      uint32_t tag, uint32_t task, NSString *phase) {
     if (!functions || bytes.length > 1024 * 1024 || functions.count > 256) return;
     NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (![NSFileManager.defaultManager fileExistsAtPath:[documents stringByAppendingPathComponent:@"shader-audit-capture"]]) return;
     NSDictionary *record = @{@"schema":@1, @"phase":phase, @"task":@(task), @"tag":@(tag),
         @"process_id":@(getpid()), @"timestamp":@([NSDate date].timeIntervalSince1970),
         @"serialized_base64":[bytes base64EncodedStringWithOptions:0], @"function_refs":functions};
@@ -475,6 +482,7 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     static NSUInteger capturedCount, capturedBytes;
     if (bytes.length > 1024 * 1024 || functions.count > 256) return;
     NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (![NSFileManager.defaultManager fileExistsAtPath:[documents stringByAppendingPathComponent:@"shader-audit-capture"]]) return;
     NSString *folder = [documents stringByAppendingPathComponent:@"shader-pipeline-audit"];
     uint8_t hash[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, hash);
     NSMutableString *blobDigest = [NSMutableString new];
@@ -547,16 +555,18 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     __block NSError *err = nil;
     id<MTLLibrary> library = nil;
 #if TARGET_OS_IPHONE
-    NSString *libraryID = nil;
+    __block NSString *libraryID = nil;
     NSString *convertedPath = nil;
     NSString *convertedRoute = nil;
     BOOL usedConverted = NO;
+    __block NSDictionary *agxSelected = nil;
     const uint8_t *bytes = lib.bytes;
     BOOL macLibrary = lib.length >= 6 && !memcmp(bytes, "MTLB", 4) && bytes[4] == 1 && bytes[5] == 0x80;
     id (^loadConvertedLibrary)(NSData *) = ^id(NSData *candidate) {
         dispatch_data_t compiled = dispatch_data_create(candidate.bytes, candidate.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         NSError *loadError = nil;
         id loaded = [device newLibraryWithData:compiled error:&loadError];
+        if (loaded) agxSelected = hv_agx_library(candidate, libraryID, @"converted-candidate");
         if (!loaded) err = loadError ?: err;
         return loaded;
     };
@@ -592,6 +602,9 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     if (!library) {
         dispatch_data_t data = dispatch_data_create(lib.bytes, lib.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         library = [device newLibraryWithData:data error:&err];
+#if TARGET_OS_IPHONE
+        if (library) agxSelected = hv_agx_library(lib, libraryID, @"original-library");
+#endif
     }
 #if TARGET_OS_IPHONE
     if (!library && macLibrary) {
@@ -611,6 +624,7 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
             dispatch_data_t data = dispatch_data_create(candidate.bytes, candidate.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             NSError *retryError = nil;
             library = [device newLibraryWithData:data error:&retryError];
+            if (library) agxSelected = hv_agx_library(candidate, libraryID, [NSString stringWithFormat:@"metadata-relabel-stage-%d", stage]);
             if (library) [self complain:[NSString stringWithFormat:@"library: metadata relabel stage %d accepted; pipeline compatibility remains separate", stage]];
             else err = retryError ?: err;
         }
@@ -631,6 +645,11 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     }
     id<MTLFunction> function = [library newFunctionWithName:library.functionNames.firstObject];
 #if TARGET_OS_IPHONE
+    if (agxSelected && usedConverted) {
+        NSMutableDictionary *selection=[agxSelected mutableCopy];
+        selection[@"route"]=convertedRoute ?: @"converted-candidate";agxSelected=selection;
+    }
+    hv_agx_bind(function, agxSelected);
     if (function && libraryID)
         objc_setAssociatedObject(function, "hvLibraryID",
                                  [NSString stringWithFormat:@"%@:%@", libraryID,
@@ -651,13 +670,18 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     NSString *identity = objc_getAssociatedObject(original, "hvLibraryID");
     NSString *digest = [identity componentsSeparatedByString:@":"].firstObject;
     NSString *route = nil;
+    __block NSDictionary *agxSelected = nil;
     id<MTLFunction> function = hv_shader_load_converted(path.stringByDeletingLastPathComponent,
         digest, path, original.name, YES, YES, ^id(NSData *bytes) {
             dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             id<MTLLibrary> alternate = [device newLibraryWithData:data error:nil];
-            return [alternate newFunctionWithName:original.name];
+            id<MTLFunction> selected=[alternate newFunctionWithName:original.name];
+            if (selected) agxSelected=hv_agx_library(bytes, digest, @"converted-retry");
+            return selected;
         }, &route);
     if (function) {
+        if (agxSelected) { NSMutableDictionary *selection=[agxSelected mutableCopy];
+            selection[@"route"]=route ?: @"converted-retry";hv_agx_bind(function,selection); }
         if (digest) objc_setAssociatedObject(function, "hvLibraryID", [digest stringByAppendingString:@":ios-air"], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         fprintf(stderr, "hengevm: shader-broker: selected %s source=%s function=%s for pipeline retry\n",
                 route.UTF8String, digest.UTF8String, original.name.UTF8String);
@@ -682,22 +706,31 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
         ctx->replay = self, ctx->task = task;
 #if TARGET_OS_IPHONE
         NSString *auditMarker = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"shader-audit-capture"];
-        if ([NSFileManager.defaultManager fileExistsAtPath:auditMarker]) ctx->auditFunctions = [NSMutableDictionary new];
+        if ([NSFileManager.defaultManager fileExistsAtPath:auditMarker] || hv_agx_enabled()) ctx->auditFunctions = [NSMutableDictionary new];
+#endif
+#if TARGET_OS_IPHONE
+        NSMutableDictionary *agxAttempt=hv_agx_begin(all,tag,task);
+        hv_agx_phase(agxAttempt,nil,ctx->auditFunctions,@"before_deserialize",nil);
 #endif
         dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         id descriptor = tag == 0xe ? [spi newRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
                                    : [spi newTileRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx];
         if (!descriptor || ctx->failure) {
+#if TARGET_OS_IPHONE
+            hv_agx_phase(agxAttempt,nil,ctx->auditFunctions,@"descriptor_failed",nil);
+#endif
             [self complain:[NSString stringWithFormat:@"pipeline descriptor %u: %@", tag, ctx->failure]];
             return nil;
         }
         NSError *err = nil;
 #if TARGET_OS_IPHONE
         capture_pipeline_attempt(all, ctx->auditFunctions, tag, task, @"entered_driver");
+        hv_agx_phase(agxAttempt,descriptor,ctx->auditFunctions,@"first_entered_driver",nil);
 #endif
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
                               : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
 #if TARGET_OS_IPHONE
+        hv_agx_phase(agxAttempt,descriptor,ctx->auditFunctions,state?@"first_created":@"first_returned_error",err);
         if (!state && tag == 0xe) {
             MTLRenderPipelineDescriptor *rp = descriptor;
             id<MTLFunction> vertex = [self convertedFunction:rp.vertexFunction];
@@ -706,7 +739,9 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
                 if (vertex) rp.vertexFunction = vertex;
                 if (fragment) rp.fragmentFunction = fragment;
                 NSError *retryError = nil;
+                hv_agx_phase(agxAttempt,rp,ctx->auditFunctions,@"retry_entered_driver",nil);
                 state = [device newRenderPipelineStateWithDescriptor:rp error:&retryError];
+                hv_agx_phase(agxAttempt,rp,ctx->auditFunctions,state?@"retry_created":@"retry_returned_error",retryError);
                 if (state) fprintf(stderr, "hengevm: pvg-metal: retried pipeline %s with converted AIR\n",
                                    rp.fragmentFunction.name.UTF8String ?: "(no fragment)");
                 else err = retryError ?: err;
@@ -718,7 +753,9 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
             if (alternate) {
                 tp.tileFunction = alternate;
                 NSError *retryError = nil;
+                hv_agx_phase(agxAttempt,tp,ctx->auditFunctions,@"retry_entered_driver",nil);
                 state = [device newRenderPipelineStateWithTileDescriptor:tp options:MTLPipelineOptionNone reflection:nil error:&retryError];
+                hv_agx_phase(agxAttempt,tp,ctx->auditFunctions,state?@"retry_created":@"retry_returned_error",retryError);
                 if (state) fprintf(stderr, "hengevm: pvg-metal: retried tile pipeline %s with converted AIR\n", tp.tileFunction.name.UTF8String);
                 else err = retryError ?: err;
             }
@@ -784,28 +821,39 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
         ctx->replay = self, ctx->task = task;
 #if TARGET_OS_IPHONE
         NSString *auditMarker = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"shader-audit-capture"];
-        if ([NSFileManager.defaultManager fileExistsAtPath:auditMarker]) ctx->auditFunctions = [NSMutableDictionary new];
+        if ([NSFileManager.defaultManager fileExistsAtPath:auditMarker] || hv_agx_enabled()) ctx->auditFunctions = [NSMutableDictionary new];
+#endif
+#if TARGET_OS_IPHONE
+        NSMutableDictionary *agxAttempt=hv_agx_begin(all,tag,task);
+        hv_agx_phase(agxAttempt,nil,ctx->auditFunctions,@"before_deserialize",nil);
 #endif
         dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         ctx->standIn = [self computeStandIn];
         id descriptor = [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
         if (!descriptor || ctx->failure) {
+#if TARGET_OS_IPHONE
+            hv_agx_phase(agxAttempt,nil,ctx->auditFunctions,@"descriptor_failed",nil);
+#endif
             [self complain:[NSString stringWithFormat:@"compute descriptor: %@", ctx->failure]];
             return nil;
         }
         NSError *err = nil;
 #if TARGET_OS_IPHONE
         capture_pipeline_attempt(all, ctx->auditFunctions, tag, task, @"entered_driver");
+        hv_agx_phase(agxAttempt,descriptor,ctx->auditFunctions,@"first_entered_driver",nil);
 #endif
         id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
 #if TARGET_OS_IPHONE
+        hv_agx_phase(agxAttempt,descriptor,ctx->auditFunctions,state?@"first_created":@"first_returned_error",err);
         MTLComputePipelineDescriptor *cp = descriptor;
         if (!state) {
             id<MTLFunction> alternate = [self convertedFunction:cp.computeFunction];
             if (alternate) {
                 cp.computeFunction = alternate;
                 NSError *retryError = nil;
+                hv_agx_phase(agxAttempt,cp,ctx->auditFunctions,@"retry_entered_driver",nil);
                 state = [device newComputePipelineStateWithDescriptor:cp options:MTLPipelineOptionNone reflection:nil error:&retryError];
+                hv_agx_phase(agxAttempt,cp,ctx->auditFunctions,state?@"retry_created":@"retry_returned_error",retryError);
                 if (state) fprintf(stderr, "hengevm: pvg-metal: retried compute pipeline %s with converted AIR\n", cp.computeFunction.name.UTF8String);
                 else err = retryError ?: err;
             }
