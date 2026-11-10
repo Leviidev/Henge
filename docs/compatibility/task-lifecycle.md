@@ -29,8 +29,10 @@ The production lineage passed an actual iPad ABBA regression: four fresh
 processes reused task21, all four selected their correct normal/compensated
 vertex bytes and created new pipeline states. Diagnostic paired-depth controls
 passed21/21 twice; uncompensated controls still failed seven expected cases.
-This qualifies task-cache identity. It does not install the diagnostic shader
-compensation or claim the separately pending GL viewport/compiler fix.
+This qualifies task-cache identity. The separately integrated protocol3
+shader/viewport fix then passed the unmodified GL depth and image controls;
+see [paired OpenGL qualification](profiled-opengl.md). Diagnostic compensated
+shader fixtures are not the production implementation.
 
 The transport still publishes roots/list metadata before queued Metal work.
 Epoch invalidation is not a snapshot of all guest task memory and does not prove

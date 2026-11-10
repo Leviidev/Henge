@@ -134,7 +134,7 @@ not qualify dynamic render/stateful features, every app, or another OS/device.
 Source/recipe identity was unchanged between the cold and offline gates.
 
 Collect each process's exact exit status beside the result folders, using normal
-shell commands in the guest (no Python). For example, after the documented cold
+shell commands in the guest (no Python). For example, after the documented full-matrix
 control commands, preserve their statuses in `matrix.exit`, `async.exit` and
 `snapshot.exit` respectively; capture `$?` immediately, before copying/uploading
 anything. Keep `matrix-results`, `async-results` and `snapshot-results` unchanged.
@@ -144,12 +144,16 @@ same async/snapshot folder names in a separate directory.
 On the analysis Mac, independently review the collected raw readbacks:
 
 ```sh
-python3 controls/review_results.py --results /path/collected-cold \
-  --mode cold --output /path/new-cold-review.json
+python3 controls/review_results.py --results /path/collected-full \
+  --mode full --output /path/new-full-review.json
 python3 controls/review_results.py --results /path/collected-offline \
   --mode offline --output /path/new-offline-review.json
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+The `full` mode selects the 2,816-value matrix; the legacy `cold` alias means the
+same coverage and does not establish empty caches. Cache/transport lifecycle
+needs separate evidence.
 
 The reviewer decodes every raw little-endian uint32 against the authored formulas
 (alpha/beta specialization, `i*7+19`, and the replacement dependency `i*7+23`).

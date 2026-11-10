@@ -95,9 +95,12 @@ def matrix(root):
 
 def review(root, mode):
     root = Path(root).resolve()
-    require(mode in ('cold', 'offline'), 'Unknown review mode')
-    checks, exits = [], {}
+    require(mode in ('full', 'cold', 'offline'), 'Unknown review mode')
+    requested_mode = mode
     if mode == 'cold':
+        mode = 'full'  # Historical coverage-selector alias; not proof of empty caches.
+    checks, exits = [], {}
+    if mode == 'full':
         exits['matrix.exit'] = checked_exit(root, 'matrix.exit')
         checks.extend(matrix(root / 'matrix-results'))
     prefix = 'offline-' if mode == 'offline' else ''
@@ -122,10 +125,11 @@ def review(root, mode):
         name = row['case']
         require(row['expected_add'] == additions[name], 'Producer expectation differs from authored fixture')
         checks.append(raw_case(root / 'snapshot-results', row['execution'], name, 7, additions[name]))
-    require(sum(x['values'] for x in checks) == (2816 if mode == 'cold' else 1024), 'Wrong total coverage')
+    require(sum(x['values'] for x in checks) == (1024 if mode == 'offline' else 2816), 'Wrong total coverage')
     sources = ['alpha.metal', 'beta.metal', 'dynamic-source.metal', 'dynamic-consumer.metal',
                'path_runner.m', 'async_lifetime.m', 'dependency_snapshot.m']
-    return {'schema': 1, 'status': 'passed', 'mode': mode,
+    return {'schema': 1, 'status': 'passed', 'mode': mode, 'requested_mode': requested_mode,
+            'cache_state': 'Not determined: full matrix coverage does not prove an empty cache.',
             'values': sum(x['values'] for x in checks), 'checks': checks, 'exit_file_sha256': exits,
             'authored_control_sources': {name: hashlib.sha256((HERE / name).read_bytes()).hexdigest()
                                         for name in sources},
@@ -135,14 +139,15 @@ def review(root, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--results', type=Path, required=True)
-    parser.add_argument('--mode', choices=('cold', 'offline'), default='cold')
+    parser.add_argument('--mode', choices=('full', 'offline', 'cold'), default='full',
+                        help='full matrix or offline subset; cold is a legacy alias for full, not cache-state evidence')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     result = review(args.results, args.mode)
     with args.output.open('x') as output:
         json.dump(result, output, indent=2)
         output.write('\n')
-    print(f"{result['values']} raw uint32 values passed ({args.mode})")
+    print(f"{result['values']} raw uint32 values passed ({result['mode']})")
 
 
 if __name__ == '__main__':

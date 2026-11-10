@@ -23,8 +23,8 @@ remain available under their original names and retain their prior policy.
 
 ## Compiler Mac build and identity
 
-The tested host uses Xcode27.2 build27B52, its Metal toolchain, Python3.9+ and
-LLVM23.1.4 development headers/libraries. Use your own licensed SDK/toolchain;
+The tested host uses Xcode 27.2 build 27B52, its Metal toolchain, Python 3.9+ and
+LLVM 23.1.4 development headers/libraries. Use your own licensed SDK/toolchain;
 this repository does not distribute them or a compiled planner. Select the
 intended Xcode with `xcode-select`; the companion pins that selected developer
 directory for its child compilers. Supply the LLVM installation explicitly:
@@ -51,14 +51,20 @@ That is an evidence identity, not a recipe constant to paste into another setup.
 
 ## Activation and rollback
 
-1. Build/install the paired Henge source using the [guarded in-place updater](reproduce-ios17.md).
-   Preserve a known-good TIPA and its private data-preservation receipts.
-2. Close the guest applications whose pipelines will change. Stop the prior
-   static shader companion so it releases its ownership lock/lease. Save a
-   byte-for-byte private copy of Henge Documents' `shader-compiler-config.json`,
-   or explicitly record that it was absent. Preserve old recipe caches and
-   manually validated legacy libraries.
-3. Start the profiled companion in the foreground on the compiler Mac:
+1. Halt the guest normally and keep it stopped during the policy switch.
+   Closing ordinary apps is insufficient: WindowServer also owns pipelines.
+   Preserve a known-good TIPA and obtain a fresh updater preflight.
+2. Stop the prior static shader companion so it releases its ownership lock/lease.
+   Save a byte-for-byte private copy of Henge Documents'
+   `shader-compiler-config.json`, or explicitly record that it was absent.
+   Preserve old recipe caches and manually validated legacy libraries.
+3. Install the paired Henge source using the [guarded in-place updater](reproduce-ios17.md).
+   Optional prewarming must use your own sources, the final compiler recipe and
+   complete verified source/recipe/output/profile receipts. Raw converted bytes
+   alone are insufficient. The validated production sequence uploaded its
+   verified prewarm before boot; captured inputs are not distributed here.
+4. Start and verify the profiled companion **before starting/restarting the guest**.
+   Lazy first use requires a live compiler at boot. Run it in the foreground:
 
 ```sh
 python3 ios/scripts/shader_companion_profiled.py \
@@ -75,24 +81,29 @@ It does not overwrite the old manually validated legacy cache. A successful
 receipt is published after its bytes. `--local` is an isolated host test mode,
 not a device installation shortcut.
 
-4. Launch a fresh supported OpenGL process through the
+Before Start VM, verify the selected protocol3 recipe/config and fresh owned
+lease in Henge Documents through your authenticated file access. A local
+`starting` log alone does not prove the remote peer is ready.
+
+5. Start the guest, then launch a fresh supported OpenGL process through the
    [process-scoped discovery helper](../../compat/opengl-discovery/README.md).
    Protocol3 is a Henge shader-conversion policy; renderer discovery remains
    per-process. The dynamic-library HTTP compiler is separate. If using its
    cold dynamic path while protocol3 is active, keep both required compilers
    available until both cache layers have been filled and checked.
-5. Verify fresh task/function provenance and actual pixels. Stopping the
+6. Verify fresh task/function provenance and actual pixels. Stopping the
    companion with Ctrl-C revokes its owned lease but leaves protocol3 and valid
    cached outputs active. Cached offline behavior is intentional; a cold miss
    still needs the compiler and must not silently use unprofiled bytes.
 
-To deactivate, close the affected guest apps and stop the profiled companion.
+To deactivate, halt the guest normally and stop the profiled companion.
 Restore the exact previous config, or remove only that active config if it was
 originally absent. Preserve caches rather than relabel or overwrite them.
-Restart applications so task/PSO lifetimes are fresh. Start the old protocol2
-companion explicitly if uncached old-policy conversions are needed. If rolling
-back the Henge app too, restore the matching compiler policy first, then halt
-and use the same guarded TIPA update route. Never uninstall Henge or restore a
+Start the old protocol2 companion explicitly if uncached old-policy conversions
+are needed. If rolling back the Henge app too, restore the matching compiler
+policy first, then use the same guarded TIPA update route while the guest remains
+halted. Start the guest only after the selected policy/compiler is ready, so
+system and application task/PSO lifetimes are fresh. Never uninstall Henge or restore a
 stale guest disk to roll back this source change. Do not copy transformed
 protocol3 outputs into bare protocol2 legacy cache filenames.
 
@@ -113,18 +124,18 @@ controls compare Python and native validation and exercise eight load-policy
 cases without a GPU. The authored end-to-end control compiles a fresh MSL ABI
 fixture, explicitly tags its coordinate contract, converts/publishes it and
 checks bound-cache reuse/tamper rejection; it is not a captured GLSL frontend
-fixture or a GPU execution test. There are126 viewport state/math checks,
-11 lifecycle checks and977 ordinary-texture CPU sanitizer checks.
+fixture or a GPU execution test. There are 126 viewport state/math checks,
+11 lifecycle checks and 977 ordinary-texture CPU sanitizer checks.
 
 Private retained VLC AIR/metallib tests skip unless the operator supplies
 `HENGE_GL_VLC_VERTEX_IR` / `HENGE_GL_VLC_METALLIB`. No captured shader or fixture
 binary is distributed. A compiler test pass does not substitute for actual
 rendering on the target device.
 
-The production lineage independently passed all797 prewarm outputs with full
-profile bindings (eight GL profiles). That is compile/profile coverage, not797
-GPU execution tests. Actual unmodified GL controls passed21/21 depth cases twice
-and17 native-reference image cases, with no diagnostic viewport hook. VLC H.264,
-HEVC and10-bit HEVC playback also advanced through the real OpenGL layer; broader
+The production lineage independently passed all 797 prewarm outputs with full
+profile bindings (eight GL profiles). That is compile/profile coverage, not 797
+GPU execution tests. Actual unmodified GL controls passed 21/21 depth cases twice
+and 17 native-reference image cases, with no diagnostic viewport hook. VLC H.264,
+HEVC and 10-bit HEVC playback also advanced through the real OpenGL layer; broader
 media, all extensions and all applications are not thereby qualified. The
 separately reconciled latest-upstream branch still needs its own device gate.

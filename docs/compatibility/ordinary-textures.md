@@ -23,8 +23,10 @@ Run `make test-pvg-ordinary-texture` or `python3 tests/test_pvg_ordinary_texture
 There are 977 deterministic CPU checks with AddressSanitizer and UndefinedBehavior-
 Sanitizer, covering authored normal records, complete mip chains, field extraction,
 bounded truncation and unsupported-layout rejection. No GPU calls execute.
-Existing mapped-texture decoder tests remain separate. A parser pass does not
-qualify an actual guest texture-first render; that runtime gate is pending.
+Existing mapped-texture decoder tests remain separate. The original production
+lineage subsequently passed all four actual texture-first early/late clear
+readbacks with zero mismatches. This is separate from the parser checks and
+does not qualify the reconciled latest-upstream binary on-device.
 
 This change is independent of task-cache identity, the paired GL vertex/viewport
 conversion, and the unresolved historical AGX driver abort.
