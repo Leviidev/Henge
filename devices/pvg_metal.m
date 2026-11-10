@@ -599,7 +599,15 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
         }
     }
 #endif
-    if (!library) {
+    /* Preserve upstream's explicit native-Mac relabel diagnostic. Normal iOS
+       loading still prefers validated conversions before metadata fallback. */
+    const char *forcedRelabel = getenv("HV_PVG_RELABEL");
+    int forcedRelabelStage = forcedRelabel && atoi(forcedRelabel) >= 1 && atoi(forcedRelabel) <= 2 ? atoi(forcedRelabel) : 0;
+    BOOL forceNativeRelabel = NO;
+#if !TARGET_OS_IPHONE
+    forceNativeRelabel = forcedRelabelStage && !getenv("HV_PVG_NO_RELABEL");
+#endif
+    if (!library && !forceNativeRelabel) {
         dispatch_data_t data = dispatch_data_create(lib.bytes, lib.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         library = [device newLibraryWithData:data error:&err];
 #if TARGET_OS_IPHONE
@@ -615,21 +623,24 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     if (usedConverted)
         fprintf(stderr, "hengevm: shader-broker: selected %s source=%s before function creation\n",
                 convertedRoute.UTF8String, libraryID.UTF8String);
-    if (!library && macLibrary && !getenv("HV_PVG_NO_RELABEL")) {
-        const char *forced = getenv("HV_PVG_RELABEL");
-        int first = forced && atoi(forced) >= 1 && atoi(forced) <= 2 ? atoi(forced) : 1;
+#endif
+    if (!library && !getenv("HV_PVG_NO_RELABEL")) {
+        int first = forcedRelabelStage ?: 1;
         for (int stage = first; stage <= 2 && !library; stage++) {
             NSMutableData *candidate = [lib mutableCopy];
             if (hv_metallib_relabel(candidate.mutableBytes, candidate.length, stage) <= 0) continue;
             dispatch_data_t data = dispatch_data_create(candidate.bytes, candidate.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             NSError *retryError = nil;
             library = [device newLibraryWithData:data error:&retryError];
+#if TARGET_OS_IPHONE
             if (library) agxSelected = hv_agx_library(candidate, libraryID, [NSString stringWithFormat:@"metadata-relabel-stage-%d", stage]);
-            if (library) [self complain:[NSString stringWithFormat:@"library: metadata relabel stage %d accepted; pipeline compatibility remains separate", stage]];
-            else err = retryError ?: err;
+#endif
+            if (library) {
+                if (!getenv("HV_PVG_RELABEL_QUIET"))
+                    [self complain:[NSString stringWithFormat:@"library: metadata relabel stage %d accepted; pipeline compatibility remains separate", stage]];
+            } else err = retryError ?: err;
         }
     }
-#endif
     if (!library) {
         [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
         return nil;
