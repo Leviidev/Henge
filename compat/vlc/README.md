@@ -24,7 +24,7 @@ Clean source-built native regression passed all six authored cases. The original
 
 ## Promote only after the candidate passes the target GUI gate
 
-Copy the candidate, scripts, source tree hashes and validation receipts to the guest using your authenticated transport. Preserve `tools/compat/ipad_update.py` beside this package because the shared Mach-O identity helper is used. Close VLC. Test the candidate through LaunchServices with only its isolated config, so its existing LSEnvironment applies:
+Copy the candidate, `promote.pl`, `macho-content.pl`, source tree hashes and validation receipts to the guest using your authenticated transport. Guest promotion uses stock `/usr/bin/perl`, JSON::PP, Digest::SHA and standard macOS tools; it does not require Python or Xcode CLT. Check availability with `/usr/bin/perl -MJSON::PP -MDigest::SHA -e 1`. The Python equivalent is for a host with Python and also needs `tools/compat/ipad_update.py` for shared Mach-O identity. Close VLC. Test the candidate through LaunchServices with only its isolated config, so its existing LSEnvironment applies:
 
 ```sh
 open -n '/path/candidate/VLC Export Test.app' --args --config /path/candidate/vlc-export.ini
@@ -33,18 +33,18 @@ open -n '/path/candidate/VLC Export Test.app' --args --config /path/candidate/vl
 Use Convert/Stream with native H.264 and HEVC selections, AAC and MP4/MOV, then independently decode the completed outputs and save a receipt. The promotion tool takes that explicit operator-validated receipt, binds its SHA and enforces candidate/source app hashes; it does not infer GUI success from the receipt's mere existence. On the guest, use the real installed app and current user's normal VLC config path:
 
 ```sh
-python3 compat/vlc/promote.py install --candidate /path/candidate \
+/usr/bin/perl /path/promote.pl install --candidate /path/candidate \
   --app /Applications/VLC.app --config "$HOME/Library/Preferences/org.videolan.vlc/vlcrc" \
   --backup "$HOME/Library/Application Support/Henge Compatibility/VLC-before-fixes" \
   --validated-gui-receipt /path/gui-validation.json
 ```
 
-Backup must be new and on the app's filesystem. The tool refuses a running app or changed source tree, retains the complete original app by rename, preserves original preferences privately, and merges only the two decoder preferences above. It never changes CGL environment/load commands or installs a second permanent app. After promotion, double-click normal `/Applications/VLC.app` with no wrapper/config flags and repeat export, playback and audio acceptance. Save that separate installed-entry receipt.
+All Perl-tool paths must be absolute. Backup must be new and on the app's filesystem. The tool refuses a running app or changed source tree, retains the complete original app by rename, preserves original preferences privately, and merges only the two decoder preferences above. It never changes CGL environment/load commands or installs a second permanent app. After promotion, double-click normal `/Applications/VLC.app` with no wrapper/config flags and repeat export, playback and audio acceptance. Save that separate installed-entry receipt.
 
 Rollback retains both versions and restores the complete original preferences only if neither installed files nor config changed since promotion:
 
 ```sh
-python3 compat/vlc/promote.py restore \
+/usr/bin/perl /path/promote.pl restore \
   --backup "$HOME/Library/Application Support/Henge Compatibility/VLC-before-fixes" \
   --retain-current "$HOME/Library/Application Support/Henge Compatibility/VLC-export-candidate.app"
 ```
