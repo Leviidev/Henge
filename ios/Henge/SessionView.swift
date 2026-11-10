@@ -89,7 +89,8 @@ struct SessionView: View {
                         .frame(width: layout.touch.width, height: layout.touch.height)
                         .position(x: layout.touch.midX, y: layout.touch.midY)
                     if inputMode == .volumeButtons && volumeMode == .intercept {
-                        // The capture interaction stays in the SwiftUI hierarchy while the Mac runs.
+                        // The capture interaction must live in the SwiftUI hierarchy to receive
+                        // the volume-button events; it passes touches through to the trackpad.
                         CaptureInteractionView()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .allowsHitTesting(false)

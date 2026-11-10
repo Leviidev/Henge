@@ -23,11 +23,10 @@ Hosts without `hw.optional.arm.FEAT_AFP` cannot enable Rosetta in this version.
 ## Isolation and maintenance
 
 The mainline pin is
-[`764479128f804d41197d9a5b721f1584230369ff`](https://github.com/liukaixiang817/Henge/commit/764479128f804d41197d9a5b721f1584230369ff).
-It contains upstream `73a9315` plus the guest shutdown, restart and resource
-cleanup from [PR #50](https://github.com/Leviidev/Henge/pull/50). Both engines
-use that exact lifecycle bridge, including JIT reuse. The Rosetta engine also
-includes upstream `623d9f1` and its macOS 13 graphics compatibility fix.
+[`d5b8502c3c7da84462086935fa43a9c4f4f792bd`](https://github.com/Leviidev/Henge/commit/d5b8502c3c7da84462086935fa43a9c4f4f792bd).
+It is upstream main with the JIT startup and guest shutdown/restart fixes from
+PRs #46 and #50 already incorporated. Both engines use that exact lifecycle
+bridge, including JIT reuse.
 
 `tools/build_ios_engines.py` exports the pinned source from Git. The off engine
 builds its unmodified CPU, devices and host code. The on engine builds this
