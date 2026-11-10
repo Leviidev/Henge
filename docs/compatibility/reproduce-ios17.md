@@ -1,6 +1,8 @@
 # Reproducing the Sonoma / iPadOS 17 compatibility changes
 
 This branch separates Henge source fixes from optional guest VLC source patches.
+See [source series and review boundaries](patch-series.md) for clean application
+and the distinction between the device lineage and current-upstream reconciliation.
 It contains no Apple shader libraries, converted shader caches, VM disks, boot
 ROMs, credentials, signed apps, or captured user data. Regenerate authored tests
 from source and obtain your own macOS inputs. Existing diagnostic programs are
