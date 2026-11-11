@@ -236,3 +236,25 @@ ejected it and reported unchanged image identity while retaining the lease.
 No volume was mounted or written. Production root-helper operations do not invoke
 this transaction yet: mount qualification, payload delivery, activation and
 fresh-device acceptance remain unfinished.
+
+### Read-only mount qualification (not enabled for automatic startup)
+
+The native transaction can now create private temporary mount directories and
+mount the freshly selected System/Data media with `rdonly,nobrowse,noexec,nosuid`.
+It checks APFS filesystem type, exact source device and mount path, and required
+read-only/noexec/nosuid flags. Close revalidates registry ownership, unmounts Data
+then System without force, verifies the original directory inode and removes the
+temporary directories before ejection. Unknown mount identity or flags stop
+cleanup rather than unmounting an unrelated filesystem. The caller must call
+close after mount failure as well as success.
+
+Ten native mocked-boundary controls pass, including successful dual mounts,
+second-mount failure cleanup, and refusal to unmount unexpected/writable mounts.
+arm64 iPadOS compilation passes. The first physical mount test on the authored
+System/Data fixture did not return within 50 seconds; SSH subsequently refused
+connections and Xcode reported the iPad unavailable. A restart/panic is not yet
+confirmed, and no panic report has been collected. This is a failed device gate,
+not a successful mount qualification. Do not invoke this mount path in production
+startup until the device failure is understood and resolved. No production helper
+operation currently calls it; the explicit developer control flag is
+`--mount-readonly`. No existing guest disk was used in this test.

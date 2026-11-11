@@ -23,16 +23,28 @@ class GuestAttachmentTests(unittest.TestCase):
 #include <spawn.h>
 #include <sys/file.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
 #include <time.h>
 #include <unistd.h>
 static NSString *scenario;
 static int attached, launches, ejects, statusCode, inventoryCalls, timedWait, kills;
+static char mountPaths[2][PATH_MAX];
+static int mounted[2], unmounts;
 static int spawn_control(pid_t *pid, const char *path,
  const posix_spawn_file_actions_t *actions, const posix_spawnattr_t *attrs,
  char *const argv[], char *const env[]) {
  (void)actions;(void)attrs;
- if(strcmp(path,"/usr/sbin/hdik") || strcmp(env[1],"LC_ALL=C"))abort();
+ if(strcmp(env[1],"LC_ALL=C"))abort();
  launches++;*pid=123;statusCode=0;timedWait=0;
+ if(!strcmp(path,"/sbin/mount_apfs")) {
+  if(strcmp(argv[1],"-o") || strcmp(argv[2],"rdonly,nobrowse,noexec,nosuid"))abort();
+  int index=!strcmp(argv[3],"/dev/disk21s2");
+  strlcpy(mountPaths[index],argv[4],PATH_MAX);
+  if(index && [scenario isEqual:@"mount-data-fail"])statusCode=1;
+  else mounted[index]=1;
+  return 0;
+ }
+ if(strcmp(path,"/usr/sbin/hdik"))abort();
  if(!strcmp(argv[1],"-e")) {
   ejects++;
   if(strcmp(argv[2],"/dev/disk21"))abort();
@@ -56,24 +68,52 @@ static int kill_control(pid_t pid,int signal) {
 static int sleep_control(const struct timespec *delay,struct timespec *remain) {
  (void)delay;(void)remain;return 0;
 }
+static char *directory_control(char *path) {
+ strcpy(path,"/tmp/henge-mount-test-XXXXXX");return mkdtemp(path);
+}
+static int filesystem_control(const char *path,struct statfs *fs) {
+ memset(fs,0,sizeof(*fs));
+ for(int i=0;i<2;i++)if(mounted[i] && !strcmp(path,mountPaths[i])) {
+  strcpy(fs->f_fstypename,"apfs");strlcpy(fs->f_mntonname,path,sizeof(fs->f_mntonname));
+  strcpy(fs->f_mntfromname,i?"/dev/disk21s2":"/dev/disk21s1");
+  fs->f_flags=MNT_RDONLY|MNT_NOEXEC|MNT_NOSUID;
+  if([scenario isEqual:@"mount-wrong-source"])strcpy(fs->f_mntfromname,"/dev/disk999");
+  if([scenario isEqual:@"mount-writable"])fs->f_flags&=~MNT_RDONLY;
+  return 0;
+ }
+ strcpy(fs->f_mntonname,"/");return 0;
+}
+static int unmount_control(const char *path,int flags) {
+ if(flags)abort();
+ for(int i=0;i<2;i++)if(mounted[i] && !strcmp(path,mountPaths[i])) {
+  mounted[i]=0;unmounts++;return 0;
+ }
+ return -1;
+}
 int hg_guest_media_copy(const HGGuestDisk *disk,char **json,const char **error) {
  inventoryCalls++;*error=NULL;
  if(!attached){*json=strdup("[]");return 0;}
  NSDictionary *row=@{@"content":@"GUID_partition_scheme",@"whole":@YES,
  @"writable":@([scenario isEqual:@"writable"]),@"bytes":@(disk->identity.st_size),
  @"bsd_name":@"disk21",@"registry_id":@(([scenario isEqual:@"reused"] && inventoryCalls>3)?999:101)};
- NSData *bytes=[NSJSONSerialization dataWithJSONObject:@[row] options:0 error:NULL];
+ NSMutableArray *rows=[NSMutableArray arrayWithObject:row];
+ if([scenario hasPrefix:@"mount-"])for(int i=1;i<=2;i++)[rows addObject:@{
+ @"bsd_name":[NSString stringWithFormat:@"disk21s%d",i],@"registry_id":@(101+i)}];
+ NSData *bytes=[NSJSONSerialization dataWithJSONObject:rows options:0 error:NULL];
  *json=strndup(bytes.bytes,bytes.length);return 0;
 }
 int hg_guest_media_copy_volume_group(const HGGuestDisk *disk,char **json,const char **error) {
  (void)disk;
  if([scenario isEqual:@"no-group"]){*error="unsupported-volume-group";return -1;}
- *json=strdup("{\"schema\":1}");*error=NULL;return 0;
+ *json=strdup("{\"system\":{\"bsd_name\":\"disk21s1\",\"registry_id\":102},\"data\":{\"bsd_name\":\"disk21s2\",\"registry_id\":103}}");*error=NULL;return 0;
 }
 #define posix_spawn spawn_control
 #define waitpid wait_control
 #define nanosleep sleep_control
 #define kill kill_control
+#define mkdtemp directory_control
+#define statfs(path,fs) filesystem_control(path,fs)
+#define unmount unmount_control
 #include "HGGuestAttachment.m"
 int main(int argc,char **argv){@autoreleasepool{
  if(argc!=3)return 64;scenario=@(argv[2]);
@@ -82,6 +122,7 @@ int main(int argc,char **argv){@autoreleasepool{
  attached=[scenario isEqual:@"existing"];
  HGGuestAttachment a={0};char *group=NULL;const char *error=NULL,*cleanup=NULL;
  int opened=hg_guest_attachment_open(&disk,&a,&group,&error);
+ if(!opened && [scenario hasPrefix:@"mount-"])opened=hg_guest_attachment_mount_readonly(&a,&error);
  if([scenario isEqual:@"double-open"]) {
   char *second=NULL;const char *secondError=NULL;
   if(!hg_guest_attachment_open(&disk,&a,&second,&secondError) ||
@@ -89,8 +130,9 @@ int main(int argc,char **argv){@autoreleasepool{
  }
  if([scenario isEqual:@"reused"])inventoryCalls=4;
  int closed=a.disk?hg_guest_attachment_close(&a,&cleanup):0;
- printf("{\"opened\":%s,\"closed\":%s,\"attached\":%s,\"launches\":%d,\"ejects\":%d,\"kills\":%d,\"error\":\"%s\",\"cleanup\":\"%s\"}\n",
- opened?"false":"true",closed?"false":"true",attached?"true":"false",launches,ejects,kills,error?:"",cleanup?:"");
+ printf("{\"opened\":%s,\"closed\":%s,\"attached\":%s,\"launches\":%d,\"ejects\":%d,\"kills\":%d,\"unmounts\":%d,\"error\":\"%s\",\"cleanup\":\"%s\"}\n",
+ opened?"false":"true",closed?"false":"true",attached?"true":"false",launches,ejects,kills,unmounts,error?:"",cleanup?:"");
+ for(int i=0;i<2;i++)if(mountPaths[i][0])rmdir(mountPaths[i]);
  free(group);hg_guest_disk_close(&disk);return 0;
 }}
 ''')
@@ -114,6 +156,30 @@ int main(int argc,char **argv){@autoreleasepool{
         self.assertTrue(r['closed'])
         self.assertFalse(r['attached'])
         self.assertEqual(r['ejects'], 1)
+
+    def test_readonly_mounts_close_before_ejection(self):
+        r = self.run_control('mount-valid')
+        self.assertTrue(r['opened'])
+        self.assertTrue(r['closed'])
+        self.assertEqual(r['unmounts'], 2)
+        self.assertEqual(r['ejects'], 1)
+
+    def test_second_mount_failure_cleans_first_mount_and_empty_directory(self):
+        r = self.run_control('mount-data-fail')
+        self.assertFalse(r['opened'])
+        self.assertTrue(r['closed'])
+        self.assertEqual(r['unmounts'], 1)
+        self.assertFalse(r['attached'])
+
+    def test_unexpected_mount_identity_or_flags_prevent_unmount_and_eject(self):
+        for scenario in ('mount-wrong-source', 'mount-writable'):
+            with self.subTest(scenario=scenario):
+                r = self.run_control(scenario)
+                self.assertFalse(r['opened'])
+                self.assertFalse(r['closed'])
+                self.assertEqual(r['cleanup'], 'mount-cleanup-required')
+                self.assertEqual(r['unmounts'], 0)
+                self.assertEqual(r['ejects'], 0)
 
     def test_existing_attachment_is_never_ejected(self):
         r = self.run_control('existing')
