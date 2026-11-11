@@ -537,13 +537,13 @@ struct SessionView: View {
                 }
                 Section("Touch input") {
                     Toggle("Native touch (experimental)", isOn: $nativeTouch.requested)
-                    Text("Requires macOS 27.2 or later and the updated guest helper. If unavailable, the screen continues to work as a trackpad.")
+                    Text("Requires macOS 27.2 or later and the updated Henge sharing helper. Allow Local Network for Henge Sharing Agent if macOS asks. If unavailable, the screen continues to work as a trackpad.")
                         .font(.footnote).foregroundStyle(.secondary)
                     switch nativeTouch.status {
                     case 2: Text("Native touch is ready.")
                     case 3: Text("This guest needs macOS 27.2 or later. Using trackpad.")
                     case 4: Text("Allow Accessibility for henge-touch-agent in the Mac. Using trackpad.")
-                    case 5: Text("The Mac could not create its touchscreen. Check the helper’s virtual HID authorization. Using trackpad.")
+                    case 5: Text("The Mac could not connect its touchscreen. Update the helper and try again. Using trackpad.")
                     case 6: Text("The touch helper did not respond. Retrying automatically while you use the trackpad.")
                     default: Text("Trackpad is active. Native touch connects after you close Details.")
                     }

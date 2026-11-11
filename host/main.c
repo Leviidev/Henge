@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <stdlib.h>
@@ -22,6 +23,7 @@
 #include "pvg.h"
 #include "pvg_lite.h"
 #include "vm.h"
+#include "native_touch.h"
 #include "install.h"
 #include "snapshot.h"
 #include <dispatch/dispatch.h>
@@ -260,9 +262,16 @@ static void prof_dump(const char *path) {
    it is, in small steps as a hand makes: macOS accelerates big ones past the target. */
 static void pointer_to(int x, int y) {
     const uint8_t *page = hv_pvg_lite_display_page(board.pvg);
-    for (int i = 0; page && i < 1500; i++) {
-        uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
-        int dx = x - (int)(at & 0xffff), dy = y - (int)(at >> 16);
+    for (int i = 0; i < 1500; i++) {
+        int px, py;
+        if (hv_pvg_mac_pointer(&px, &py) == 0) {
+            /* The native backend owns the current cursor, including after a
+               WindowServer restart; its lightweight page can retain old data. */
+        } else if (page) {
+            uint32_t at = *(const volatile uint32_t *)(page + 0xe00);
+            px = (int)(at & 0xffff); py = (int)(at >> 16);
+        } else return;
+        int dx = x - px, dy = y - py;
         if (abs(dx) < 3 && abs(dy) < 3) break;
         int sx = dx > 16 ? 16 : dx < -16 ? -16 : dx, sy = dy > 16 ? 16 : dy < -16 ? -16 : dy;
         hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, sx);
@@ -557,7 +566,54 @@ static void *input_thread(void *unused) {
         at = ftell(f);
         line[strcspn(line, "\n")] = 0;
         int x, y;
-        if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
+        int contact_id, contact_flags, tx, ty;
+        if (sscanf(line, "native-touch-enable %d", &x) == 1) {
+            fprintf(stderr, "hengevm: native-touch epoch=%u\n", hv_native_touch_enable(x));
+        }
+        else if (!strncmp(line, "native-touch-frame ", 19)) {
+            const char *text = line + 19;
+            unsigned count = 0; int used = 0;
+            uint8_t ids[5]; double px[5], py[5];
+            int valid = sscanf(text, "%u %n", &count, &used) == 1 && count <= 5;
+            text += used;
+            for (unsigned i = 0; valid && i < count; i++) {
+                unsigned id;
+                if (sscanf(text, "%u %lf %lf %n", &id, &px[i], &py[i], &used) != 3 || id < 1 || id > 127) valid = 0;
+                else { ids[i] = (uint8_t)id; text += used; }
+            }
+            if (*text) valid = 0;
+            int accepted = valid && hv_native_touch_submit(hv_native_touch_epoch(), ids, px, py, count);
+            fprintf(stderr, "hengevm: native-touch-frame accepted=%d status=%d\n", accepted, hv_native_touch_status());
+        }
+        else if (sscanf(line, "usb-touch-connect %d", &x) == 1) {
+            fprintf(stderr, "hengevm: usb-touch-connect accepted=%d\n", hv_xhci_touchscreen_connect(board.usb, x));
+        }
+        else if (!strncmp(line, "usb-touch-report ", 17)) {
+            const char *hex = line + 17;
+            const char *digits = "0123456789abcdef";
+            uint8_t report[HV_TS_REPORT_LEN];
+            int valid = strlen(hex) == 2 * HV_TS_REPORT_LEN;
+            for (size_t i = 0; valid && i < sizeof report; i++) {
+                int hi = tolower((unsigned char)hex[2*i]), lo = tolower((unsigned char)hex[2*i+1]);
+                const char *h = strchr(digits, hi), *l = strchr(digits, lo);
+                if (!h || !l) valid = 0;
+                else report[i] = (uint8_t)((h - digits) * 16 + l - digits);
+            }
+            fprintf(stderr, "hengevm: usb-touch-report accepted=%d\n", valid && hv_xhci_touchscreen_report(board.usb, report));
+        }
+        else if (sscanf(line, "usb-touch %d %d %d %d", &contact_id, &contact_flags, &tx, &ty) == 4) {
+            uint8_t report[HV_TS_REPORT_LEN] = {1};
+            int valid = contact_id >= 0 && contact_id <= 127 && (contact_flags == 2 || contact_flags == 3) &&
+                        tx >= 0 && tx <= 32767 && ty >= 0 && ty <= 32767;
+            if (valid && contact_id) {
+                report[1] = (uint8_t)contact_flags; report[2] = (uint8_t)contact_id;
+                report[3] = tx & 255; report[4] = tx >> 8; report[5] = ty & 255; report[6] = ty >> 8;
+                report[31] = 1;
+            }
+            fprintf(stderr, "hengevm: usb-touch accepted=%d\n",
+                    valid && hv_xhci_touchscreen_report(board.usb, report));
+        }
+        else if (sscanf(line, "click %d %d", &x, &y) == 2) pointer_to(x, y), click_here();
         else if (sscanf(line, "move %d %d", &x, &y) == 2) pointer_to(x, y);
         else if (sscanf(line, "scroll %d %d", &x, &y) == 2) {
             if (y) hv_vm_mouse_wheel(y);
@@ -712,6 +768,7 @@ static void *input_thread(void *unused) {
             usleep(60000);
             key_event(125, 0);
         }
+        else if (sscanf(line, "wait-ms %d", &x) == 1 && x >= 0 && x <= 10000) usleep((unsigned)x * 1000u);
         else if (sscanf(line, "wait %d", &x) == 1) sleep((unsigned)x);
         else if (!strncmp(line, "type ", 5)) type_text(line + 5);
         else if (!strncmp(line, "prof ", 5)) prof_dump(line + 5);

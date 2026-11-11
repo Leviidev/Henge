@@ -19,5 +19,7 @@ void hv_pvg_window_run(void);
 
 /* Called from the CPU thread: delivers interrupts the framework raised. */
 void hv_pvg_poll(void);
+/* Mac test driver: current cursor from the framework-backed display. */
+int hv_pvg_mac_pointer(int *x, int *y);
 
 #endif

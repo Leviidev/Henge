@@ -27,6 +27,8 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
         var liftedAt: TimeInterval?
     }
     private var device: HIDVirtualDevice?
+    private let usb: USBTouchTransport?
+    private var started = false
     private let delegate = NativeTouchDeviceDelegate()
     private var task: Task<Void, Never>?
     private var slots: [Slot?] = Array(repeating: nil, count: NativeTouchFrame.maximumContacts)
@@ -35,10 +37,20 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
     private var lastSentReport: Data?
     private var lastDownIDs = Set<UInt8>()
     private var transitionDeadline: TimeInterval = 0
-    private let allowed: ([NativeTouchContact]) -> Bool = { $0.allSatisfy(\.isValid) && AXIsProcessTrusted() }
+    private func allowed(_ contacts: [NativeTouchContact]) -> Bool {
+        contacts.allSatisfy(\.isValid) && (usb != nil || AXIsProcessTrusted())
+    }
     var onFailure: ((String) -> Void)?
 
+    init(usb: USBTouchTransport? = nil) { self.usb = usb }
+
     func start(displayID: CGDirectDisplayID) async throws {
+        if let usb {
+            try await usb.start(displayID: displayID)
+            started = true
+            try await dispatch(report())
+            return
+        }
         guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else { throw CocoaError(.featureUnsupported) }
         let displayUUID = CFUUIDCreateString(nil, uuid) as String
         guard IOHIDCheckAccess(kIOHIDRequestTypePostEvent).rawValue == 0 else { throw CocoaError(.userCancelled) }
@@ -51,6 +63,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
         }
         self.device = device
         await device.activate(delegate: delegate)
+        started = true
         // Validate report dispatch before advertising readiness to the host.
         try await device.dispatchInputReport(data: report(), timestamp: .now)
     }
@@ -94,18 +107,26 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
         let remaining = transitionDeadline-ProcessInfo.processInfo.systemUptime
         if remaining > 0 { try? await Task.sleep(for: .seconds(remaining)) }
         releaseAll()
-        if let device {
+        if started {
             let lifted = report()
-            if lifted != lastSentReport { try? await device.dispatchInputReport(data: lifted, timestamp: .now) }
+            if lifted != lastSentReport { try? await dispatch(lifted) }
             try? await Task.sleep(for: .milliseconds(70))
             slots = Array(repeating: nil, count: NativeTouchFrame.maximumContacts)
-            try? await device.dispatchInputReport(data: report(), timestamp: .now)
+            try? await dispatch(report())
         }
+        await usb?.stop()
+        started = false
         device = nil; hadReport = false
     }
 
+    private func dispatch(_ report: Data) async throws {
+        if let usb { try await usb.send(report) }
+        else if let device { try await device.dispatchInputReport(data: report, timestamp: .now) }
+        else { throw CocoaError(.featureUnsupported) }
+    }
+
     private func tick() async throws {
-        guard let device else { return }
+        guard started else { return }
         let now = ProcessInfo.processInfo.systemUptime
         // AppKit needs time to consume each contact transition's change mask.
         guard now >= transitionDeadline else { return }
@@ -142,7 +163,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
             let downIDs = Set(slots.compactMap { $0 }.filter(\.down).map { $0.finger.id })
             for index in slots.indices where slots[index]?.down == true { slots[index]?.published = true }
             for index in slots.indices where slots[index]?.down == false && slots[index]?.liftedAt == nil { slots[index]?.liftedAt = now }
-            try await device.dispatchInputReport(data: data, timestamp: .now)
+            try await dispatch(data)
             if downIDs != lastDownIDs { transitionDeadline = ProcessInfo.processInfo.systemUptime + 0.06 }
             lastDownIDs = downIDs; lastSentReport = data
             hadReport = occupied
@@ -158,7 +179,7 @@ final class SystemNativeTouchDevice: NativeTouchDevice {
                 let slot = occupied[index]
                 let x = UInt16((min(1,max(0,slot.finger.x))*32767).rounded())
                 let y = UInt16((min(1,max(0,slot.finger.y))*32767).rounded())
-                bytes += [slot.down ? 1 : 0, slot.hidID, UInt8(x&255), UInt8(x>>8), UInt8(y&255), UInt8(y>>8)]
+                bytes += [slot.down ? 3 : 2, slot.hidID, UInt8(x&255), UInt8(x>>8), UInt8(y&255), UInt8(y>>8)]
             } else { bytes += Array(repeating: 0, count: 6) }
         }
         bytes.append(UInt8(occupied.count))

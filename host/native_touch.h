@@ -13,4 +13,19 @@ int hv_native_touch_submit(uint32_t epoch, const uint8_t *ids, const double *x, 
 /* Guest helper transport. next waits at most 250 ms; new input wakes it immediately. */
 size_t hv_native_touch_next(char *json, size_t capacity);
 void hv_native_touch_report(uint32_t epoch, int status);
+/* The emulator supplies this transport; the guest only associates the USB
+   device with its display and encodes reports. No virtual-HID grant is needed. */
+typedef struct HvNativeTouchUSB {
+    void *context;
+    int (*connect)(void *context, int connected);
+    int (*connected)(void *context);
+    int (*report)(void *context, const uint8_t report[32]);
+    void (*keepalive)(void *context);
+    int (*mapped)(void *context);
+} HvNativeTouchUSB;
+void hv_native_touch_set_usb(const HvNativeTouchUSB *transport);
+size_t hv_native_touch_usb_state(char *json, size_t capacity);
+int hv_native_touch_usb_connect(uint32_t epoch, int connected);
+int hv_native_touch_usb_mapped(uint32_t epoch);
+int hv_native_touch_usb_report(uint32_t epoch, const uint8_t report[32]);
 #endif
