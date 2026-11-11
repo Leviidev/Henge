@@ -33,7 +33,7 @@ int main(void) { @autoreleasepool {
     tasks[@26] = [@{@1:normal} mutableCopy];
     task_cache_generation(tasks,seen,26,hv_pvg_lite_task_generation(p,26));
     check(tasks[@26][@1] == normal, @"same generation retains valid cache");
-    p->task_objects[26] = 0x4000; p->task_placement[26] = 0x8000; 
+    p->task_objects[26] = 0x4000; p->task_placement[26] = 0x8000;
 #if HV_TEST_HAS_LEGACY_TABLE
     p->legacy_object_table[26] = 1;
 #endif
