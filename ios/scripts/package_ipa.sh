@@ -12,6 +12,9 @@ TROLLSTORE=false
 OUT="${HENGE_IPA_OUTPUT:-$HOME/Desktop/Henge.ipa}"
 [ "$TROLLSTORE" = true ] && OUT="${HENGE_IPA_OUTPUT:-$HOME/Desktop/Henge.tipa}"
 [ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
+# The bundled samples are Mac programs and a disk image. Prepare them outside
+# Xcode's iOS build-script environment before the app copies them as resources.
+env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET make -C "$IOS/.." build/tl-samples.dmg
 cd "$IOS"
 xcodegen generate >/dev/null
 DD="${HENGE_DERIVED_DATA:-$IOS/build/DerivedData}"

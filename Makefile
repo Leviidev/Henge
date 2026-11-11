@@ -210,7 +210,7 @@ $(B)/tl-samples.dmg: tests/tl/exit3.c tl/tests/hello.c tl/tests/fnd.m tl/tests/s
 	cp tl/build/swifty "$(B)/tl-samples/Swift sample"
 	cp tl/build/cxx "$(B)/tl-samples/C++ sample"
 	ditto tl/build/FW.app "$(B)/tl-samples/Framework sample.app"
-	hdiutil create -quiet -srcfolder $(B)/tl-samples -volname "Henge Samples" -fs HFS+ -format UDZO $@
+	hdiutil create -srcfolder $(B)/tl-samples -volname "Henge Samples" -fs HFS+ -format UDZO $@
 	xattr -c $@ # codesign refuses an app holding a file with Finder information
 
 $(B)/tl-exit3: tests/tl/exit3.c | $(B)
