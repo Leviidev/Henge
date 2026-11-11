@@ -36,6 +36,7 @@ int hg_guest_clone_discard(HGGuestClone *clone,const char **error) {
             free(media);
             if (!empty) { *error="clone-media-cleanup-required";return -1; }
         }
+        if (!named_clone(clone)) { *error="clone-path-identity-changed";return -1; }
         if (unlinkat(clone->directory_fd,clone->name,0)) {
             *error="clone-cleanup-required";return -1;
         }

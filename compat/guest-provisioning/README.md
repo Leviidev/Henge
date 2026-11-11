@@ -410,10 +410,11 @@ the owned copy, synchronizes its directory and preserves borrowed descriptors
 and the source lease. Changes to the source invalidate later publication but do
 not prevent discarding the independently owned copy.
 
-Eight native sanitizer-backed controls use real Darwin descriptor-based COW and
+Nine native sanitizer-backed controls use real Darwin descriptor-based COW and
 file leases, with the IOMedia boundary stubbed. They cover independent byte
 identity, private modes, locks, source/copy isolation, nonce collisions, handle
-reuse, replaced names and inventory refusal/retry. A separate native control on
+reuse, replaced names (including replacement during inventory) and inventory
+refusal/retry. A separate native control on
 the real authored 4 GiB APFS image used the production IOMedia scanner and passed
 create, independent inode/APFS identity, empty-media discard and unchanged source
 identity. arm64 iPadOS compilation passes. This is host qualification, not an

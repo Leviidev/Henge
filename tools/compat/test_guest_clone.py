@@ -27,12 +27,19 @@ class GuestCloneTests(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-static int busy,collision,inventory_error;
+static int busy,collision,inventory_error,replace_during_query;
 static void clone_random(void *p,size_t n) {
  if(collision)memset(p,0,n);else arc4random_buf(p,n);
 }
 int hg_guest_media_copy(const HGGuestDisk *disk,char **json,const char **error) {
  if(inventory_error){*json=NULL;*error="test-inventory-unavailable";return -1;}
+ if(replace_during_query) {
+  char path[4096],saved[4096];replace_during_query=0;
+  if(fcntl(disk->fd,F_GETPATH,path) || strlen(path)>4080)abort();
+  strcpy(saved,path);strcat(saved,".saved");if(rename(path,saved))abort();
+  int fd=open(path,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
+  if(fd<0 || write(fd,"preserve replacement",20)!=20)abort();close(fd);
+ }
  (void)disk;*json=strdup(busy?"[{\"owned\":true}]":"[]");*error=NULL;return 0;
 }
 #define arc4random_buf clone_random
@@ -41,6 +48,7 @@ int main(int n,char **v) {
  if(n!=4)return 64;
  busy=!strcmp(v[3],"busy");collision=!strcmp(v[3],"collision");
  inventory_error=!strcmp(v[3],"inventory-error");
+ replace_during_query=!strcmp(v[3],"query-race");
  int src=open(v[1],O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
  int parent=open(v[2],O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
  HGGuestDisk original={.fd=-1};HGGuestClone clone=HG_GUEST_CLONE_INIT;
@@ -178,6 +186,19 @@ int main(int n,char **v) {
         self.assertEqual(path.read_text(), 'preserve replacement')
         path.unlink()
         saved.rename(path)
+        self.assertTrue(self.release(process)['discarded'])
+
+    def test_name_is_rechecked_after_media_query(self):
+        process, report = self.start('query-race')
+        path = self.parent / report['name']
+        process.stdin.write(b'\n')
+        process.stdin.flush()
+        refusal = json.loads(process.stdout.readline())
+        self.assertFalse(refusal['discarded'])
+        self.assertEqual(refusal['error'], 'clone-path-identity-changed')
+        self.assertEqual(path.read_text(), 'preserve replacement')
+        path.unlink()
+        path.with_name(path.name + '.saved').rename(path)
         self.assertTrue(self.release(process)['discarded'])
 
     def test_untrusted_parent_and_existing_nonce_are_not_modified(self):
