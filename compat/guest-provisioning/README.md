@@ -391,3 +391,31 @@ catalog, without scanning file contents; the resulting copy passed the host APFS
 checker. This catalog still does not grant rewrite or mount authority. Production
 clone ownership, mutation journaling, restoration after filesystem writes,
 publication/rollback and device acceptance remain unfinished; the iOS guard stays.
+
+### Native private COW lifecycle
+
+`HGGuestClone` creates a temporary copy directly from the held source descriptor
+using `fclonefileat`; it never reopens the source pathname and has no full-copy
+fallback. The caller retains the source lease. The destination is an already
+opened trusted private directory owned by the effective user, and the clone name
+is generated internally. The new inode has mode 0600 and its own read-only,
+close-on-exec exclusive lease. GPT/disk identity and source stability are checked
+before returning. It never patches roles, mounts, stages payloads or replaces the
+source image.
+
+Discard verifies the original created inode at the owned name and requires fresh
+empty IOMedia inventory before unlinking it. A substituted path, attached media or
+unavailable inventory retains the clone state for retry. Cleanup removes only
+the owned copy, synchronizes its directory and preserves borrowed descriptors
+and the source lease. Changes to the source invalidate later publication but do
+not prevent discarding the independently owned copy.
+
+Eight native sanitizer-backed controls use real Darwin descriptor-based COW and
+file leases, with the IOMedia boundary stubbed. They cover independent byte
+identity, private modes, locks, source/copy isolation, nonce collisions, handle
+reuse, replaced names and inventory refusal/retry. A separate native control on
+the real authored 4 GiB APFS image used the production IOMedia scanner and passed
+create, independent inode/APFS identity, empty-media discard and unchanged source
+identity. arm64 iPadOS compilation passes. This is host qualification, not an
+iPad clone/mount or production replacement transaction; native role mutation,
+journaling/restoration, publication/rollback and activation remain unfinished.

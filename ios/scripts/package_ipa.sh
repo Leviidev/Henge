@@ -110,6 +110,7 @@ PY
         "$IOS/../compat/guest-provisioning/HGGuestPayload.m" \
         "$IOS/../compat/guest-provisioning/HGGuestDisk.c" \
         "$IOS/../compat/guest-provisioning/HGGuestAPFS.c" \
+        "$IOS/../compat/guest-provisioning/HGGuestClone.c" \
         "$IOS/../compat/guest-provisioning/HGGuestAttachment.m" \
         "$IOS/../compat/guest-provisioning/HGGuestMedia.m" -framework Foundation -lz \
         -o "$SAPP/henge-root-helper"
