@@ -337,3 +337,38 @@ refused with -69599. The `0` role argument is a no-op, not a role reset; a comma
 returning success for `0` is not evidence of neutralization. No guest disk role
 was changed, and no clone workaround has been qualified. Do not remove the iOS
 guard based on host mocks or the old roleless scratch test.
+
+### Alternate path investigation: isolated clone and bounded APFS identities
+
+A host-only authored-fixture experiment now demonstrates a possible alternative:
+clone the image with APFS copy-on-write, neutralize the copied Data role, stage the
+real 19-file compatibility payload, then restore the role before publication. The
+original image's full SHA-256 remained unchanged. A role-only round trip reproduced
+its original bytes exactly. After actual marker/payload writes, role restoration
+preserved the volume group and both volume UUIDs; the host APFS checker passed,
+the marker matched and the native stager reverified all payload files and modes.
+No guest image was used. This is not iPad qualification or production installation.
+
+The experiment's metadata scan is unsuitable for production writes: file contents
+can resemble filesystem metadata, and historical checkpoints need an explicit
+policy. `HGGuestAPFS` therefore adds a separate read-only native inspector. It
+uses the existing exclusive image lease, validates container/object checksums,
+selects the latest checkpoint and traverses bounded container object-map B-trees
+to resolve each volume superblock. It reports role, volume/group UUID, flags,
+object/transaction identity and physical block without scanning file contents,
+attaching or mounting. It rejects ambiguous same-transaction checkpoints, cycles,
+bad offsets/mappings and changed image identity. The current format profile requires
+the ordinary version-2 container layout, bounded descriptor arrays, fixed-size
+object-map records and at most 100 volumes; unsupported formats fail closed.
+
+Seven synthetic native groups pass with address/undefined-behavior sanitizers,
+including interior-node traversal, corruption at every metadata layer and bounds
+refusal. On the real authored fixtures, it independently resolved the original
+roles and the newer Data superblock after payload writes/restoration. arm64 iPadOS
+compilation passes. The inspector reports only the latest checkpoint and does
+not authorize a role rewrite, checkpoint rollback, clone publication or mounting.
+An implementation that handles all recoverable checkpoints, interrupted writes,
+clone ownership/publication and device acceptance is still required. The iOS
+mount guard remains in place.
+
+Layout reference: [Apple File System Reference](https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf).
