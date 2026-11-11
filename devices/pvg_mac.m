@@ -706,3 +706,13 @@ void hv_pvg_window_run(void) {
         [app run];
     }
 }
+
+int hv_pvg_mac_pointer(int *x, int *y) {
+    if (!pgdisp) return -1;
+    __block PGDisplayCoord_t position;
+    if (NSThread.isMainThread) position = pgdisp.cursorPosition;
+    else dispatch_sync(dispatch_get_main_queue(), ^{ position = pgdisp.cursorPosition; });
+    if (position.x == 0xffff || position.y == 0xffff) return -1;
+    *x = position.x; *y = position.y;
+    return 0;
+}

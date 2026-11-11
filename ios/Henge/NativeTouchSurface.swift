@@ -29,7 +29,7 @@ struct NativeTouchSurface: UIViewRepresentable {
             super.init(frame: frame)
             isMultipleTouchEnabled = true
             backgroundColor = .clear
-            controlsTap.numberOfTouchesRequired = 3
+            controlsTap.numberOfTouchesRequired = 4
             controlsTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
             controlsTap.cancelsTouchesInView = true
             controlsTap.isEnabled = false
@@ -59,7 +59,7 @@ struct NativeTouchSurface: UIViewRepresentable {
 
         @objc private func revealControls() {
             cancel()
-            NotificationCenter.default.post(name: Trackpad.threeFingerTap, object: nil)
+            NotificationCenter.default.post(name: Trackpad.revealTap, object: nil)
         }
 
         override func didMoveToWindow() {

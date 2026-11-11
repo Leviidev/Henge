@@ -2,9 +2,12 @@
 # Select Xcode 27.3+ with DEVELOPER_DIR. This does not need the external iOS build dependencies.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-make test-native-touch build/henge-agent.gz build/henge-touch-agent.gz build/share.o build/native_touch.o
+python3 tests/test_native_touch_packaging.py
+make test-native-touch test-guest-connection build/henge-agent.gz build/henge-touch-agent.tar.gz build/share.o build/native_touch.o
 xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
     -parse-as-library -typecheck tools/henge-touch-agent.swift tools/native-touch/*.swift
+xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors \
+    -parse-as-library tools/native-touch-probe.swift tools/native-touch/*.swift -o build/native-touch-probe
 sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
 sources=()
 while IFS= read -r -d '' source; do sources+=("$source"); done < <(find ios/Henge -name '*.swift' -print0)

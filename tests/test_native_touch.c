@@ -35,20 +35,34 @@ static void *delayed_contact(void *generation) {
     submit(*(uint32_t *)generation, 1, 0.6);
     return NULL;
 }
-static void http(const char *path, const char *body, char *result, size_t size, const char *socket_path) {
+static void http_bytes(const char *path, const void *body, size_t length, char *result, size_t size, const char *socket_path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0); assert(fd >= 0);
     struct sockaddr_un address = {.sun_family = AF_UNIX};
     snprintf(address.sun_path, sizeof address.sun_path, "%s", socket_path);
     assert(connect(fd, (struct sockaddr *)&address, sizeof address) == 0);
     char request[1024];
     int n = snprintf(request, sizeof request,
-        "%s %s HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n%s",
-        body ? "PUT" : "GET", path, body ? strlen(body) : 0, body ? body : "");
+        "%s %s HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n",
+        body ? "PUT" : "GET", path, length);
     assert(write(fd, request, (size_t)n) == n);
+    if (length) assert(write(fd, body, length) == (ssize_t)length);
     size_t at = 0; ssize_t read_count;
     while ((read_count = read(fd, result+at, size-at-1)) > 0) { at += (size_t)read_count; assert(at < size-1); }
     result[at] = 0; close(fd);
 }
+static void http(const char *path, const char *body, char *result, size_t size, const char *socket_path) {
+    http_bytes(path, body, body ? strlen(body) : 0, result, size, socket_path);
+}
+typedef struct { int connected, reports, heartbeats; uint8_t last[32]; } USB;
+static int usb_connect(void *context, int connected) { ((USB *)context)->connected = connected; return 1; }
+static int usb_connected(void *context) { return ((USB *)context)->connected; }
+static int usb_report(void *context, const uint8_t report[32]) {
+    USB *usb = context;
+    if (!usb->connected) return 0;
+    memcpy(usb->last, report, 32); usb->reports++; return 1;
+}
+static void usb_heartbeat(void *context) { ((USB *)context)->heartbeats++; }
+static int usb_mapped(void *context) { return ((USB *)context)->connected; }
 int main(void) {
     assert(hv_native_touch_status() == HV_TOUCH_OFF);
     uint32_t e = hv_native_touch_enable(1);
@@ -116,8 +130,18 @@ int main(void) {
     // Exercise the real guest HTTP endpoints and their status validation.
     char directory[] = "/tmp/henge-touch-test-XXXXXX"; assert(mkdtemp(directory));
     char socket_path[108]; snprintf(socket_path, sizeof socket_path, "%s/s", directory);
-    assert(hv_share_start(directory, socket_path, NULL) == 0);
+    char agent_path[256], touch_path[256];
+    snprintf(agent_path, sizeof agent_path, "%s/henge-agent.gz", directory);
+    snprintf(touch_path, sizeof touch_path, "%s/henge-touch-agent.tar.gz", directory);
+    FILE *archive = fopen(touch_path, "wb"); assert(archive);
+    fputs("touch archive fixture", archive); assert(fclose(archive) == 0);
+    assert(hv_share_start(directory, socket_path, agent_path) == 0);
     char response[4096], body[64];
+    http("/.henge/touch-agent", NULL, response, sizeof response, socket_path);
+    assert(strstr(response, "200 OK") && strstr(response, "touch archive fixture"));
+    http("/.henge/install", NULL, response, sizeof response, socket_path);
+    assert(strstr(response, "tar -xzf") && strstr(response, "codesign --verify --strict"));
+    assert(strstr(response, "Henge Touch Agent.app"));
     e = hv_native_touch_enable(1);
     http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
     assert(strstr(response, "200 OK") && strstr(response, "\"version\":1"));
@@ -132,6 +156,43 @@ int main(void) {
     hv_native_touch_enable(0);
     http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
     assert(strstr(response, "\"enabled\":false") && strstr(response, "\"contacts\":[]"));
-    unlink(socket_path); rmdir(directory);
+    USB usb = {0};
+    HvNativeTouchUSB transport = {&usb, usb_connect, usb_connected, usb_report, usb_heartbeat, usb_mapped};
+    hv_native_touch_set_usb(&transport);
+    e = hv_native_touch_enable(1);
+    http("/.henge/native-touch", NULL, response, sizeof response, socket_path);
+    assert(strstr(response, "\"usb\":true"));
+    http("/.henge/native-touch-usb", NULL, response, sizeof response, socket_path);
+    assert(strstr(response, "\"available\":true") && strstr(response, "\"connected\":false"));
+    assert(!hv_native_touch_usb_connect(e - 1, 1));
+    assert(!hv_native_touch_usb_mapped(e - 1));
+    assert(!hv_native_touch_usb_connect(e, 2));
+    snprintf(body, sizeof body, "%u 1", e);
+    http("/.henge/native-touch-usb", body, response, sizeof response, socket_path);
+    assert(strstr(response, "204 No Content") && usb.connected);
+    snprintf(body, sizeof body, "%u 2", e);
+    http("/.henge/native-touch-usb", body, response, sizeof response, socket_path);
+    assert(strstr(response, "204 No Content"));
+    uint8_t report[32] = {1, 3, 1}; report[31] = 1;
+    assert(!hv_native_touch_usb_report(e, report));
+    uint8_t neutral[32] = {1};
+    assert(hv_native_touch_usb_report(e, neutral));
+    hv_native_touch_report(e, HV_TOUCH_READY);
+    assert(usb.heartbeats == 1);
+    uint8_t packet[36] = {e & 255, (e >> 8) & 255, (e >> 16) & 255, (e >> 24) & 255};
+    memcpy(packet + 4, report, 32);
+    http_bytes("/.henge/native-touch-usb/report", packet, sizeof packet, response, sizeof response, socket_path);
+    assert(strstr(response, "204 No Content") && usb.last[31] == 1);
+    int reports = usb.reports;
+    packet[0] ^= 0x80;
+    http_bytes("/.henge/native-touch-usb/report", packet, sizeof packet, response, sizeof response, socket_path);
+    assert(strstr(response, "409 Conflict") && usb.reports == reports);
+    http_bytes("/.henge/native-touch-usb/report", packet, 35, response, sizeof response, socket_path);
+    assert(strstr(response, "400 Bad Request"));
+    usleep(800000);
+    assert(hv_native_touch_status() == HV_TOUCH_TIMEOUT && !usb.connected);
+    assert(!hv_native_touch_usb_report(e, report));
+    hv_native_touch_set_usb(NULL);
+    unlink(touch_path); unlink(socket_path); rmdir(directory);
     puts("native touch: idle polling, immediate wake, transitions, validation, generations, fallback, timeout and HTTP passed");
 }

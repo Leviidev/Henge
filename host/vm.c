@@ -23,6 +23,7 @@
 #include "dispatch.h"
 #include "net_slirp.h"
 #include "sysreg.h"
+#include "native_touch.h"
 
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
@@ -130,6 +131,12 @@ static void board_poll(void) {
     if (extra_poll) extra_poll();
     if (net_on) hv_net_poll();
 }
+
+static int touch_usb_connect(void *context, int connected) { return hv_xhci_touchscreen_connect(context, connected); }
+static int touch_usb_connected(void *context) { return hv_xhci_touchscreen_connected(context); }
+static int touch_usb_report(void *context, const uint8_t report[32]) { return hv_xhci_touchscreen_report(context, report); }
+static void touch_usb_keepalive(void *context) { hv_xhci_touchscreen_keepalive(context); }
+static int touch_usb_mapped(void *context) { return hv_xhci_touchscreen_mapped(context); }
 
 static int fail(char *err, size_t n, const char *msg) {
     if (err && n) snprintf(err, n, "%s", msg);
@@ -281,6 +288,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
         return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
     if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
+    if (board.usb && board.usb->ts_enabled) {
+        HvNativeTouchUSB transport = {board.usb, touch_usb_connect, touch_usb_connected, touch_usb_report, touch_usb_keepalive, touch_usb_mapped};
+        hv_native_touch_set_usb(&transport);
+    }
     hv_vmapple_reset_cpu(&board);
     if (board.net && !c->no_net) {
         if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");
@@ -313,6 +324,7 @@ void hv_vm_destroy(void) {
     atomic_store_explicit(&display_pvg, NULL, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
     stop_pointer();
+    hv_native_touch_set_usb(NULL);
     hv_net_detach();
     net_on = 0;
     hv_audio_detach();

@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_usb_touchscreen
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -53,14 +53,16 @@ $(B)/henge-agent: tools/henge-agent.m
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit $< -o $@
 	codesign -f -s - $@
 
-# Guest-side CoreHID companion for native touch.
-$(B)/henge-touch-agent: tools/henge-touch-agent.swift tools/native-touch/*.swift tools/native-touch.entitlements
+# Guest-side native-touch companion: USB, with provisioned CoreHID compatibility.
+$(B)/henge-touch-agent: tools/henge-touch-agent.swift tools/native-touch/*.swift
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx swiftc -parse-as-library -target arm64-apple-macos15.0 -O tools/henge-touch-agent.swift tools/native-touch/*.swift -o $@
-	codesign -f -s - --entitlements tools/native-touch.entitlements $@
+	codesign -f -s - $@
 
-$(B)/henge-touch-agent.gz: $(B)/henge-touch-agent
-	gzip -9 -n -c $< > $@
+# Repackage on each invocation so changed signing settings cannot reuse an old profile.
+.PHONY: native-touch-package-force
+$(B)/henge-touch-agent.tar.gz: $(B)/henge-touch-agent $(B)/henge-agent tools/package_native_touch.py native-touch-package-force
+	python3 tools/package_native_touch.py --binary $< --sharing-binary $(B)/henge-agent --output $@
 
 $(B)/native_touch.o: host/native_touch.c host/native_touch.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -252,6 +254,13 @@ test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
 	./$(B)/test_native_touch_session
 .PHONY: test-native-touch
 
+$(B)/test_guest_connection: tests/test_guest_connection.swift tools/native-touch/GuestConnection.swift | $(B)
+	xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors -parse-as-library $^ -o $@
+
+test-guest-connection: $(B)/test_guest_connection
+	python3 tests/test_guest_connection.py $<
+.PHONY: test-guest-connection
+
 # Session-owned display routing, independent of JIT, Metal and a connected monitor.
 $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
 	xcrun --sdk macosx swiftc $^ -o $@
@@ -287,3 +296,12 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+# Guest USB touchscreen research: protocol checks need no macOS image.
+$(B)/test_usb_touchscreen: tests/test_usb_touchscreen.c $(ENGINE) $(DEV)
+	$(CC) $(CFLAGS) $^ $(METAL_LIBS) -o $@
+
+test-usb-touchscreen: $(B)/test_usb_touchscreen
+	@mkdir -p $(B)/usb-touch-research
+	./$(B)/test_usb_touchscreen
+.PHONY: test-usb-touchscreen

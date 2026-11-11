@@ -15,8 +15,10 @@ static size_t queued;
 static uint32_t epoch = 1;
 static int enabled, status;
 static double last_sender, last_helper, started;
+static HvNativeTouchUSB usb;
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void reset_locked(void) {
+    if (usb.connect) usb.connect(usb.context, 0);
     if (++epoch == 0) epoch = 1;
     queued = 0; memset(&current, 0, sizeof current);
     started = last_sender = now(); last_helper = 0;
@@ -71,7 +73,10 @@ void hv_native_touch_report(uint32_t generation, int value) {
     pthread_mutex_lock(&mutex); expire_locked();
     if (enabled && generation == epoch && value >= HV_TOUCH_READY && value <= HV_TOUCH_DEVICE) {
         last_helper = now(); if (status == HV_TOUCH_WAITING) last_sender = last_helper; status = value;
-        if (value != HV_TOUCH_READY) { enabled = 0; queued = 0; memset(&current, 0, sizeof current); }
+        if (value != HV_TOUCH_READY) {
+            enabled = 0; queued = 0; memset(&current, 0, sizeof current);
+            if (usb.connect) usb.connect(usb.context, 0);
+        } else if (usb.keepalive) usb.keepalive(usb.context);
     }
     pthread_mutex_unlock(&mutex);
 }
@@ -85,9 +90,48 @@ size_t hv_native_touch_next(char *json, size_t capacity) {
         pthread_cond_timedwait(&changed, &mutex, &until); expire_locked();
     }
     if (queued) { current = queue[0]; memmove(queue, queue+1, (--queued)*sizeof(Frame)); }
-    size_t n = (size_t)snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"enabled\":%s,\"contacts\":[", epoch, enabled ? "true" : "false");
+    size_t n = (size_t)snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"enabled\":%s,\"usb\":%s,\"contacts\":[", epoch, enabled ? "true" : "false", usb.connect ? "true" : "false");
     for (size_t i = 0; i < current.count; i++) n += (size_t)snprintf(json+n, capacity-n,
         "%s{\"id\":%u,\"x\":%.9f,\"y\":%.9f}", i ? "," : "", current.ids[i], current.x[i], current.y[i]);
     n += (size_t)snprintf(json+n, capacity-n, "]}");
     pthread_mutex_unlock(&mutex); return n;
+}
+
+void hv_native_touch_set_usb(const HvNativeTouchUSB *transport) {
+    pthread_mutex_lock(&mutex);
+    enabled = 0; reset_locked();
+    usb = transport ? *transport : (HvNativeTouchUSB){0};
+    pthread_mutex_unlock(&mutex);
+}
+
+size_t hv_native_touch_usb_state(char *json, size_t capacity) {
+    pthread_mutex_lock(&mutex); expire_locked();
+    int connected = usb.connected && usb.connected(usb.context);
+    int n = snprintf(json, capacity, "{\"version\":1,\"epoch\":%u,\"available\":%s,\"connected\":%s}",
+                     epoch, usb.connect ? "true" : "false", connected ? "true" : "false");
+    pthread_mutex_unlock(&mutex);
+    return n >= 0 && (size_t)n < capacity ? (size_t)n : 0;
+}
+
+int hv_native_touch_usb_connect(uint32_t generation, int connected) {
+    if (connected != 0 && connected != 1) return 0;
+    pthread_mutex_lock(&mutex); expire_locked();
+    int accepted = enabled && generation == epoch && usb.connect && usb.connect(usb.context, connected);
+    pthread_mutex_unlock(&mutex); return accepted;
+}
+
+int hv_native_touch_usb_report(uint32_t generation, const uint8_t report[32]) {
+    if (!report) return 0;
+    pthread_mutex_lock(&mutex); expire_locked();
+    /* The startup dispatch is neutral. Contacts cannot precede readiness. */
+    int accepted = enabled && generation == epoch && usb.report &&
+                   (status == HV_TOUCH_READY || (status == HV_TOUCH_WAITING && report[31] == 0)) &&
+                   usb.report(usb.context, report);
+    pthread_mutex_unlock(&mutex); return accepted;
+}
+
+int hv_native_touch_usb_mapped(uint32_t generation) {
+    pthread_mutex_lock(&mutex); expire_locked();
+    int accepted = enabled && generation == epoch && usb.mapped && usb.mapped(usb.context);
+    pthread_mutex_unlock(&mutex); return accepted;
 }
