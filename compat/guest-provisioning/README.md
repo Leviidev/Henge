@@ -207,3 +207,32 @@ Adding Data to a preexisting ungrouped System failed with -69624 on the test Mac
 changing an existing ordinary volume to System failed with -69599. Always derive
 device identifiers from the newly attached fixture and detach it on every exit;
 never apply these creation commands to an existing VM or host volume.
+
+## Native read-only attachment transaction
+
+`HGGuestAttachment` retains a caller-owned `HGGuestDisk` lease throughout attach,
+volume identification and ejection. It refuses preexisting attachments. It derives
+the source path from the descriptor and checks its inode, then runs fixed
+`/usr/sbin/hdik -nomount -drivekey write-protected=true` with a fixed environment,
+isolated descriptors and a bounded child lifetime. Tool output grants no device
+authority. Fresh IOKit ancestry must identify one correctly sized physical GPT
+device and read-only media before volume-group selection succeeds.
+
+Close re-queries ownership and physical registry identity before each ejection,
+retries busy devices and verifies that owned inventory is empty. Partial attach
+and selection errors attempt the same cleanup. A writable/ambiguous device,
+reused device identifier or failed inventory never grants ejection authority;
+`attachment-cleanup-required` means the caller must stop rather than boot the VM.
+Concurrent source pathname replacement reports `attachment-outcome-unknown`;
+the API never guesses device ownership to clean up an unrelated image. This
+remaining pathname race requires a stable source path at the integration boundary.
+
+Seven native state-machine controls cover normal closure, existing attachments,
+partial failure, unsupported volume groups, timeout kill/reap, busy retries,
+persistent cleanup failures, device reuse and repeated open. Subprocess/IOKit
+boundaries in these controls are mocked. Separately, the developer native control
+attached the authored System/Data fixture on the matching iPad, selected the group,
+ejected it and reported unchanged image identity while retaining the lease.
+No volume was mounted or written. Production root-helper operations do not invoke
+this transaction yet: mount qualification, payload delivery, activation and
+fresh-device acceptance remain unfinished.
