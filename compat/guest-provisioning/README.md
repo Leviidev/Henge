@@ -176,13 +176,34 @@ imply an unencrypted, unlocked or Data-role volume. Malformed supplied metadata
 rejects inventory. iPadOS exposed these fields on the read-only scratch attachment,
 which was ejected after observation. Six native fixture groups passed, including
 invalid metadata and absent-field controls; arm64 iPadOS compilation passed.
-`hg_guest_media_copy_sonoma_data` now selects one exact System-role (1) and one
+`hg_guest_media_copy_volume_group` now selects one exact System-role (1) and one
 exact Data-role (64) APFS volume from a fresh owned-media inventory while the
 caller retains the image lease. It requires distinct volume UUIDs, one matching
-nonzero volume-group UUID, leaf media and explicit unlocked/unencrypted evidence.
-Missing fields, combined roles, duplicate candidates and ambiguous groups fail.
+nonzero volume-group UUID and leaf media. Combined roles, duplicate candidates,
+ambiguous groups and explicit encrypted/locked state fail. Missing encryption
+fields remain unknown, reported as `encryption_state_verified=false`; they do not
+prevent identity reporting and never authorize a mount or write. Both macOS and
+the iPad omit these fields on the authored unencrypted System/Data fixture. A
+later mount transaction must independently qualify readable access and safe
+write policy; this identity API cannot establish either.
 It reports identity only: it neither proves the installed macOS version nor grants
 mount/write authority after the lease is released. Native fixtures cover valid
 selection and these refusal cases. The roleless iPad scratch image is deliberately
 unsupported. Real System/Data device qualification, attachment, mounting and
 payload delivery/activation remain unfinished.
+
+The developer `guest_media_control` accepts `--volume-group` to exercise this
+identity selector. On the matching iPad, it selected the two members of an authored
+4 GiB sparse APFS fixture attached read-only, reported the correct role/group UUIDs,
+`encryption_state_verified=false`, and an unchanged image identity. The control
+exited before ejection; the first ejection was busy and a subsequent retry
+succeeded. No volume was mounted. This qualifies native identity reporting, not
+production attachment cleanup, encryption policy, guest version detection or
+payload installation.
+
+For an authored System/Data fixture, create the Data volume first and change its
+role to D, then add the System volume with `-role S -groupWith <data-device>`.
+Adding Data to a preexisting ungrouped System failed with -69624 on the test Mac;
+changing an existing ordinary volume to System failed with -69599. Always derive
+device identifiers from the newly attached fixture and detach it on every exit;
+never apply these creation commands to an existing VM or host volume.

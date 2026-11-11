@@ -95,7 +95,7 @@ static void *mock_symbol(void *p,const char *n){(void)p;
 int main(int n,char **v){@autoreleasepool{
  if(n!=3)return 64;path=@(v[1]);scenario=@(v[2]);
  HGGuestDisk d={.fd=open(v[1],O_RDONLY|O_CLOEXEC)};if(d.fd<0 || fstat(d.fd,&d.identity) || flock(d.fd,LOCK_EX|LOCK_NB))return 70;
- char *json=NULL;const char *error=NULL;int result=[scenario hasPrefix:@"select"]?hg_guest_media_copy_sonoma_data(&d,&json,&error):hg_guest_media_copy(&d,&json,&error);
+ char *json=NULL;const char *error=NULL;int result=[scenario hasPrefix:@"select"]?hg_guest_media_copy_volume_group(&d,&json,&error):hg_guest_media_copy(&d,&json,&error);
  printf("{\"ok\":%s,\"media\":%s,\"released\":%u,\"error\":\"%s\"}\n",result?"false":"true",json?:"null",released,error?:"");
  free(json);hg_guest_disk_close(&d);return result?1:0;
 }}
@@ -136,7 +136,12 @@ int main(int n,char **v){@autoreleasepool{
         self.assertEqual(r['media']['system']['bsd_name'], 'disk21s1')
         self.assertEqual(r['media']['data']['bsd_name'], 'disk21s2')
         self.assertFalse(r['media']['volume_mounted'])
-        for scenario in ('select-duplicate', 'select-wrong-group', 'select-missing-lock', 'select-encrypted',
+        self.assertTrue(r['media']['encryption_state_verified'])
+        unknown = self.run_control('select-missing-lock')
+        self.assertTrue(unknown['ok'])
+        self.assertFalse(unknown['media']['encryption_state_verified'])
+        self.assertNotIn('Locked', unknown['media']['data']['apfs_metadata'])
+        for scenario in ('select-duplicate', 'select-wrong-group', 'select-encrypted',
                          'select-locked', 'select-roleless', 'select-combined-role',
                          'select-zero-group', 'select-missing-uuid', 'select-same-uuid', 'select-nonleaf'):
             with self.subTest(scenario=scenario):

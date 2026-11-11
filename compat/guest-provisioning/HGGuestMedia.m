@@ -161,7 +161,7 @@ int hg_guest_media_copy(const HGGuestDisk *disk, char **json, const char **error
     }
 }
 
-int hg_guest_media_copy_sonoma_data(const HGGuestDisk *disk, char **json, const char **error)
+int hg_guest_media_copy_volume_group(const HGGuestDisk *disk, char **json, const char **error)
 {
     if (json) *json = NULL;
     if (!json || !error) return -1;
@@ -189,14 +189,18 @@ int hg_guest_media_copy_sonoma_data(const HGGuestDisk *disk, char **json, const 
             ![group isEqual:d[@"VolGroupUUID"]] || !s[@"UUID"] || !d[@"UUID"] ||
             [s[@"UUID"] isEqual:d[@"UUID"]] ||
             ![system[@"leaf"] isEqual:@YES] || ![data[@"leaf"] isEqual:@YES]) return -1;
+        BOOL encryptionVerified = YES;
         for (NSDictionary *m in @[s, d]) {
-            // Missing lock/encryption evidence must not mean false.
-            if (![m[@"Encrypted"] isEqual:@NO] || ![m[@"Locked"] isEqual:@NO]) return -1;
+            // Registry fields are absent on ordinary unencrypted APFS images.
+            // Unknown state permits identity reporting, never write authority.
+            if ([m[@"Encrypted"] isEqual:@YES] || [m[@"Locked"] isEqual:@YES]) return -1;
+            if (![m[@"Encrypted"] isEqual:@NO] || ![m[@"Locked"] isEqual:@NO]) encryptionVerified = NO;
         }
         if (!hg_guest_disk_unchanged(disk)) { *error = "image-identity-changed"; return -1; }
         NSData *result = [NSJSONSerialization dataWithJSONObject:@{
             @"schema": @1, @"system": system, @"data": data, @"volume_group_uuid": group,
-            @"volume_mounted": @NO, @"image_modified": @NO
+            @"volume_mounted": @NO, @"image_modified": @NO,
+            @"encryption_state_verified": @(encryptionVerified)
         } options:NSJSONWritingSortedKeys error:NULL];
         if (!result) return -1;
         *json = strndup(result.bytes, result.length);
