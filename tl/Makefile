@@ -1,7 +1,8 @@
 # Henge's translation layer for Mac apps: the loader and its tests (Mac).
 # make -C tl test: each test program runs natively and through the loader, and the two outputs must match.
 B = build
-CC = xcrun clang
+MAC_TOOLS = env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx
+CC = $(MAC_TOOLS) clang
 CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -fblocks
 GUEST = -target arm64-apple-macos13
 LOADER = loader/tl_loader.c loader/tl_tlv.S loader/tl_bundle.m
@@ -33,7 +34,7 @@ $(B)/fnd: tests/fnd.m | $(B)
 $(B)/fnd-opcodes: tests/fnd.m | $(B)
 	$(CC) -target arm64-apple-macos11 -O1 -fobjc-arc -framework Foundation -Wl,-no_fixup_chains $< -o $@
 $(B)/swifty: tests/swifty.swift | $(B)
-	xcrun swiftc -target arm64-apple-macos13 -O -module-name swifty $< -o $@
+	$(MAC_TOOLS) swiftc -target arm64-apple-macos13 -O -module-name swifty $< -o $@
 $(B)/cxx: tests/cxx.cpp | $(B)
 	$(CC) $(GUEST) -O1 -std=c++17 $< -lc++ -o $@
 
@@ -50,7 +51,7 @@ APPKIT_APP = $(B)/HelloAppKit.app/Contents/MacOS/HelloAppKit
 apps: $(SWIFTUI_APP) $(APPKIT_APP)
 $(SWIFTUI_APP): tests/apps/HelloSwiftUI.swift | $(B)
 	mkdir -p $(B)/HelloSwiftUI.app/Contents/MacOS
-	xcrun swiftc -target arm64-apple-macos14 -O -parse-as-library $< -o $@
+	$(MAC_TOOLS) swiftc -target arm64-apple-macos14 -O -parse-as-library $< -o $@
 	printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleExecutable</key><string>HelloSwiftUI</string><key>CFBundleIdentifier</key><string>dev.henge.tl.swiftui</string><key>CFBundleName</key><string>HelloSwiftUI</string><key>LSMinimumSystemVersion</key><string>14.0</string></dict></plist>\n' > $(B)/HelloSwiftUI.app/Contents/Info.plist
 $(APPKIT_APP): tests/apps/HelloAppKit.m | $(B)
 	mkdir -p $(B)/HelloAppKit.app/Contents/MacOS
