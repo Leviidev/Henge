@@ -216,7 +216,7 @@ invalid-offset cleanup, uncached writes and release. The iOS engine build and
 native VM phase/pause/lifecycle/snapshot controls also passed. This does not
 qualify the final app's device path or a mount of the actual Sonoma Data volume.
 
-Remaining production requirements include a bundled native root helper and
+Remaining production requirements include qualified root-helper execution and a
 source-built guest payload, normal-app activation, identification of the owned
 Sonoma Data volume, backup-preserving atomic version changes and a device gate.
 [TrollStore documents the root-helper/persona mechanism](https://github.com/opa334/TrollStore#root-helpers),
@@ -235,3 +235,21 @@ missing-ROM and snapshot controls passed. The DISCARD control was updated to sto
 its writable workers and release ownership before reopening the same fixture
 read-only; all 1647 checks passed. Compatibility Python checks remained at
 65 tests/13 skips, 82 tests/39 skips and 16 packaging/tool tests.
+
+### Bundled root-helper capability probe
+
+The TrollStore packaging path now compiles and signs a native helper from
+`compat/guest-provisioning/root_helper.c`. It accepts only `probe-v1`, reports
+real/effective root identity and tool availability, and never accesses a guest
+disk. Henge starts this check on a background queue using persona attributes,
+with a fixed environment, unrelated descriptors closed, bounded output and a
+three-second completion deadline. Ordinary IPA packaging omits the helper and
+the new unsandbox/persona entitlements.
+
+Both the helper and Objective-C launcher compiled for arm64 iPadOS 17 with
+warnings treated as errors. Seven native test methods passed, including valid
+and malformed reports, persona denial, abnormal exit, output overflow,
+environment/descriptor isolation and timeout reaping. The native controls use
+test-only persona stubs: they do not establish actual root permission. The iPad
+was unavailable during these checks, so this new helper has not been installed
+or run there. This is a capability check, not automatic guest provisioning.

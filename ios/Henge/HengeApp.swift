@@ -11,6 +11,18 @@ struct HengeApp: App {
         // Order matters: HengeLog takes over stderr, so the engine's and the JIT
         // allocator's first lines land in Documents/henge.log too.
         HengeLog.start()
+        // The TrollStore package includes a bounded, read-only capability probe.
+        // It never attaches a disk, and ordinary sideloaded packages omit it.
+        if FileManager.default.isExecutableFile(atPath: Bundle.main.bundlePath + "/henge-root-helper") {
+            DispatchQueue.global(qos: .utility).async {
+                guard let report = henge_root_helper_probe() else {
+                    HengeLog.log("guest-setup", "root helper probe failed; automatic disk provisioning unavailable")
+                    return
+                }
+                defer { free(report) }
+                HengeLog.log("guest-setup", String(cString: report))
+            }
+        }
         HengeLog.log("boot", "address space: \(henge_largest_reservation_gb()) GB can be reserved in one piece")
         EngineTuning.apply()
         HengeLog.logFootprint("app-launch")

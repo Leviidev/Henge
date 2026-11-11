@@ -48,6 +48,12 @@ ENT="$STAGE/entitlements.plist"
 cp "$IOS/${HENGE_ENTITLEMENTS:-Henge/Henge.entitlements}" "$ENT"
 BANNED_KEYS=("com.apple.private.cs.debugger" "dynamic-codesigning" "com.apple.private.skip-library-validation")
 if [ "$TROLLSTORE" = true ]; then for k in "${BANNED_KEYS[@]}"; do plutil -remove "$k" "$ENT" 2>/dev/null || true; done; fi
+if [ "$TROLLSTORE" = true ]; then
+    # App-context persona qualification. This helper currently accepts only a
+    # read-only capability probe; guest mutation is intentionally unavailable.
+    plutil -insert com.apple.private.security.no-sandbox -bool true "$ENT"
+    plutil -insert com.apple.private.persona-mgmt -bool true "$ENT"
+fi
 SAPP="$STAGE/Payload/Henge.app"
 xattr -rc "$SAPP"
 plutil -insert HengeBuildCommit -string "$(git -C "$IOS/.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" "$SAPP/Info.plist"
@@ -60,6 +66,15 @@ if [ -n "$(find "$STAGE" -iname 'AVPBooter*' -o -iname 'AVPSEPBooter*')" ]; then
   exit 1
 fi
 sign() { codesign --force --sign - --timestamp=none "$@"; }
+if [ "$TROLLSTORE" = true ]; then
+    xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 \
+        -Wall -Wextra -Werror -O2 "$IOS/../compat/guest-provisioning/root_helper.c" \
+        -o "$SAPP/henge-root-helper"
+    HELPER_ENT="$STAGE/helper-entitlements.plist"
+    plutil -create xml1 "$HELPER_ENT"
+    plutil -insert com.apple.private.security.no-sandbox -bool true "$HELPER_ENT"
+    sign --entitlements "$HELPER_ENT" "$SAPP/henge-root-helper"
+fi
 for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
 for ex in "$SAPP"/PlugIns/*.appex; do [ -d "$ex" ] && sign "$ex"; done
 sign --entitlements "$ENT" "$SAPP"
