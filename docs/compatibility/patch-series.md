@@ -43,6 +43,12 @@ Create a new immutable export from a clean, committed checkout:
 python3 tools/compat/export_series.py --base RECORDED_BASE --output /path/new-series
 ```
 
+For an integration branch containing upstream merges, add `--squash`. This emits
+one net-tree patch, including merge resolutions, and verifies the same final tree.
+The manifest retains the original HEAD and commit inventory separately from the
+synthetic export commit. Linear series export rejects merge histories rather than
+silently omitting their resolutions.
+
 It rejects binary changes, writes ordered patches and SHA256 manifests, applies
 them to a fresh checkout and verifies the resulting Git tree matches exactly.
 That is a source-application check. Follow [the reproduction guide](reproduce-ios17.md)
