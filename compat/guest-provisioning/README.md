@@ -501,3 +501,50 @@ macOS volume verification passed. Repeated native restoration performed no
 further edits. The copy was discarded with empty media inventory and source
 identity unchanged. This qualifies host mounted-write restoration, with the
 explicit copy-lease accommodation above; it is not iPad or publication proof.
+
+### Discard-only recovery of unpublished workspaces
+
+`HGGuestWorkspace` creates an exclusive private directory beneath an already
+trusted helper-private parent. Both directories must be owned by the effective
+UID, exclude group/other mode access and have no extended ACL. A fixed 96-byte
+ownership receipt binds the workspace's device/inode and the protected source
+inode, size, APFS bounds and GPT UUID; it contains no caller/source path. The
+receipt and both directories are synchronized before the API returns a usable
+workspace. No clone, journal or mount may be created before that success.
+
+After process death, reopening checks the exact workspace name, private directory
+identity, receipt integrity/ownership and an exclusive workspace lease. Recovery
+is discard-only, with a closed namespace of at most 128 entries: one internally
+named clone and its role journals. Trust in the private, exclusively
+helper-managed directory authorizes cleanup even if the creator died before
+recording a new artifact's individual inode. It does not authorize cleanup in an
+app-controlled or shared directory. Unknown names/types, hardlinks, source inode,
+foreign filesystem, conflicting clone names and excessive inventories are
+preserved. A substituted directory cannot reuse the original receipt.
+
+All files are opened without following links, checked against their named inode,
+and exclusively leased before any deletion. A copy needs verified empty fresh
+IOMedia inventory. Recovery then revalidates all inodes and namespace membership
+after that query, deletes only the preflighted copy/journals, and syncs cleanup
+before removing the receipt and empty directory. Busy or unavailable inventory
+stops all deletion; unknown entries are never recursively removed. Sync failures
+retain the live recovery handle for retry, including after directory removal.
+
+The copy may have torn APFS metadata or an incomplete journal: cleanup never
+parses/replays those blocks, mounts the image, opens the source or publishes a
+disk. Source inode protection also refuses a source moved into the workspace.
+Unreceipted/invalid directories are preserved. Creation failure before a durable
+receipt can leave a small metadata-only directory, but no heavy artifacts may
+exist at that point. Cleanup of such incomplete bootstrap directories and
+production startup enumeration are not implemented yet.
+
+Nineteen native sanitizer-backed cross-process controls cover abrupt exit,
+neutralized and torn copies, partial journals, orphan journals, source inode
+protection, busy/unavailable media, live leases, path replacement, late namespace
+insertion, receipt transplant/corruption, namespace bounds, ACLs and sync retry.
+The inventory boundary is stubbed there. A separate control using the production
+scanner created and neutralized an authored 4 GiB copy, exited without cleanup,
+then recovered it and its journal from another process. The original full source
+SHA-256 remained unchanged and no mounting/replay occurred. These are host
+controls, not device/root-helper startup or publication qualification. The module
+is compiled into the packaged helper but has no production command.
