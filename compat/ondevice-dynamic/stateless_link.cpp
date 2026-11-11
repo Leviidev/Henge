@@ -392,7 +392,8 @@ static void field(Bytes &out, const char *key, const Bytes &bytes) {
 }
 
 static Bytes close(const void *const *bytes, const size_t *sizes, const char *const *origins,
-                   size_t count, uint32_t preloaded, const char *entry, bool ios) {
+                   size_t count, uint32_t preloaded, const char *entry, bool ios,
+                   const char *const *required = nullptr, size_t requiredCount = 0) {
     need(bytes && sizes && origins && count && count <= 17 && !(preloaded & 1) &&
          !(preloaded >> count), "closure input inventory bound");
     std::vector<Library> libraries;
@@ -409,6 +410,16 @@ static Bytes close(const void *const *bytes, const size_t *sizes, const char *co
                  "ambiguous dependency origin");
     }
     need(entry && libraries[0].entry == entry, "closure function inventory mismatch");
+    need(requiredCount <= 16 && (!requiredCount || required), "compile dependency count bound");
+    std::set<std::string> requiredNames;
+    for (size_t i = 0; i < requiredCount; ++i) {
+        need(required[i] && strnlen(required[i], 4097) <= 4096 && required[i][0] == '/',
+             "compile dependency must have an absolute install name");
+        need(requiredNames.insert(required[i]).second, "duplicate compile dependency");
+        auto found = names.find(required[i]);
+        need(found != names.end() && (preloaded & (1u << found->second)),
+             "missing explicit compile dependency identity");
+    }
     std::vector<size_t> selected;
     std::set<size_t> seen, active;
     std::function<void(size_t)> visit = [&](size_t index) {
@@ -495,6 +506,20 @@ extern "C" int HGStatelessMetallibClose(const void *const *bytes, const size_t *
     *output = nullptr; *size = 0; *error = nullptr;
     try {
         auto result = hg_dynamic::close(bytes, sizes, origins, count, preloaded, entry, ios != 0);
+        void *owned = malloc(result.size()); need(owned, "closure output allocation failed");
+        memcpy(owned, result.data(), result.size()); *output = owned; *size = result.size(); return 0;
+    } catch (const std::exception &failure) { *error = strdup(failure.what()); return 1; }
+}
+
+extern "C" int HGStatelessMetallibCloseRequired(const void *const *bytes, const size_t *sizes,
+    const char *const *origins, size_t count, uint32_t preloaded, const char *entry,
+    const char *const *required, size_t requiredCount, int ios,
+    void **output, size_t *size, char **error) {
+    if (!output || !size || !error) return 1;
+    *output = nullptr; *size = 0; *error = nullptr;
+    try {
+        auto result = hg_dynamic::close(bytes, sizes, origins, count, preloaded, entry,
+                                       ios != 0, required, requiredCount);
         void *owned = malloc(result.size()); need(owned, "closure output allocation failed");
         memcpy(owned, result.data(), result.size()); *output = owned; *size = result.size(); return 0;
     } catch (const std::exception &failure) { *error = strdup(failure.what()); return 1; }

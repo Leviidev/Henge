@@ -6,6 +6,9 @@
 
 #include <os/proc.h>
 #include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include "HGOnDeviceDynamicService.h"
+#endif
 #include <stdio.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -411,6 +414,9 @@ int henge_vm_guest_el0(void) {
 }
 
 void henge_vm_share(const char *folder, const char *socket_path, const char *agent) {
+#if TARGET_OS_IPHONE
+    hv_share_set_shader_service(HGOnDeviceDynamicService);
+#endif
     if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
 }
 void henge_share_set_clipboard(const char *text) { hv_share_set_clipboard(text); }

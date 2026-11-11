@@ -270,6 +270,13 @@ static BOOL HGAddDeclared(NSDictionary *lib, NSMutableDictionary *pool,
     return NO;
   }
   for (NSString *name in lib[@"header"][@"dependencies"]) {
+    // Explicit API libraries already carry an immutable byte snapshot. Resolve
+    // those by install name before trying the guest filesystem. The compiler
+    // still validates origin semantics and rejects ambiguous install names.
+    BOOL supplied=NO;
+    for(NSDictionary *candidate in pool.allValues)
+      if([candidate[@"header"][@"install_name"] isEqual:name]) { supplied=YES; break; }
+    if(supplied) continue;
     NSString *origin =
         lib[@"origin_url"] == NSNull.null ? nil : lib[@"origin_url"];
     NSString *path = nil;

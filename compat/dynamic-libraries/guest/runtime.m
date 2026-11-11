@@ -4,7 +4,7 @@
 #import <dlfcn.h>
 #include <math.h>
 static void HGMaybeInstall(id<MTLDevice> d) {
-  if (!d || !HGLoadConfiguration())
+  if (!d)
     return;
   BOOL supportedClass =
       [NSStringFromClass([d class]) isEqual:@"AppleParavirtDevice"] &&
@@ -14,6 +14,8 @@ static void HGMaybeInstall(id<MTLDevice> d) {
   supportedClass |= getenv("HENGE_DYNAMIC_TEST_DEVICE") != NULL;
 #endif
   if (!supportedClass)
+    return;
+  if (!HGLoadConfiguration())
     return;
   HGInstall(d, HGRoot);
 }

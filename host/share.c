@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <poll.h>
 #include <removefile.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +37,14 @@
 
 static char root[PATH_MAX];
 static char agent_path[PATH_MAX];
+static pthread_mutex_t shader_service_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t shader_request_mu = PTHREAD_MUTEX_INITIALIZER;
+static HvShareShaderService shader_service;
+void hv_share_set_shader_service(HvShareShaderService service) {
+    pthread_mutex_lock(&shader_service_mu);
+    shader_service = service;
+    pthread_mutex_unlock(&shader_service_mu);
+}
 
 /* ---- the clipboard ---- */
 
@@ -76,6 +85,7 @@ typedef struct Conn {
     int fd;
     char buf[64 * 1024]; /* read ahead */
     size_t at, have;
+    int64_t body_deadline_ns; /* only the bounded shader upload */
 } Conn;
 
 typedef struct Request {
@@ -160,6 +170,15 @@ static ssize_t conn_read(Conn *c, void *out, size_t n) {
         return (ssize_t)take;
     }
     for (;;) {
+        if (c->body_deadline_ns) {
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+            int64_t left=c->body_deadline_ns-((int64_t)now.tv_sec*1000000000+now.tv_nsec);
+            if (left<=0) return -1;
+            struct pollfd fd={.fd=c->fd,.events=POLLIN};
+            int ready=poll(&fd,1,(int)((left+999999)/1000000));
+            if(ready<0&&errno==EINTR)continue;
+            if(ready<=0)return -1;
+        }
         ssize_t r = recv(c->fd, out, n, 0);
         if (r < 0 && errno == EINTR) continue;
         return r;
@@ -233,14 +252,32 @@ static int body_discard(Conn *c, Request *r) {
         if (got < 0) return -1;
     }
 }
+static void shader_upload_deadline(Conn *c, int enabled) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+    c->body_deadline_ns=enabled?(int64_t)now.tv_sec*1000000000+now.tv_nsec+15000000000ll:0;
+}
+static int shader_upload_discard(Conn *c, Request *r) {
+    char bytes[8192]; size_t total=0;
+    body_ready(c,r);
+    shader_upload_deadline(c,1);
+    int rc=0;
+    for(;;) {
+        ssize_t n=body_read(c,r,bytes,sizeof bytes);
+        if(n<0 || (size_t)n>(24u<<20)-total) {rc=-1; break;}
+        if(!n)break;
+        total+=(size_t)n;
+    }
+    shader_upload_deadline(c,0);
+    return rc;
+}
 
-static char *body_small(Conn *c, Request *r, size_t *len) {
+static char *body_limited(Conn *c, Request *r, size_t *len, size_t limit) {
     Text t = {0};
     char piece[16384];
     body_ready(c, r);
     for (;;) {
         ssize_t got = body_read(c, r, piece, sizeof piece);
-        if (got < 0 || t.len + (size_t)got > SMALL_BODY_MAX) {
+        if (got < 0 || (size_t)got > limit - t.len) {
             free(t.s);
             return NULL;
         }
@@ -250,6 +287,9 @@ static char *body_small(Conn *c, Request *r, size_t *len) {
     add(&t, "", 0);
     *len = t.len;
     return t.s;
+}
+static char *body_small(Conn *c, Request *r, size_t *len) {
+    return body_limited(c, r, len, SMALL_BODY_MAX);
 }
 
 static int respond(Conn *c, Request *r, int status, const char *reason, const char *headers, const char *body, size_t len) {
@@ -709,6 +749,45 @@ static int clipboard_put(Conn *c, Request *r) {
 
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
+    if (!strncmp(what,"shaders/",8)) {
+        pthread_mutex_lock(&shader_service_mu);
+        HvShareShaderService service = shader_service;
+        pthread_mutex_unlock(&shader_service_mu);
+        if (!service) { if(body_discard(c,r))return -1; return respond_empty(c,r,503,"Service Unavailable"); }
+        // Identity is immutable and never enters LLVM. New guest applications
+        // must discover it even while another process has a closure in flight.
+        if(!strcmp(what+8,"identity") && !strcmp(r->method,"GET") && !r->length && !r->chunked) {
+            void *output=NULL; size_t out_length=0;
+            int status=service(r->method,what+8,NULL,0,&output,&out_length);
+            if(status!=200 || out_length>16384 || !output) {free(output); return respond_empty(c,r,503,"Service Unavailable");}
+            int rc=respond(c,r,200,"OK","Content-Type: application/json\r\n",output,out_length);
+            free(output); return rc;
+        }
+        if(r->length>(24u<<20)) {r->close=1; return respond_empty(c,r,413,"Content Too Large");}
+        // Drain a bounded rejected upload so clients receive HTTP 429 instead
+        // of a reset while still writing. No large allocation or compile occurs.
+        if (pthread_mutex_trylock(&shader_request_mu)) {
+            if(shader_upload_discard(c,r)) {r->close=1; return respond_empty(c,r,413,"Content Too Large");}
+            return respond_empty(c,r,429,"Too Many Requests");
+        }
+        size_t length=0, out_length=0;
+        shader_upload_deadline(c,1);
+        char *body=body_limited(c,r,&length,24u<<20);
+        shader_upload_deadline(c,0);
+        if (!body) { pthread_mutex_unlock(&shader_request_mu); r->close=1; return respond_empty(c,r,413,"Content Too Large"); }
+        void *output=NULL;
+        int status=service(r->method,what+8,body,length,&output,&out_length);
+        free(body);
+        if (out_length>(24u<<20) || (out_length&&!output)) { free(output); pthread_mutex_unlock(&shader_request_mu); return -1; }
+        const char *reason=status==200?"OK":status==400?"Bad Request":status==404?"Not Found":
+            status==429?"Too Many Requests":status==503?"Service Unavailable":"Internal Server Error";
+        struct timeval previous={0}, timeout={.tv_sec=15}; socklen_t timeout_size=sizeof previous;
+        getsockopt(c->fd,SOL_SOCKET,SO_SNDTIMEO,&previous,&timeout_size);
+        setsockopt(c->fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof timeout);
+        int rc=respond(c,r,status,reason,"Content-Type: application/json\r\n",output,out_length);
+        setsockopt(c->fd,SOL_SOCKET,SO_SNDTIMEO,&previous,sizeof previous);
+        free(output); pthread_mutex_unlock(&shader_request_mu); return rc;
+    }
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);

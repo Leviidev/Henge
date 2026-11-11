@@ -1,6 +1,7 @@
 #import "HGOnDeviceShaderProvider.h"
 #import "HGOnDeviceAIR.h"
 #import "HGOnDeviceCompilerRecipe.h"
+#import "HGOnDeviceDynamicService.h"
 #import "pvg_shader_profile.h"
 #include <stdlib.h>
 #include <float.h>
@@ -14,6 +15,11 @@ static const NSUInteger PendingLimit=HG_PROVIDER_PENDING_LIMIT, PendingBytesLimi
 extern void HGProviderTestBeforeCompile(void);
 #endif
 static const NSUInteger ReadyLimit=128, ReadyBytesLimit=32*1024*1024;
+dispatch_queue_t HGOnDeviceCompilerQueue(void) {
+ static dispatch_queue_t queue;static dispatch_once_t once;
+ dispatch_once(&once,^{queue=dispatch_queue_create("henge.local-air.compiler",DISPATCH_QUEUE_SERIAL);});
+ return queue;
+}
 static NSError* HGError(NSInteger code,NSString*message){return [NSError errorWithDomain:@"HengeOnDeviceShader" code:code userInfo:@{NSLocalizedDescriptionKey:message?:@"local compiler error"}];}
 @interface HGOnDeviceShaderResult ()
 @property(nonatomic,readwrite) HGOnDeviceShaderStatus status;
@@ -63,7 +69,7 @@ static NSError* HGError(NSInteger code,NSString*message){return [NSError errorWi
  if(!documents.length||![hv_sp_sha(manifest)isEqual:@HG_ONDEVICE_COMPILER_RECIPE]){if(error)*error=HGError(1,@"local compiler recipe manifest mismatch");return nil;}
  _recipe=@HG_ONDEVICE_COMPILER_RECIPE;_cacheNamespace=[cacheNamespace copy];_cacheRoot=[[[[documents stringByAppendingPathComponent:@"shader-local-cache"]stringByAppendingPathComponent:_cacheNamespace]stringByAppendingPathComponent:_recipe]copy];
  _guard=[NSObject new];_jobs=[NSMutableDictionary new];_capacityWakes=[NSMutableDictionary new];
- static dispatch_queue_t sharedCompilerQueue;static dispatch_once_t once;dispatch_once(&once,^{sharedCompilerQueue=dispatch_queue_create("henge.local-air.compiler",DISPATCH_QUEUE_SERIAL);});_compilerQueue=sharedCompilerQueue;
+ _compilerQueue=HGOnDeviceCompilerQueue();
  // Initialization itself performs no disk I/O. The serial job validates/creates storage.
  return self;
 }

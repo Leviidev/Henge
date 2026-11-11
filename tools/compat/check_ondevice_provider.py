@@ -21,6 +21,8 @@ def verify(root):
                 and p.name not in ('README.md', '.gitignore')}
     for name in ('stateless_link.cpp', 'HGStatelessLink.h'):
         expected['dynamic/' + name] = digest(root / 'compat/ondevice-dynamic' / name)
+    for name in ('adapter.m', 'transport.m', 'runtime.m'):
+        expected['guest/' + name] = digest(root / 'compat/dynamic-libraries/guest' / name)
     if receipt['source_package'] != expected:
         raise ValueError('On-device compiler source changed; rebuild the provider')
     if digest(library) != receipt['archive_sha256']:
@@ -30,7 +32,7 @@ def verify(root):
                          separators=(',', ':')).encode()
     if hashlib.sha256(encoded).hexdigest() != compiler['recipe']:
         raise ValueError('On-device compiler recipe identity is invalid')
-    for name in ('HGOnDeviceShaderProvider.h', 'pvg_shader_profile.h'):
+    for name in ('HGOnDeviceShaderProvider.h', 'pvg_shader_profile.h', 'HGOnDeviceDynamicService.h'):
         if (source / name).read_bytes() != (root / 'devices' / name).read_bytes():
             raise ValueError('On-device compiler API contract differs: ' + name)
     if (source / 'LICENSE-LLVM.txt').read_bytes() != (

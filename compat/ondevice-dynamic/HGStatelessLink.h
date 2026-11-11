@@ -12,6 +12,12 @@ extern "C" {
 int HGStatelessMetallibClose(const void *const *bytes, const size_t *sizes,
     const char *const *origins, size_t count, uint32_t preloaded, const char *entry,
     int retargetIOS, void **output, size_t *outputSize, char **error);
+// Additional compile dependencies must have declared absolute install names
+// and occur in the explicit preload set, matching the guest adapter protocol.
+int HGStatelessMetallibCloseRequired(const void *const *bytes, const size_t *sizes,
+    const char *const *origins, size_t count, uint32_t preloaded, const char *entry,
+    const char *const *required, size_t requiredCount, int retargetIOS,
+    void **output, size_t *outputSize, char **error);
 #ifdef __cplusplus
 }
 #endif

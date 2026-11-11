@@ -17,7 +17,7 @@ class ProviderPackageTests(unittest.TestCase):
         for directory in (self.source, self.lib, self.root / 'devices',
                           self.root / 'ios/Henge/Resources/legal'):
             directory.mkdir(parents=True)
-        for name in ('HGOnDeviceShaderProvider.h', 'pvg_shader_profile.h'):
+        for name in ('HGOnDeviceShaderProvider.h', 'pvg_shader_profile.h', 'HGOnDeviceDynamicService.h'):
             (self.source / name).write_text(name)
             (self.root / 'devices' / name).write_text(name)
         (self.source / 'rebuild_llvm.py').write_text('authored build fixture')
@@ -41,7 +41,18 @@ class ProviderPackageTests(unittest.TestCase):
         for name in ('stateless_link.cpp', 'HGStatelessLink.h'):
             self.receipt['source_package']['dynamic/' + name] = hashlib.sha256(
                 (dynamic / name).read_bytes()).hexdigest()
+        guest = self.root / 'compat/dynamic-libraries/guest'
+        guest.mkdir(parents=True)
+        for name in ('adapter.m', 'transport.m', 'runtime.m'):
+            (guest / name).write_text('authored guest ' + name)
+            self.receipt['source_package']['guest/' + name] = hashlib.sha256(
+                (guest / name).read_bytes()).hexdigest()
         self.write_receipt()
+
+    def test_stale_guest_transport(self):
+        (self.root / 'compat/dynamic-libraries/guest/transport.m').write_text('changed protocol')
+        with self.assertRaisesRegex(ValueError, 'source changed'):
+            verify(self.root)
 
     def test_stale_dynamic_linker(self):
         (self.root / 'compat/ondevice-dynamic/stateless_link.cpp').write_text('changed linker')

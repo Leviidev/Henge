@@ -8,12 +8,40 @@ static NSDictionary *HGConfiguration;
 static NSString *HGToken;
 static NSString *HGEndpoint;
 static NSTimeInterval HGTimeout;
+static BOOL HGEmbeddedTransport;
+static NSString *HGEmbeddedRecipe;
+static NSData *HGHTTP(NSString *, NSString *, NSData *, NSTimeInterval, NSInteger *, NSError **);
 static BOOL HGLoadConfiguration(void) {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
     const char *path = getenv("HENGE_DYNAMIC_CONFIG");
-    if (!path)
+    if (!path) {
+      HGEndpoint=@"http://10.0.2.4/.henge/shaders";
+#ifdef HG_ALLOW_NATIVE_TESTING
+      const char *testEndpoint=getenv("HENGE_EMBEDDED_TEST_ENDPOINT");
+      if(testEndpoint) HGEndpoint=@(testEndpoint);
+#endif
+      NSInteger status=0;
+      NSData *bytes=HGHTTP(@"GET",@"/identity",nil,5,&status,nil);
+      NSDictionary *identity=bytes.length && bytes.length<=16384?[NSJSONSerialization JSONObjectWithData:bytes options:0 error:nil]:nil;
+      id recipe=[identity isKindOfClass:NSDictionary.class]?identity[@"recipe"]:nil;
+      NSCharacterSet *bad=[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet];
+      if(status!=200 || ![recipe isKindOfClass:NSString.class] || [recipe length]!=64 ||
+         [recipe rangeOfCharacterFromSet:bad].location!=NSNotFound ||
+         ![identity[@"schema"] isEqual:@1] ||
+         ![identity[@"policy"] isEqual:@"henge_stateless_compute_dynamic_1"] ||
+         ![identity[@"protocol"] isEqual:@"embedded-close-v1"])
+        return;
+      HGEmbeddedRecipe=[recipe copy]; HGRecipeID=HGEmbeddedRecipe.UTF8String;
+      HGRoot=[[[NSSearchPathForDirectoriesInDomains(NSCachesDirectory,NSUserDomainMask,YES) firstObject]
+          stringByAppendingPathComponent:@"Henge/Stateless"] stringByAppendingPathComponent:HGEmbeddedRecipe];
+#ifdef HG_ALLOW_NATIVE_TESTING
+      const char *testCache=getenv("HENGE_EMBEDDED_TEST_CACHE");
+      if(testCache) HGRoot=[@(testCache) stringByAppendingPathComponent:HGEmbeddedRecipe];
+#endif
+      HGTimeout=60; HGEmbeddedTransport=YES; HGConfiguration=[identity copy];
       return;
+    }
     NSData *bytes =
         [NSData dataWithContentsOfFile:[@(path) stringByExpandingTildeInPath]];
     NSDictionary *c = bytes ? [NSJSONSerialization JSONObjectWithData:bytes
@@ -78,7 +106,7 @@ static NSData *HGHTTP(NSString *method, NSString *suffix, NSData *body,
       timeoutInterval:fmax(.1, seconds)];
   request.HTTPMethod = method;
   request.HTTPBody = body;
-  [request setValue:[@"Bearer " stringByAppendingString:HGToken]
+  if(HGToken) [request setValue:[@"Bearer " stringByAppendingString:HGToken]
       forHTTPHeaderField:@"Authorization"];
   NSURLSessionConfiguration *cfg =
       NSURLSessionConfiguration.ephemeralSessionConfiguration;
@@ -122,6 +150,41 @@ static NSData *HGHTTP(NSString *method, NSString *suffix, NSData *body,
     *error = failure;
   return result;
 }
+static BOOL HGFetchEmbedded(NSString *key, NSData *request, NSString *base, NSDate *deadline, NSError **error) {
+  while(deadline.timeIntervalSinceNow>0) {
+    NSInteger status=0;
+    NSData *data=HGHTTP(@"POST",[@"/close/" stringByAppendingString:key],request,
+        fmin(60,deadline.timeIntervalSinceNow),&status,error);
+    if(status==429 || status==0) { [NSThread sleepForTimeInterval:.1]; continue; }
+    if(!data || status!=200 || data.length>(24u<<20)) {
+      HGFail(error,42,@"Embedded compiler request unavailable or oversized"); return NO;
+    }
+    NSDictionary *receipt=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if(![receipt isKindOfClass:NSDictionary.class] || ![receipt[@"schema"] isEqual:@1] ||
+       ![receipt[@"recipe"] isEqual:@(HGRecipeID)] || ![receipt[@"request_sha256"] isEqual:key]) {
+      HGFail(error,34,@"Embedded compiler receipt identity mismatch"); return NO;
+    }
+    if([receipt[@"status"] isEqual:@"rejected"]) {
+      if(![receipt[@"error"] isKindOfClass:NSString.class]) { HGFail(error,44,@"Invalid rejection receipt"); return NO; }
+      return [data writeToFile:[base stringByAppendingString:@".json"] options:NSDataWritingAtomic error:error];
+    }
+    if(![receipt[@"status"] isEqual:@"ready"] || ![receipt[@"output_base64"] isKindOfClass:NSString.class] ||
+       ![receipt[@"output_bytes"] isKindOfClass:NSNumber.class]) {
+      HGFail(error,44,@"Invalid embedded compiler receipt"); return NO;
+    }
+    NSData *binary=[[NSData alloc] initWithBase64EncodedString:receipt[@"output_base64"] options:0];
+    if(binary.length<88 || binary.length>(16u<<20) ||
+       binary.length!=[receipt[@"output_bytes"] unsignedLongLongValue] ||
+       ![HGSHA(binary) isEqual:receipt[@"output_sha256"]]) {
+      HGFail(error,34,@"Embedded compiler output digest or length mismatch"); return NO;
+    }
+    NSMutableDictionary *compact=[receipt mutableCopy]; [compact removeObjectForKey:@"output_base64"];
+    NSData *record=[NSJSONSerialization dataWithJSONObject:compact options:NSJSONWritingSortedKeys error:error];
+    return record && [binary writeToFile:[base stringByAppendingString:@".metallib"] options:NSDataWritingAtomic error:error] &&
+        [record writeToFile:[base stringByAppendingString:@".json"] options:NSDataWritingAtomic error:error];
+  }
+  HGFail(error,33,@"Embedded compiler did not complete before the deadline"); return NO;
+}
 static BOOL HGFetchReady(NSString *key, NSData *request, NSString *base,
                          NSError **error) {
   // Per-request lock also coordinates independent opted-in application
@@ -152,6 +215,7 @@ static BOOL HGFetchReady(NSString *key, NSData *request, NSString *base,
     ok = YES;
     goto done;
   }
+  if(HGEmbeddedTransport) { ok=HGFetchEmbedded(key,request,base,deadline,error); goto done; }
   {
     NSInteger status = 0;
     NSError *network = nil;

@@ -52,9 +52,10 @@ The caller header and profile contract copies must match `devices/` before build
 The same archive now contains the bounded stateless compute linker from
 [`ondevice-dynamic`](../ondevice-dynamic/README.md). Both ordinary conversion and
 closure linking share one LLVM runtime; they must never execute concurrently.
-The guest closure transport is not implemented yet. It must enqueue closure jobs
-on the provider's process-wide serial compiler queue before activation. Direct
-single-threaded controls are separate from that runtime integration requirement.
+The private guest closure service queues its work on the ordinary provider's
+process-wide serial compiler queue. Native HTTP/API/GPU controls passed. The
+guest adapter still needs automatic delivery and activation, and the new app
+requires its integrated iPad runtime gate.
 Dynamic source hashes are checked alongside the ordinary provider source.
 
 

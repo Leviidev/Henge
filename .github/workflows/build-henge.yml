@@ -134,6 +134,13 @@ jobs:
             --control "$RUNNER_TEMP/henge-closure-control/native-control" \
             --fixtures "$RUNNER_TEMP/henge-closure-assets" \
             --output "$RUNNER_TEMP/henge-closure-results"
+          python3 compat/ondevice-dynamic/build_service_controls.py \
+            --provider-archive "$RUNNER_TEMP/henge-ondevice-provider/lib-macosx/libHGOnDeviceShader.a" \
+            --output "$RUNNER_TEMP/henge-service-controls"
+          python3 compat/ondevice-dynamic/qualify_service.py \
+            --controls "$RUNNER_TEMP/henge-service-controls" \
+            --fixtures "$RUNNER_TEMP/henge-closure-assets" \
+            --output "$RUNNER_TEMP/henge-service-results"
 
       - name: Run portable compatibility controls
         working-directory: Henge
