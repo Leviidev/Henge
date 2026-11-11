@@ -18,6 +18,9 @@ struct VirtualMac: Identifiable, Codable, Hashable {
     var screenHeight: Int?
     /// m4 fork: the iPad's own panel at Retina density. On by default on iPad, for Macs that never chose.
     var retina: Bool?
+    /// On an iPhone's large screen (iPhone Duo unfolded): fill it, or leave a strip at the right for the status
+    /// bar and Henge's controls. Macs that never chose fill it.
+    var fillScreen: Bool?
     var isRetina: Bool { Device.isPad && (retina ?? false) }
     var screen: (width: Int, height: Int) { isRetina ? Device.retinaScreen : (screenWidth ?? 1920, screenHeight ?? 1080) }
     var aspect: CGFloat { CGFloat(screen.width) / CGFloat(screen.height) }
@@ -271,6 +274,23 @@ final class Machines: ObservableObject {
         all.removeAll { $0.id == mac.id }
         all.append(mac)
         save()
+    }
+
+    /// A Mac set to fit takes the shape of the screen it starts on: an iPhone with two screens (iPhone Duo) has
+    /// two shapes, and a Mac fitted to one shows bars on the other. On an iPhone anything but 16:9 is the fit
+    /// (MacSettingsView). A Mac with a saved session keeps its size, which the save is for; an iPad has one panel.
+    func fittedForStart(_ mac: VirtualMac) -> VirtualMac {
+        guard !Device.isPad, !InstantResume.hasSave(for: mac) else { return mac }
+        let fit = Device.fitting(for: mac)
+        let now = mac.screen
+        // Only where a fit is not 16:9, which is an iPhone Duo's two screens: any other iPhone keeps what a Mac has.
+        guard !(fit.width == 1920 && fit.height == 1080),
+              !(now.width == 1920 && now.height == 1080), !(now.width == fit.width && now.height == fit.height) else { return mac }
+        var fitted = mac
+        (fitted.screenWidth, fitted.screenHeight) = fit
+        HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) refitted to this display: \(fit.width)x\(fit.height)")
+        update(fitted)
+        return fitted
     }
 
     func update(_ mac: VirtualMac) {
