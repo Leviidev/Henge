@@ -50,6 +50,11 @@ static CFTypeRef search(unsigned int e,const char *p,CFStringRef k,CFAllocatorRe
 static int properties(unsigned int e,CFMutableDictionaryRef *out,CFAllocatorRef a,unsigned int o){
  (void)e;(void)a;(void)o;
  NSMutableDictionary *p=[@{@"BSD Name":@"disk21s1",@"Content":@"41504653-0000-11AA-AA11-00306543ECAC",@"Size":@4096,@"Whole":@NO,@"Leaf":@YES,@"Writable":@NO} mutableCopy];
+ if([scenario isEqual:@"metadata"]) {p[@"RoleValue"]=@64;p[@"UUID"]=@"12345678-1234-1234-1234-123456789ABC";p[@"VolGroupUUID"]=@"ABCDEFAB-1234-1234-1234-123456789ABC";p[@"Encrypted"]=@NO;p[@"Locked"]=@NO;}
+ if([scenario isEqual:@"bad-role"])p[@"RoleValue"]=@YES;
+ if([scenario isEqual:@"oversize-role"])p[@"RoleValue"]=@65536;
+ if([scenario isEqual:@"bad-uuid"])p[@"UUID"]=@"invalid";
+ if([scenario isEqual:@"bad-encrypted"])p[@"Encrypted"]=@1;
  if([scenario isEqual:@"bad-name"])p[@"BSD Name"]=@"disk21/../../other";
  if([scenario isEqual:@"bad-name-null"])p[@"BSD Name"]=@"disk21\0other";
  if([scenario isEqual:@"zero-size"])p[@"Size"]=@0;
@@ -108,6 +113,18 @@ int main(int n,char **v){@autoreleasepool{
                 self.assertEqual(r['media'][0]['registry_id'], 101)
                 self.assertEqual(r['released'], 2)
                 self.assertFalse(r['media'][0]['writable'])
+
+    def test_apfs_metadata_is_typed_and_missing_values_stay_missing(self):
+        r = self.run_control('metadata')
+        self.assertTrue(r['ok'])
+        metadata = r['media'][0]['apfs_metadata']
+        self.assertEqual(metadata['RoleValue'], 64)
+        self.assertFalse(metadata['Encrypted'])
+        self.assertFalse(metadata['Locked'])
+        self.assertEqual(metadata['UUID'], '12345678-1234-1234-1234-123456789ABC')
+        self.assertEqual(self.run_control('valid')['media'][0]['apfs_metadata'], {})
+        for scenario in ('bad-role', 'oversize-role', 'bad-uuid', 'bad-encrypted'):
+            self.assertFalse(self.run_control(scenario)['ok'])
 
     def test_unrelated_and_nonimage_media_do_not_grant_ownership(self):
         for scenario in ('unrelated', 'no-ancestor'):

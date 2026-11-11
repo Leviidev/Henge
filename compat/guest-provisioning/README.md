@@ -168,3 +168,12 @@ verified all 19 payload files, and inspected the actual 64 GiB Sonoma disk witho
 attaching, mounting or changing it. The same control rejected the attached scratch
 image. This developer jailbreak CLI launch is stronger evidence than persona
 stubs, but it does not replace the final UIKit/TrollStore application launch gate.
+
+The inventory now includes an `apfs_metadata` object for each owned media record.
+It preserves valid UUID/volume-group UUID, bounded integral RoleValue and strict
+boolean encryption/lock properties. Missing properties remain absent; they never
+imply an unencrypted, unlocked or Data-role volume. Malformed supplied metadata
+rejects inventory. iPadOS exposed these fields on the read-only scratch attachment,
+which was ejected after observation. Six native fixture groups passed, including
+invalid metadata and absent-field controls; arm64 iPadOS compilation passed.
+Role/group-based volume selection and mounting remain unimplemented.

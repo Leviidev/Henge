@@ -117,10 +117,34 @@ int hg_guest_media_copy(const HGGuestDisk *disk, char **json, const char **error
                 ![writable isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)writable) != CFBooleanGetTypeID()) {
                 failed = YES; break;
             }
+            NSMutableDictionary *metadata = [NSMutableDictionary dictionary];
+            for (NSString *key in @[@"UUID", @"VolGroupUUID"]) {
+                id value = p[key];
+                if (!value) continue;
+                NSUUID *uuid = [value isKindOfClass:NSString.class] ? [[NSUUID alloc] initWithUUIDString:value] : nil;
+                if (!uuid) { failed = YES; break; }
+                metadata[key] = uuid.UUIDString;
+            }
+            id role = p[@"RoleValue"];
+            if (role) {
+                if (![role isKindOfClass:NSNumber.class] ||
+                    CFGetTypeID((__bridge CFTypeRef)role) != CFNumberGetTypeID() ||
+                    CFNumberIsFloatType((__bridge CFNumberRef)role) ||
+                    [role longLongValue] < 0 || [role unsignedLongLongValue] > UINT16_MAX) failed = YES;
+                else metadata[@"RoleValue"] = role;
+            }
+            for (NSString *key in @[@"Encrypted", @"Locked"]) {
+                id value = p[key];
+                if (!value) continue;
+                if (![value isKindOfClass:NSNumber.class] ||
+                    CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID()) { failed = YES; break; }
+                metadata[key] = value;
+            }
+            if (failed) break;
             [names addObject:name];
             [rows addObject:@{@"bsd_name": name, @"content": content, @"bytes": size,
                               @"whole": whole, @"leaf": leaf, @"writable": writable,
-                              @"registry_id": @(identifier)}];
+                              @"registry_id": @(identifier), @"apfs_metadata": metadata}];
         }
         api.release(iterator);
         dlclose(library);
