@@ -74,3 +74,9 @@ the build and checked again afterward, so an edit during compilation cannot
 produce a falsely bound manifest. VLC itself and its reference frameworks are
 not bundled by this payload. Updating an installed app, preserving its data and
 signature policy, and checking normal launches remain separate guest gates.
+
+Signatures alone do not prove loadability. Packaging also uses a separate native
+process to load the guest libraries and an isolated signed VLC candidate's own
+headless module loader to check all nine plugins. Content-based UUIDs are retained
+with reproducible linker mode. These build-time checks do not qualify guest
+execution or GUI behavior, and they never start the installed VLC app.

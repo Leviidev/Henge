@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -36,6 +37,8 @@ SOURCES = ('compat/dynamic-libraries/guest/runtime.m',
            'compat/dynamic-libraries/guest/transport.m',
            'compat/opengl-discovery/registry_discovery.m', 'LICENSE',
            'tools/compat/build_guest_payload.py')
+SOURCES += ('tools/compat/guest_library_load_control.c', 'compat/vlc/candidate.py',
+            'compat/vlc/promote.py', 'tools/compat/ipad_update.py')
 SOURCES += tuple('compat/vlc/' + name for name in (
     'build.py', 'reference.py', 'reference.lock.json', 'inputs.lock.json',
     'source-provenance.json', 'COPYING', 'COPYING.LIB'))
@@ -145,7 +148,7 @@ def build(root, output, vlc_archives=None):
         command = [compiler, '-isysroot', sdk, '-arch', 'arm64', '-mmacosx-version-min=14.0',
                    '-dynamiclib', '-O2', '-fobjc-arc', '-fblocks', '-Wall', '-Wextra',
                    '-Wno-deprecated-declarations', '-ffile-prefix-map=' + str(root) + '=.',
-                   '-Wl,-no_uuid', '-DHG_RECIPE_ID="' + recipe + '"',
+                   '-Wl,-reproducible', '-DHG_RECIPE_ID="' + recipe + '"',
                    '-install_name', '@rpath/' + name, str(source), '-o', str(target)]
         command += [value for framework in frameworks for value in ('-framework', framework)]
         commands.append(command)
@@ -160,6 +163,11 @@ def build(root, output, vlc_archives=None):
     license_file = payload / 'LICENSE-Henge-GPL-2.0.txt'
     license_file.write_bytes((root / 'LICENSE').read_bytes())
     license_file.chmod(0o644)
+    loader = output / 'library-load-control'
+    subprocess.run([compiler, '-arch', 'arm64', '-mmacosx-version-min=14.0', '-Wall',
+                    '-Wextra', '-Werror', str(root / 'tools/compat/guest_library_load_control.c'),
+                    '-o', str(loader)], check=True)
+    subprocess.run([str(loader), *(str(payload / name) for name in LIBRARIES)], check=True)
     vlc_build = output / 'vlc-build'
     if vlc_archives is None:
         vlc_archives = root / '.compat-local/vlc-archives'
@@ -194,6 +202,26 @@ def build(root, output, vlc_archives=None):
         target.chmod(0o644)
     (payload / 'vlc-build-receipt.json').write_bytes((vlc_build / 'build-receipt.json').read_bytes())
     (payload / 'vlc-build-receipt.json').chmod(0o644)
+    # Sign and inspect a separate candidate using VLC's own loader. The source
+    # reference remains untouched; no GUI, playback or installed app is started.
+    candidate = output / 'vlc-load-control'
+    reference_app = vlc_archives.resolve() / ('reference-' + json.loads(
+        (root / 'compat/vlc/reference.lock.json').read_text())['sha256']) / 'VLC.app'
+    subprocess.run([sys.executable, str(root / 'compat/vlc/candidate.py'),
+                    '--source-app', str(reference_app), '--build', str(vlc_build),
+                    '--output', str(candidate)], check=True)
+    env = dict(os.environ)
+    for name in ('DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', 'VLC_PLUGIN_PATH'):
+        env.pop(name, None)
+    result = subprocess.run([str(candidate / 'VLC Export Test.app/Contents/MacOS/VLC'),
+                             '--ignore-config', '--no-plugins-cache', '--list'],
+                            env=env, capture_output=True, timeout=45)
+    (output / 'vlc-load-control.log').write_bytes(result.stdout + result.stderr)
+    result.check_returncode()
+    listed = {line.strip().split()[0] for line in result.stdout.decode().splitlines() if line.strip()}
+    required_modules = {name.removeprefix('lib').removesuffix('_plugin.dylib') for name in VLC_PLUGINS}
+    if not required_modules <= listed or b'cannot load module' in result.stderr:
+        raise ValueError('VLC could not load the complete plugin unit; see vlc-load-control.log')
     if {name: digest(root / name) for name in SOURCES} != source_snapshot:
         raise ValueError('Guest payload source changed during the build')
     manifest = dict(schema=1, kind='henge-sonoma-guest-compatibility', architecture='arm64',

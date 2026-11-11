@@ -126,7 +126,7 @@ vlc_module_end()
         objects=[]
         for index,file in enumerate(files):
             target=obj/f'{name}-{index}.o';objects.append(str(target));checked(common+list(extra)+['-DMODULE_STRING="'+name+'"',str(file),'-o',str(target)],out,logs/f'{name}-{index}.log')
-        checked(['clang++'if cxx else'clang','-dynamiclib','-mmacosx-version-min=14.0','-Wl,-no_uuid','-install_name',f'@rpath/lib{name}_plugin.dylib','-o',str(plugins/f'lib{name}_plugin.dylib')]+objects+list(libs)+['-L'+str(core),'-lvlccore','-framework','CoreFoundation','-framework','CoreVideo','-framework','CoreMedia','-Wl,-exported_symbols_list,'+str(support/'exports.txt')],out,logs/f'{name}-link.log')
+        checked(['clang++'if cxx else'clang','-dynamiclib','-mmacosx-version-min=14.0','-Wl,-reproducible','-install_name',f'@rpath/lib{name}_plugin.dylib','-o',str(plugins/f'lib{name}_plugin.dylib')]+objects+list(libs)+['-L'+str(core),'-lvlccore','-framework','CoreFoundation','-framework','CoreVideo','-framework','CoreMedia','-Wl,-exported_symbols_list,'+str(support/'exports.txt')],out,logs/f'{name}-link.log')
     build('aacgap',[encoder/'encoder.c',support/'module.c',encoder/'fourcc.c',encoder/'chroma.c',support/'audio_format.c'],ff_libs)
     build('avgap',[obj/'demux_module.c',vlc/'modules/demux/avformat/demux.c',encoder/'fourcc.c',encoder/'chroma.c'],ff_libs)
     build('aacdecgap',[obj/'decoder_module.c',vlc/'modules/codec/avcodec/audio.c',vlc/'modules/codec/avcodec/helpers.c',encoder/'fourcc.c',encoder/'chroma.c'],ff_libs)
@@ -140,7 +140,7 @@ vlc_module_end()
     def gui(file):
         target=obj/('gui-'+str(file.relative_to(vlc/'modules/gui/macosx')).replace('/','_')+'.o');checked(gui_flags+[str(file),'-o',str(target)],out,logs/(target.name+'.log'));return str(target)
     with ThreadPoolExecutor(max_workers=a.jobs)as pool:objects=list(pool.map(gui,files))
-    command=['clang','-dynamiclib','-mmacosx-version-min=14.0','-Wl,-no_uuid','-fobjc-arc','-o',str(plugins/'libmacosx_plugin.dylib')]+objects+['-L'+str(core),'-lvlccore','-F'+str(app/'Contents/Frameworks'),'-Wl,-install_name,@rpath/libmacosx_plugin.dylib']
+    command=['clang','-dynamiclib','-mmacosx-version-min=14.0','-Wl,-reproducible','-fobjc-arc','-o',str(plugins/'libmacosx_plugin.dylib')]+objects+['-L'+str(core),'-lvlccore','-F'+str(app/'Contents/Frameworks'),'-Wl,-install_name,@rpath/libmacosx_plugin.dylib']
     for f in ['Cocoa','CoreServices','AVFoundation','CoreMedia','IOKit','AddressBook','WebKit','CoreAudio','SystemConfiguration','ScriptingBridge','QuartzCore','MediaPlayer','Sparkle']:command+=['-framework',f]
     checked(command,out,logs/'gui-link.log')
     receipt.update(state='built; not installed',plugins={p.name:sha(p)for p in sorted(plugins.glob('*.dylib'))},gui_sources=len(files))

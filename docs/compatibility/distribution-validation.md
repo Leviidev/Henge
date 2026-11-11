@@ -313,8 +313,20 @@ The combined source build passed. Eight payload controls passed, including a
 missing plugin, partial unit and wrong core hash. All 37 packaging/tool tests
 passed. The manifest captures source hashes before compilation and refuses to
 publish if they change during the build. Plugin install names use `@rpath` and
-omit random UUIDs; source prefix maps and FFmpeg's runtime configuration string
-normalize transient build paths. Actual compiler flags remain in the builder.
+the linker's reproducible mode retains content-based UUIDs; source prefix maps
+and FFmpeg's runtime configuration string normalize transient build paths.
+Actual compiler flags remain in the builder.
 This records the build changes; equality of independent complete release builds
 and the finished IPA remain separate checks. No guest installation, app update
 or normal launch gate is established by bundling these files.
+
+The native export check caught a defect in the first combined package: removing
+`LC_UUID` made the dylibs pass signature verification but fail the native dyld
+loader. That candidate/package is not qualified. Both guest libraries and all
+VLC plugins now retain UUIDs. The payload builder requires a separate native
+process to `dlopen` the guest libraries, then creates a signed, isolated VLC
+candidate and uses VLC's own `--list` loader with config and plugin cache disabled
+to require all nine module names and reject loader errors. Those checks passed
+on the corrected combined build. The separate native load control also rejected
+the earlier known-bad UUID-less libraries. No GUI, installed app or guest disk
+is accessed by these build-time load controls.
