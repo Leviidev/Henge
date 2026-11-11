@@ -82,8 +82,32 @@ python3 "$IOS/../tools/compat/build_guest_payload.py" "${GUEST_BUILD_ARGS[@]}"
 cp "$STAGE/guest-build/henge-guest-payload.tar.gz" "$SAPP/"
 cp "$STAGE/guest-build/henge-guest-payload.json" "$SAPP/"
 if [ "$TROLLSTORE" = true ]; then
+    # Bind validation to this package's exact resources, independently of any
+    # caller-supplied manifest or path. Constants are inside the signed helper.
+    PAYLOAD_HEADER="$STAGE/HengeGuestPayloadIdentity.h"
+    python3 - "$STAGE/guest-build" "$PAYLOAD_HEADER" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+root, header = map(Path, sys.argv[1:])
+descriptor = json.loads((root / 'henge-guest-payload.json').read_text())
+manifest = json.loads((root / 'payload/manifest.json').read_text())
+values = {
+    'HG_PAYLOAD_DESCRIPTOR_SHA': hashlib.sha256((root / 'henge-guest-payload.json').read_bytes()).hexdigest(),
+    'HG_PAYLOAD_RECIPE': descriptor['compiler_recipe'],
+    'HG_PAYLOAD_ID': descriptor['payload_id'],
+    'HG_PAYLOAD_VLC_CORE': manifest['vlc']['reference_core_sha256'],
+    'HG_PAYLOAD_VLC_LOCK': manifest['vlc']['reference_lock_sha256'],
+}
+assert all(re.fullmatch('[0-9a-f]{64}', value) for value in values.values())
+header.write_text(''.join('#define ' + key + ' ' + json.dumps(value) + '\n' for key, value in values.items()))
+PY
     xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 \
-        -Wall -Wextra -Werror -O2 "$IOS/../compat/guest-provisioning/root_helper.c" \
+        -Wall -Wextra -Werror -O2 -fobjc-arc -include "$PAYLOAD_HEADER" \
+        "$IOS/../compat/guest-provisioning/root_helper.c" \
+        "$IOS/../compat/guest-provisioning/HGGuestPayload.m" -framework Foundation -lz \
         -o "$SAPP/henge-root-helper"
     HELPER_ENT="$STAGE/helper-entitlements.plist"
     python3 - "$HELPER_ENT" <<'PY'

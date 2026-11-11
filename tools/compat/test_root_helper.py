@@ -57,6 +57,8 @@ int main(void) {
         cls.real_helper = cls.base / 'real-helper'
         subprocess.run(['clang', '-Wall', '-Wextra', '-Werror',
                         str(ROOT / 'compat/guest-provisioning/root_helper.c'),
+                        '-fobjc-arc', str(ROOT / 'compat/guest-provisioning/HGGuestPayload.m'),
+                        '-framework', 'Foundation', '-lz',
                         '-o', str(cls.real_helper)], check=True)
 
     def fixture(self, body):
@@ -86,12 +88,19 @@ int main(void) {
         self.assertEqual(report['root'], root)
         self.assertFalse(report['guest_disk_accessed'])
 
+    def test_unbound_helper_never_accepts_payload_resources(self):
+        result = subprocess.run([str(self.real_helper), 'verify-payload-v1'], capture_output=True)
+        self.assertEqual(result.returncode, 65)
+        report = json.loads(result.stdout)
+        self.assertFalse(report['payload_verified'])
+        self.assertEqual(report['error'], 'unbound-build-identity')
+
     def test_protocol_and_process_failures(self):
         valid = dict(schema=1, operation='probe-v1', root=True, uid=0, euid=0,
-                     gid=0, egid=0, guest_disk_accessed=False)
+                     gid=0, egid=0, payload_verified=True, guest_disk_accessed=False)
         cases = [(valid, True), (dict(valid, root=False), False),
                  (dict(valid, euid=501), False), (dict(valid, schema=2), False),
-                 (dict(valid, operation='mount'), False),
+                 (dict(valid, operation='mount'), False), (dict(valid, payload_verified=False), False),
                  (dict(valid, guest_disk_accessed=True), False), ([], False), ({}, False)]
         for report, accepted in cases:
             with self.subTest(report=report):
@@ -113,7 +122,7 @@ int main(void) {
 
     def test_parent_environment_and_descriptors_are_not_inherited(self):
         valid = json.dumps(dict(schema=1, operation='probe-v1', root=True, uid=0,
-                                euid=0, gid=0, egid=0, guest_disk_accessed=False))
+                                euid=0, gid=0, egid=0, payload_verified=True, guest_disk_accessed=False))
         source = self.base / 'fixture.c'
         source.write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <fcntl.h>\n'
                           'int main(void) { if (getenv("HENGE_CONTROL_INHERITED_FD") || '

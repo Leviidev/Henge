@@ -13,13 +13,14 @@ container-access consequences. Whether these permissions suffice in Henge's
 application context still requires qualification on the matching iPad.
 
 At launch, Henge runs a read-only `probe-v1` on a background queue. The helper
-accepts no paths or other operations. It reports real/effective user and group
-identity and whether Apple's image attachment and APFS mount tools are
-executable. It never opens a guest image or creates a mountpoint. The launcher
+accepts no caller paths. It reports real/effective user/group identity, tool
+availability and verification of its bundled payload. The additional
+`verify-payload-v1` operation reports only the read-only payload check. It never
+opens a guest image or creates a mountpoint. The launcher
 checks all persona setup results, closes unrelated inherited descriptors,
 supplies a fixed environment, bounds output to 4095 bytes and kills/reaps a
-helper that does not complete within three seconds. Valid root identity is
-required before it logs a successful capability report. A failed or absent probe
+helper that does not complete within three seconds. Valid root identity and a
+verified bundled payload are required for a successful capability report. A failed or absent probe
 does not prevent normal VM use.
 
 `python3 -m unittest discover -s tools/compat -p test_root_helper.py -v`
@@ -27,6 +28,29 @@ exercises the native launcher with **test-only persona stubs**. It covers protoc
 rejection, unsuccessful exit, signals, excessive output, missing/nonexecutable
 helpers, denied persona setup, inherited environment/descriptors and timeout
 cleanup. These controls do not establish iPad root permissions.
+
+## Native payload boundary
+
+Packaging compiles the descriptor SHA-256, compiler recipe, payload identity and
+VLC core/lock identities into the signed helper. The helper finds resources beside
+its own canonical executable, never by accepting paths or hashes from its caller.
+An unbound developer helper rejects payload verification. The app requires a
+successful payload check as well as root identity before reporting readiness.
+
+`HGGuestPayload.m` opens bounded regular resources with `openat`, no-follow and
+nonblocking flags, checks their identities, and decodes gzip/tar entirely in
+memory. Compressed input is limited to 16 MiB and expansion to 32 MiB. Exactly
+the known flat, regular-file inventory is accepted; duplicate/extra/missing names,
+paths, links, owners, timestamps, permissions, malformed checksums, padding,
+concatenated streams and trailing data are rejected. The descriptor binds the
+manifest; target, compiler, complete VLC unit and every member hash/size/mode
+must match. No directory, image, mountpoint or guest file is written.
+
+Native authored-fixture controls cover valid inventories, identity changes,
+corruption, gzip limits, tar metadata, links, FIFOs, missing members and ABI/profile
+changes. The parser also accepted the real 19-member release archive. Neither
+these Mac controls nor iPadOS cross-compilation qualify iPad root permissions or
+actual guest installation.
 
 The separate `tools/compat/audit_guest_disk_mount.py` developer control proved
 read/write attachment of an authored scratch APFS image on the iPad, including

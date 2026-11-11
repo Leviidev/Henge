@@ -89,11 +89,14 @@ char *henge_root_helper_probe(void)
         if (failed || !eof || !WIFEXITED(status) || WEXITSTATUS(status)) return NULL;
         NSData *data = [NSData dataWithBytes:output length:used];
         NSDictionary *report = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+        if ([report isKindOfClass:NSDictionary.class] && [report[@"payload_verified"] isEqual:@NO])
+            NSLog(@"Henge bundled payload validation failed: %@", report[@"payload_verification"]);
         if (![report isKindOfClass:NSDictionary.class] ||
             ![report[@"schema"] isEqual:@1] || ![report[@"operation"] isEqual:@"probe-v1"] ||
             ![report[@"root"] isEqual:@YES] || ![report[@"uid"] isEqual:@0] ||
             ![report[@"euid"] isEqual:@0] || ![report[@"gid"] isEqual:@0] ||
-            ![report[@"egid"] isEqual:@0] || ![report[@"guest_disk_accessed"] isEqual:@NO]) return NULL;
+            ![report[@"egid"] isEqual:@0] || ![report[@"payload_verified"] isEqual:@YES] ||
+            ![report[@"guest_disk_accessed"] isEqual:@NO]) return NULL;
         output[used] = '\0';
         return strdup(output);
     }

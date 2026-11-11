@@ -363,3 +363,28 @@ It has not been installed on the unavailable iPad. Root-helper privileges,
 actual Sonoma Data-volume installation, ordinary app activation, device GUI
 playback, new upstream snapshot behavior and fresh-guest acceptance remain
 unqualified. The source-only PR contains none of these signed artifacts.
+
+### Native installation input validation
+
+The signed root helper now contains the exact descriptor SHA-256, compiler
+recipe, payload identity and VLC core/lock identities for its app build. It
+locates resources beside its canonical executable and accepts no caller paths
+or identities. A separate read-only `verify-payload-v1` operation reports the
+check; app launch requires verified payload contents as well as root identity.
+Unbound developer helpers reject validation.
+
+The Foundation/CommonCrypto/zlib implementation checks bounded, regular resources
+using no-follow/nonblocking opens, compressed identity and size, gzip framing and
+expansion limits, normalized flat USTAR headers/checksums/padding, a closed
+19-member inventory, manifest/target/recipe/VLC identity and every member's hash,
+size and mode. It rejects links, duplicate or unexpected paths, owners,
+timestamps, malformed/truncated/concatenated input and changed resources. Parsing
+stays in memory and never opens a guest image or writes extracted files.
+
+Twelve native authored-fixture groups passed. The parser also verified the real
+19-member release archive. A native helper compiled with that archive's identity
+accepted its own resources from an unrelated working directory, rejected a
+changed descriptor and rejected caller-supplied path arguments. The native
+implementation and helper compiled for arm64 iPadOS 17 with warnings treated as
+errors. These controls establish the installation input boundary; they do not
+qualify the actual iPad persona, a mount, guest installation or app activation.
