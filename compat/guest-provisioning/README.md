@@ -699,3 +699,25 @@ eleven native write-authority groups separately exercise namespace policy.
 The process test uses persona/helper stubs and does not qualify iPad root or
 privileged caller behavior. The physical privileged launch, role-neutral
 mount, installation and publication/rollback supervisor remain incomplete.
+
+### Private-copy ownership handoff
+
+`HGGuestPublicationMetadata` performs the copy-only metadata phase after an
+immutable publication intent is durable. It requires the original-active inode
+pair, retained source write authority, an unchanged/untainted leased copy and
+fresh empty media inventories. It sets the private copy to the original owner's
+UID/GID/mode and synchronizes/read-backs the result; an abandoned successful
+handoff can restore helper ownership and mode 0600. The original file's bytes
+and metadata are never changed. The copy stays inside its private directory.
+Every failure after the first metadata syscall permanently taints that copy;
+its publication record and both images remain available for dedicated recovery.
+
+Twelve native ASan/UBSan intent/metadata groups cover ownership-mode handoff,
+restoration, repeat handoff, media refusal and injected chown/chmod/fsync failure,
+alongside durable intent and inode-pair controls. A real authored 4 GiB GPT/APFS
+COW fixture passed handoff/restoration using the production media scanner:
+source full hash and UID/GID/mode/mtime/ctime were unchanged, the copy's full
+hash matched and its mode returned to 0600. This host control uses the test
+process UID, not kernel-attested app authority; it qualifies no iPad behavior.
+No exchange, payload activation, snapshot invalidation, restart rollback,
+health commit or automatic installation is enabled by this API.

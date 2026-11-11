@@ -35,7 +35,7 @@ class GuestPublicationIntentTests(unittest.TestCase):
 static int mode(const char *s){const char *m=getenv("HENGE_PUBLICATION_TEST");return m && !strcmp(m,s);}
 int hg_guest_media_copy(const HGGuestDisk *disk,char **json,const char **error) {
  static int queries;queries++;(void)disk;
- *json=strdup(mode("busy") || (mode("copy-busy") && queries==2)?"[{}]":"[]");*error=NULL;return 0;
+ *json=strdup(mode("busy") || (mode("copy-busy") && queries==2) || (mode("handoff-busy") && queries==3)?"[{}]":"[]");*error=NULL;return 0;
 }
 static int test_sync(int fd) {
  char path[4096];if(fcntl(fd,F_GETPATH,path))return -1;
@@ -49,11 +49,33 @@ static int test_sync(int fd) {
 #define fsync test_sync
 #include "HGGuestPublicationIntent.c"
 ''')
+        metadata_shim=folder/'metadata-shim.c'
+        metadata_shim.write_text(r'''
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+static int mode(const char *s){const char *m=getenv("HENGE_PUBLICATION_TEST");return m && !strcmp(m,s);}
+static int test_chown(int fd,uid_t uid,gid_t gid) {
+ if(mode("metadata-chown-fail")){errno=EPERM;return -1;}return fchown(fd,uid,gid);
+}
+static int test_chmod(int fd,mode_t permissions) {
+ if(mode("metadata-chmod-fail")){errno=EIO;return -1;}return fchmod(fd,permissions);
+}
+static int test_sync(int fd) {
+ if(mode("metadata-sync-fail")){errno=EIO;return -1;}return fsync(fd);
+}
+#define fchown test_chown
+#define fchmod test_chmod
+#define fsync test_sync
+#include "HGGuestPublicationMetadata.c"
+''')
         cls.control = folder / 'control'
         subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                         '-I', str(native), str(ROOT / 'tools/compat/guest_publication_intent_control.c'),
-                        str(shim), *[str(native / f) for f in [
+                        str(shim), str(metadata_shim), *[str(native / f) for f in [
                             'HGGuestDisk.c', 'HGGuestAPFS.c', 'HGGuestClone.c',
                             'HGGuestRoles.c', 'HGGuestRoleWrite.c', 'HGGuestWorkspace.c',
                             'HGGuestWriteAuthority.c']], '-lz', '-o', str(cls.control)], check=True)
@@ -104,6 +126,45 @@ static int test_sync(int fd) {
         finally:
             os.close(left)
             os.close(right)
+
+    def test_private_copy_handoff_preserves_source_metadata_and_bytes(self):
+        self.source.chmod(0o640)
+        before=self.source.stat()
+        d=self.prepare(operation='handoff')
+        after=self.source.stat()
+        self.assertEqual((after.st_uid,after.st_gid,after.st_mode,after.st_mtime_ns,after.st_ctime_ns),
+                         (before.st_uid,before.st_gid,before.st_mode,before.st_mtime_ns,before.st_ctime_ns))
+        self.assertEqual(self.clone.stat().st_mode & 0o777,0o640)
+        self.assertEqual(self.clone.read_bytes(),self.original)
+        self.assertEqual(self.inspect()['pair'],1)
+        self.assertTrue((self.workspace/'publication').exists())
+
+    def test_handoff_metadata_faults_preserve_pair_and_taint_copy(self):
+        self.source.chmod(0o640)
+        for mode in ('metadata-chown-fail','metadata-chmod-fail','metadata-sync-fail'):
+            with self.subTest(mode=mode):
+                d=self.prepare(operation='handoff',mode=mode,valid=False)
+                self.assertEqual(d['error'],'publication-metadata-write')
+                self.assertTrue(d['copy_tainted'])
+                self.assertEqual(self.inspect()['pair'],1)
+                self.assertEqual(self.clone.read_bytes(),self.original)
+                self.assertTrue((self.workspace/'publication').exists())
+
+    def test_handoff_refuses_media_before_metadata_and_supports_retry(self):
+        d=self.prepare(operation='handoff',mode='handoff-busy',valid=False)
+        self.assertEqual(d['error'],'publication-metadata-media')
+        self.assertFalse(d['copy_tainted'])
+        self.assertEqual(self.clone.stat().st_mode & 0o777,0o600)
+        self.prepare(operation='handoff-twice')
+        self.assertEqual(self.inspect()['pair'],1)
+
+    def test_abandoned_handoff_restores_private_copy_permissions(self):
+        self.source.chmod(0o644)
+        self.prepare(operation='handoff-restore')
+        self.assertEqual(self.clone.stat().st_mode & 0o777,0o600)
+        self.assertEqual(self.source.stat().st_mode & 0o777,0o644)
+        self.assertEqual(self.inspect()['pair'],1)
+        self.assertEqual(self.clone.read_bytes(),self.original)
 
     def test_durable_record_reopens_after_creator_exit(self):
         d = self.prepare()

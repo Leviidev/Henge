@@ -2,6 +2,7 @@
  * principal UID here is test-supplied, not kernel caller attestation. */
 #include "HGGuestPublicationIntent.h"
 #include "HGGuestRoleWrite.h"
+#include "HGGuestPublicationMetadata.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,7 +12,7 @@ int main(int argc,char **argv) {
     int discard=argc==5 && !strcmp(argv[1],"discard");
     int inspect=discard || (argc==5 && !strcmp(argv[1],"inspect"));
     if(!inspect && argc!=4)return 64;
-    if(!inspect && strcmp(argv[1],"prepare") && strcmp(argv[1],"neutral") && strcmp(argv[1],"tainted"))return 64;
+    if(!inspect && strcmp(argv[1],"prepare") && strcmp(argv[1],"neutral") && strcmp(argv[1],"tainted") && strcmp(argv[1],"handoff") && strcmp(argv[1],"handoff-restore") && strcmp(argv[1],"handoff-twice"))return 64;
     int incoming=open(argv[2],O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
     int witness=open(argv[2],O_RDWR|O_NOFOLLOW|O_CLOEXEC);
     int parent=open(argv[3],O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
@@ -29,16 +30,23 @@ int main(int argc,char **argv) {
     if(!status && !strcmp(argv[1],"neutral")) {
         HGGuestRoleWriteReport report={0};status=hg_guest_roles_write(&clone,0,&report,&error);
     }
-    if(!status && !strcmp(argv[1],"tainted"))clone.mutation_failed=1;
+    if(!status && !strcmp(argv[1],"tainted") && strcmp(argv[1],"handoff") && strcmp(argv[1],"handoff-restore"))clone.mutation_failed=1;
     char payload[65];memset(payload,'a',64);payload[64]=0;
     if(!status && discard)status=hg_guest_workspace_discard(&workspace,&error);
     if(!status && !discard)status=inspect?hg_guest_publication_intent_open(&workspace,&intent,&error):
         hg_guest_publication_intent_create(&workspace,&clone,&authority,payload,&intent,&error);
     if(!status && !discard)status=hg_guest_publication_intent_pair(&intent,authority.directory_fd,&pair,&error);
+    if(!status && (!strcmp(argv[1],"handoff") || !strcmp(argv[1],"handoff-restore") || !strcmp(argv[1],"handoff-twice"))) {
+        status=hg_guest_publication_metadata_set(&intent,&clone,&authority,0,&error);
+        if(!status && !strcmp(argv[1],"handoff-twice"))
+            status=hg_guest_publication_metadata_set(&intent,&clone,&authority,0,&error);
+        if(!status && !strcmp(argv[1],"handoff-restore"))
+            status=hg_guest_publication_metadata_set(&intent,&clone,&authority,1,&error);
+    }
     printf("{\"passed\":%s,\"error\":\"%s\",\"workspace\":\"%s\",\"clone\":\"%s\","
-           "\"pair\":%d,\"source_unchanged\":%s,\"intent_opened\":%s}\n",
+           "\"pair\":%d,\"source_unchanged\":%s,\"intent_opened\":%s,\"copy_tainted\":%s}\n",
            status?"false":"true",error?error:"",workspace.name,clone.name,(int)pair,
-           hg_guest_disk_unchanged(&source)?"true":"false",intent.record_fd>=0?"true":"false");
+           hg_guest_disk_unchanged(&source)?"true":"false",intent.record_fd>=0?"true":"false",clone.mutation_failed?"true":"false");
     fflush(stdout);
     /* Deliberately preserve intent and both files across process exit. */
     _exit(status?1:0);
