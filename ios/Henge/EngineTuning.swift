@@ -8,6 +8,7 @@ enum EngineTuning {
     static let superblocksKey = "henge.perf.superblocks"
     static let wfiSpinKey = "henge.perf.wfiSpin"
     static let fastFlushKey = "henge.perf.fastFlush"
+    static let keyboardLayoutKey = "henge.keyboard.layout"
 
     static let defaults: [String: String] = [
         // 60, not 120: every frame macOS draws is emulated and replayed, so 120 Hz
@@ -21,6 +22,7 @@ enum EngineTuning {
     static func apply() {
         var env = defaults
         let d = UserDefaults.standard
+        env["HV_KEYBOARD_LAYOUT"] = d.string(forKey: keyboardLayoutKey) == "jis" ? "jis" : "ansi"
         if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
