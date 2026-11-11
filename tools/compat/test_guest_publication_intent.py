@@ -35,6 +35,7 @@ class GuestPublicationIntentTests(unittest.TestCase):
 static int mode(const char *s){const char *m=getenv("HENGE_PUBLICATION_TEST");return m && !strcmp(m,s);}
 int hg_guest_media_copy(const HGGuestDisk *disk,char **json,const char **error) {
  static int queries;queries++;(void)disk;
+ if(mode("rollback-private-changed") && queries==2) {struct stat st;if(fstat(disk->fd,&st) || fchmod(disk->fd,(st.st_mode&0777)^0001))abort();}
  *json=strdup(mode("busy") || (mode("copy-busy") && queries==2) || (mode("handoff-busy") && queries==3)?"[{}]":"[]");*error=NULL;return 0;
 }
 static int test_sync(int fd) {
@@ -95,11 +96,38 @@ static int test_rename(int a,const char *b,int c,const char *d,unsigned flags) {
 #define renameatx_np test_rename
 #include "HGGuestSnapshotInvalidation.c"
 ''')
+        rollback_shim=folder/'rollback-shim.c'
+        rollback_shim.write_text(r'''
+#include "HGGuestPeer.h"
+#include <sys/stat.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static int mode(const char *s){const char *m=getenv("HENGE_PUBLICATION_TEST");return m && !strcmp(m,s);}
+int hg_guest_peer_unchanged(int fd,const HGGuestPeer *peer,const char **error) {
+ static int calls;calls++;(void)fd;
+ if(!peer->verified || (calls==2 && mode("rollback-peer-change")) || (calls==3 && mode("rollback-peer-late-change"))){*error="peer-parent-changed";return -1;}
+ *error=NULL;return 0;
+}
+static int test_sync(int fd) {
+ static int calls;calls++;
+ if(calls==1 && mode("rollback-parent-change") && fchmod(fd,0500))abort();
+ if(mode("rollback-sync-fail")){errno=EIO;return -1;}return fsync(fd);
+}
+static int test_rename(int a,const char *b,int c,const char *d,unsigned flags) {
+ if(mode("rollback-rename-fail")){errno=EIO;return -1;}return renameatx_np(a,b,c,d,flags);
+}
+#define fsync test_sync
+#define renameatx_np test_rename
+#include "HGGuestPublicationRollback.c"
+''')
         cls.control = folder / 'control'
         subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                         '-I', str(native), str(ROOT / 'tools/compat/guest_publication_intent_control.c'),
-                        str(shim), str(metadata_shim), str(snapshot_shim), *[str(native / f) for f in [
+                        str(shim), str(metadata_shim), str(snapshot_shim), str(rollback_shim), *[str(native / f) for f in [
                             'HGGuestDisk.c', 'HGGuestAPFS.c', 'HGGuestClone.c',
                             'HGGuestRoles.c', 'HGGuestRoleWrite.c', 'HGGuestWorkspace.c',
                             'HGGuestWriteAuthority.c']], '-lz', '-o', str(cls.control)], check=True)
@@ -151,6 +179,71 @@ static int test_rename(int a,const char *b,int c,const char *d,unsigned flags) {
         finally:
             os.close(left)
             os.close(right)
+
+    def rollback(self, valid=True, mode=''):
+        r=subprocess.run([str(self.control),'rollback',str(self.source),str(self.parent),self.workspace.name],
+                         capture_output=True,text=True,timeout=10,env={**os.environ,'HENGE_PUBLICATION_TEST':mode})
+        self.assertEqual(r.returncode,0 if valid else 1,r.stdout+r.stderr)
+        return json.loads(r.stdout)
+
+    def test_native_rollback_restores_original_and_preserves_failed_copy(self):
+        self.prepare(operation='ready')
+        with self.clone.open('r+b') as f:
+            f.seek(1024*1024);f.write(b'authored uncommitted guest changes')
+        failed=self.clone.read_bytes()
+        original_inode,copy_inode=self.source.stat().st_ino,self.clone.stat().st_ino
+        self.exchange_fixture()
+        d=self.rollback()
+        self.assertTrue(d['exchange_attempted']);self.assertTrue(d['rollback_durable']);self.assertEqual(d['rollback_pair'],1)
+        self.assertEqual((self.source.stat().st_ino,self.clone.stat().st_ino),(original_inode,copy_inode))
+        self.assertEqual(self.source.read_bytes(),self.original);self.assertEqual(self.clone.read_bytes(),failed)
+        d=self.rollback()
+        self.assertFalse(d['exchange_attempted']);self.assertTrue(d['rollback_durable']);self.assertEqual(d['rollback_pair'],1)
+        self.assertEqual(self.clone.read_bytes(),failed)
+
+    def test_native_rollback_sync_failure_retries_without_second_exchange(self):
+        self.prepare(operation='ready');self.exchange_fixture()
+        d=self.rollback(False,mode='rollback-sync-fail')
+        self.assertTrue(d['exchange_attempted']);self.assertFalse(d['rollback_durable']);self.assertEqual(d['rollback_pair'],1)
+        self.assertEqual(d['error'],'publication-rollback-sync')
+        self.assertEqual(self.source.read_bytes(),self.original)
+        d=self.rollback()
+        self.assertFalse(d['exchange_attempted']);self.assertTrue(d['rollback_durable'])
+
+    def test_native_rollback_late_peer_or_namespace_change_never_grants_durability(self):
+        for mode in ('rollback-peer-late-change','rollback-parent-change'):
+            with self.subTest(mode=mode):
+                self.prepare(operation='ready');self.exchange_fixture()
+                try:
+                    d=self.rollback(False,mode=mode)
+                    self.assertTrue(d['exchange_attempted']);self.assertFalse(d['rollback_durable'])
+                    self.assertEqual(d['rollback_pair'],1);self.assertEqual(self.source.read_bytes(),self.original)
+                finally:
+                    self.source.parent.chmod(0o700)
+                d=self.rollback()
+                self.assertFalse(d['exchange_attempted']);self.assertTrue(d['rollback_durable'])
+
+    def test_native_rollback_refuses_changed_peer_media_and_syscall_failure(self):
+        self.prepare(operation='ready');self.exchange_fixture()
+        copy_inode=self.source.stat().st_ino
+        for mode in ('rollback-wrong-uid','rollback-peer-change','busy','copy-busy','rollback-rename-fail'):
+            with self.subTest(mode=mode):
+                d=self.rollback(False,mode=mode)
+                self.assertFalse(d['rollback_durable']);self.assertEqual(self.source.stat().st_ino,copy_inode)
+                self.assertEqual(self.inspect()['pair'],2)
+                self.assertEqual(self.clone.read_bytes(),self.original)
+        self.assertTrue(self.rollback()['rollback_durable'])
+
+    def test_native_rollback_refuses_new_saved_state_and_private_metadata_changes(self):
+        self.prepare(operation='ready');self.exchange_fixture()
+        copy_inode=self.source.stat().st_ino
+        saved=self.source.parent/'resume.hsnap';saved.write_bytes(b'new saved state')
+        d=self.rollback(False)
+        self.assertFalse(d['exchange_attempted']);self.assertEqual(saved.read_bytes(),b'new saved state')
+        self.assertEqual(self.source.stat().st_ino,copy_inode);saved.unlink()
+        d=self.rollback(False,mode='rollback-private-changed')
+        self.assertFalse(d['exchange_attempted']);self.assertEqual(self.source.stat().st_ino,copy_inode)
+        self.assertEqual(self.clone.read_bytes(),self.original)
 
     def snapshot_inspect(self, valid=True, complete=False, mode=""):
         r=subprocess.run([str(self.control),'snapshot-complete' if complete else 'snapshot-inspect',str(self.source),str(self.parent),self.workspace.name],

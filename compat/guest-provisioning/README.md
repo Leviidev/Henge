@@ -753,3 +753,37 @@ and verified/completed the quarantine in separate processes. These are host
 controls, not iPad qualification. No app/helper operation invokes quarantine yet:
 production atomic exchange, restart supervisor, activation and health commit
 remain incomplete. The iOS System/Data mount panic guard remains unchanged.
+
+### Atomic rollback of an uncommitted image pair
+
+`HGGuestPublicationRollback` restores the original-active pair with `RENAME_SWAP`
+while retaining the failed copy and all its changes. It requires a freshly
+reattested live peer, caller-opened write authority for the current active inode,
+an independently/exclusively leased private image, the durable publication record,
+matching original ownership/mode/mtime and complete snapshot quarantine. Fresh
+media discovery must be empty for both images; peer, leases, namespace and snapshot
+state are checked again after discovery. Root never opens the active image for
+writing or accepts a source path/UID assertion as mutation authority.
+
+Both directories are synchronized, the resulting inode pair is observed, and
+retained file metadata/namespace/snapshots/peer are rechecked. A sync failure after
+successful exchange reports original-active with durability unconfirmed. A fresh
+process can then validate/sync the already-original-active pair without swapping
+again. If a kernel or observation failure makes the pair unknown, no further
+exchange or deletion is attempted. Callers must reopen leases after an attempted
+exchange because rename can change inode ctime. This API grants no boot or commit
+permission and exposes no forward publication or root-helper command.
+
+Twenty-seven native sanitizer intent/metadata/snapshot/rollback groups pass. Native
+rollback controls retain altered failed-copy bytes, exercise a fresh-process
+idempotent retry, and refuse wrong/changed peer, busy media, recreated RAM state,
+changed private metadata, late peer/namespace changes and injected rename/sync
+failures. The rollback tests
+stub peer attestation explicitly; they do not qualify kernel/root caller identity.
+A real authored 4 GiB APFS COW control with the production media scanner restored
+the original inode/full hash/owner/mode/mtime, retained the altered copy's full
+hash and quarantined RAM, and retried from another process without another swap.
+That host control also stubs peer identity; physical iPad rollback is unqualified.
+Production forward exchange, app restart routing, activation/health commit and
+fresh-guest acceptance remain incomplete. No live guest or checkpoint is changed
+by these authored-image controls.
