@@ -425,3 +425,20 @@ The components cross-compiled for arm64 iPadOS 17 with warnings treated as error
 These are Mac controls of inspection and transport, not proof of iPad persona
 permissions, physical attachment, IOMedia ownership or an actual Sonoma Data
 volume. No image attachment, mount or guest modification was performed.
+
+The complete packaging/tool suite now passes 62 tests. The full TrollStore package
+at `34b53450f05f` built and passed strict app/helper signature checks, arm64 helper
+inspection and all five compiled payload identity checks. The guest archive is
+still byte-identical to the independent complete build. This package is
+15,183,907 bytes with SHA-256
+`6ae897ee717103bdfa1ff923f8def00a874850eaa0ef1c92af49e1955b461277`.
+It has not been installed on the iPad.
+
+SSH access recovered after the device address changed. The previously installed
+Henge process remained running. A standalone iOS inspection control was killed
+with status 137 before returning any report, including when invoked with a
+nonexistent image. Adding its signing hash to the jailbreak trust cache did not
+change that outcome. This is an unqualified executable launch, not evidence of
+GPT rejection or successful image access. The live Sonoma guest was not stopped,
+attached, mounted or modified by this attempt. App-persona inspection remains an
+outstanding device gate.
