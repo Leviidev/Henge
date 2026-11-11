@@ -269,3 +269,21 @@ unkillable mount child and a child that exits later. This bounds child waiting;
 it does not prove kernel operations cannot hang or explain the physical failure.
 Production integration still needs supervision that preserves transaction
 ownership for unfinished children and must not boot a VM while cleanup is pending.
+
+### Guest OS identity
+
+`hg_guest_attachment_copy_system_version` reads `SystemVersion.plist` through the
+verified read-only System mount. It rechecks registry ownership, validates the
+opened root filesystem, traverses fixed directory components using no-follow
+descriptor-relative opens, and refuses filesystem crossings. The final regular
+file must be at most 64 KiB. It accepts XML/binary plists with bounded, typed macOS
+version/build fields and reports `sonoma=true` only for major version 14. A valid
+Sequoia version reports false; reporting an OS identity does not grant payload
+compatibility or installation authority. No guest file is written.
+
+Fourteen native mocked-boundary test groups now pass, including version parsing,
+Sequoia distinction, malformed/type/bounds checks, symlink refusal and filesystem
+crossing refusal. The developer control's `--system-version` flag exercises mounts
+and OS identification, but has not been run on the device. It remains subject to
+the unresolved physical mount gate above; do not run it before collecting logs
+and understanding that failure.

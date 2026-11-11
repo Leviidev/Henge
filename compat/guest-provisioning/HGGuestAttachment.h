@@ -37,4 +37,9 @@ int hg_guest_attachment_close(HGGuestAttachment *attachment, const char **error)
  * directories. Paths remain valid only until close; close unmounts before eject.
  * No payload files or guest configuration are written. */
 int hg_guest_attachment_mount_readonly(HGGuestAttachment *attachment, const char **error);
+/* Read bounded SystemVersion.plist through a verified read-only System mount.
+ * Reports OS identity, including whether the major version is Sonoma (14).
+ * This is not payload compatibility/installation authority. Caller frees JSON. */
+int hg_guest_attachment_copy_system_version(const HGGuestAttachment *attachment,
+                                            char **json, const char **error);
 #endif

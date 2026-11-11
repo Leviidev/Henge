@@ -42,6 +42,23 @@ static int spawn_control(pid_t *pid, const char *path,
   strlcpy(mountPaths[index],argv[4],PATH_MAX);
   if(index && [scenario isEqual:@"mount-data-fail"])statusCode=1;
   else mounted[index]=1;
+  if(!index && [scenario hasPrefix:@"version-"]) {
+   NSString *core=[@(argv[4]) stringByAppendingPathComponent:@"System/Library/CoreServices"];
+   [[NSFileManager defaultManager] createDirectoryAtPath:core withIntermediateDirectories:YES attributes:nil error:NULL];
+   NSString *file=[core stringByAppendingPathComponent:@"SystemVersion.plist"];
+   NSMutableDictionary *version=[@{@"ProductName":@"macOS",@"ProductVersion":@"14.6.1",@"ProductBuildVersion":@"23G93"} mutableCopy];
+   if([scenario isEqual:@"version-sequoia"]){version[@"ProductVersion"]=@"15.0";version[@"ProductBuildVersion"]=@"24A335";}
+   if([scenario isEqual:@"version-type"])version[@"ProductVersion"]=@14;
+   if([scenario isEqual:@"version-newline"])version[@"ProductVersion"]=@"14.6.1\n";
+   if([scenario isEqual:@"version-build"])version[@"ProductBuildVersion"]=@"23G93/other";
+   if([scenario isEqual:@"version-name"])version[@"ProductName"]=@"iPadOS";
+   NSData *bytes=[NSPropertyListSerialization dataWithPropertyList:version
+    format:[scenario isEqual:@"version-binary"]?NSPropertyListBinaryFormat_v1_0:NSPropertyListXMLFormat_v1_0
+    options:0 error:NULL];
+   if([scenario isEqual:@"version-oversize"])bytes=[NSMutableData dataWithLength:65537];
+   if([scenario isEqual:@"version-link"])symlink("/etc/hosts",file.fileSystemRepresentation);
+   else if(![scenario isEqual:@"version-missing"])[bytes writeToFile:file atomically:NO];
+  }
   if([scenario isEqual:@"mount-unkillable"])timedWait=1;
   return 0;
  }
@@ -90,7 +107,19 @@ static int filesystem_control(const char *path,struct statfs *fs) {
 static int unmount_control(const char *path,int flags) {
  if(flags)abort();
  for(int i=0;i<2;i++)if(mounted[i] && !strcmp(path,mountPaths[i])) {
+  if([scenario hasPrefix:@"version-"])[[NSFileManager defaultManager]
+   removeItemAtPath:[@(path) stringByAppendingPathComponent:@"System"] error:NULL];
   mounted[i]=0;unmounts++;return 0;
+ }
+ return -1;
+}
+static int descriptor_filesystem_control(int fd,struct statfs *fs) {
+ char path[PATH_MAX];if(fcntl(fd,F_GETPATH,path))return -1;
+ if(!strncmp(path,"/private/tmp/",13))memmove(path,path+8,strlen(path+8)+1);
+ for(int i=0;i<2;i++)if(mountPaths[i][0] && !strncmp(path,mountPaths[i],strlen(mountPaths[i]))) {
+  int result=filesystem_control(mountPaths[i],fs);
+  if([scenario isEqual:@"version-crossfs"] && strcmp(path,mountPaths[i]))fs->f_fsid.val[0]=1;
+  return result;
  }
  return -1;
 }
@@ -101,7 +130,7 @@ int hg_guest_media_copy(const HGGuestDisk *disk,char **json,const char **error) 
  @"writable":@([scenario isEqual:@"writable"]),@"bytes":@(disk->identity.st_size),
  @"bsd_name":@"disk21",@"registry_id":@(([scenario isEqual:@"reused"] && inventoryCalls>3)?999:101)};
  NSMutableArray *rows=[NSMutableArray arrayWithObject:row];
- if([scenario hasPrefix:@"mount-"])for(int i=1;i<=2;i++)[rows addObject:@{
+ if([scenario hasPrefix:@"mount-"] || [scenario hasPrefix:@"version-"])for(int i=1;i<=2;i++)[rows addObject:@{
  @"bsd_name":[NSString stringWithFormat:@"disk21s%d",i],@"registry_id":@(101+i)}];
  NSData *bytes=[NSJSONSerialization dataWithJSONObject:rows options:0 error:NULL];
  *json=strndup(bytes.bytes,bytes.length);return 0;
@@ -118,15 +147,20 @@ int hg_guest_media_copy_volume_group(const HGGuestDisk *disk,char **json,const c
 #define mkdtemp directory_control
 #define statfs(path,fs) filesystem_control(path,fs)
 #define unmount unmount_control
+#define fstatfs(fd,fs) descriptor_filesystem_control(fd,fs)
 #include "HGGuestAttachment.m"
 int main(int argc,char **argv){@autoreleasepool{
  if(argc!=3)return 64;scenario=@(argv[2]);
  HGGuestDisk disk={.fd=open(argv[1],O_RDONLY|O_CLOEXEC)};
  if(disk.fd<0 || fstat(disk.fd,&disk.identity) || flock(disk.fd,LOCK_EX|LOCK_NB))return 70;
  attached=[scenario isEqual:@"existing"];
- HGGuestAttachment a={0};char *group=NULL;const char *error=NULL,*cleanup=NULL;
+ HGGuestAttachment a={0};char *group=NULL,*version=NULL;const char *error=NULL,*cleanup=NULL;
  int opened=hg_guest_attachment_open(&disk,&a,&group,&error);
  if(!opened && [scenario hasPrefix:@"mount-"])opened=hg_guest_attachment_mount_readonly(&a,&error);
+ if(!opened && [scenario hasPrefix:@"version-"]) {
+  opened=hg_guest_attachment_mount_readonly(&a,&error);
+  if(!opened)opened=hg_guest_attachment_copy_system_version(&a,&version,&error);
+ }
  if([scenario isEqual:@"late-exit"])timedWait=0;
  if([scenario isEqual:@"double-open"]) {
   char *second=NULL;const char *secondError=NULL;
@@ -135,10 +169,10 @@ int main(int argc,char **argv){@autoreleasepool{
  }
  if([scenario isEqual:@"reused"])inventoryCalls=4;
  int closed=a.disk?hg_guest_attachment_close(&a,&cleanup):0;
- printf("{\"opened\":%s,\"closed\":%s,\"attached\":%s,\"launches\":%d,\"ejects\":%d,\"kills\":%d,\"unmounts\":%d,\"error\":\"%s\",\"cleanup\":\"%s\"}\n",
- opened?"false":"true",closed?"false":"true",attached?"true":"false",launches,ejects,kills,unmounts,error?:"",cleanup?:"");
+ printf("{\"opened\":%s,\"closed\":%s,\"attached\":%s,\"launches\":%d,\"ejects\":%d,\"kills\":%d,\"unmounts\":%d,\"version\":%s,\"error\":\"%s\",\"cleanup\":\"%s\"}\n",
+ opened?"false":"true",closed?"false":"true",attached?"true":"false",launches,ejects,kills,unmounts,version?:"null",error?:"",cleanup?:"");
  for(int i=0;i<2;i++)if(mountPaths[i][0])rmdir(mountPaths[i]);
- free(group);hg_guest_disk_close(&disk);return 0;
+ free(group);free(version);hg_guest_disk_close(&disk);return 0;
 }}
 ''')
         cls.control = base / 'control'
@@ -168,6 +202,28 @@ int main(int argc,char **argv){@autoreleasepool{
         self.assertTrue(r['closed'])
         self.assertEqual(r['unmounts'], 2)
         self.assertEqual(r['ejects'], 1)
+
+    def test_bounded_xml_and_binary_system_version_identity(self):
+        for scenario in ('version-valid', 'version-binary'):
+            with self.subTest(scenario=scenario):
+                r = self.run_control(scenario)
+                self.assertTrue(r['opened'])
+                self.assertTrue(r['version']['sonoma'])
+                self.assertEqual(r['version']['product_version'], '14.6.1')
+                self.assertEqual(r['version']['product_build_version'], '23G93')
+                self.assertTrue(r['closed'])
+        r = self.run_control('version-sequoia')
+        self.assertTrue(r['opened'])
+        self.assertFalse(r['version']['sonoma'])
+
+    def test_version_symlinks_cross_mounts_types_bounds_and_malformed_values_fail(self):
+        for scenario in ('version-type', 'version-newline', 'version-build', 'version-name',
+                         'version-oversize', 'version-link', 'version-missing', 'version-crossfs'):
+            with self.subTest(scenario=scenario):
+                r = self.run_control(scenario)
+                self.assertFalse(r['opened'])
+                self.assertIsNone(r['version'])
+                self.assertTrue(r['closed'])
 
     def test_second_mount_failure_cleans_first_mount_and_empty_directory(self):
         r = self.run_control('mount-data-fail')

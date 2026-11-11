@@ -105,6 +105,83 @@ static BOOL mount_matches(const HGGuestReadonlyMount *mount, const struct statfs
                           (MNT_RDONLY | MNT_NOEXEC | MNT_NOSUID);
 }
 
+int hg_guest_attachment_copy_system_version(const HGGuestAttachment *attachment,
+                                            char **json, const char **error)
+{
+    if (json) *json = NULL;
+    if (!attachment || !attachment->disk || !json || !error) return -1;
+    *error = "guest-version-unavailable";
+    const HGGuestReadonlyMount *mount = &attachment->system_mount;
+    if (!mount->path[0] || attachment->pending_child || mount->pending_child ||
+        !hg_guest_disk_unchanged(attachment->disk)) return -1;
+    @autoreleasepool {
+        NSArray *rows = inventory(attachment->disk, error);
+        BOOL owned = NO;
+        for (NSDictionary *row in rows) {
+            if (!strcmp([row[@"bsd_name"] UTF8String], mount->bsd) &&
+                [row[@"registry_id"] unsignedLongLongValue] == mount->registry_id) owned = YES;
+        }
+        if (!owned) { *error = "mount-identity-changed"; return -1; }
+        *error = "guest-version-unavailable";
+        int fd = open(mount->path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        struct statfs rootfs;
+        if (fd < 0) return -1;
+        if (fstatfs(fd, &rootfs) || !mount_matches(mount, &rootfs)) { close(fd); return -1; }
+        const char *components[] = {"System", "Library", "CoreServices", "SystemVersion.plist"};
+        for (unsigned int i = 0; i < 4; i++) {
+            int next = openat(fd, components[i], O_RDONLY | O_NOFOLLOW | O_CLOEXEC |
+                              O_NONBLOCK | (i < 3 ? O_DIRECTORY : 0));
+            close(fd);
+            if (next < 0) return -1;
+            fd = next;
+            struct statfs fs;
+            if (fstatfs(fd, &fs) || memcmp(&fs.f_fsid, &rootfs.f_fsid, sizeof(fs.f_fsid))) {
+                close(fd); return -1;
+            }
+        }
+        struct stat file;
+        if (fstat(fd, &file) || !S_ISREG(file.st_mode) || file.st_size < 1 || file.st_size > 65536) {
+            close(fd); return -1;
+        }
+        unsigned char buffer[65537];
+        size_t count = 0;
+        while (count < sizeof(buffer)) {
+            ssize_t bytes = read(fd, buffer + count, sizeof(buffer) - count);
+            if (bytes < 0 && errno == EINTR) continue;
+            if (bytes < 0) { close(fd); return -1; }
+            if (!bytes) break;
+            count += (size_t)bytes;
+        }
+        close(fd);
+        if (count != (size_t)file.st_size) return -1;
+        id plist = [NSPropertyListSerialization propertyListWithData:[NSData dataWithBytes:buffer length:count]
+                            options:NSPropertyListImmutable format:NULL error:NULL];
+        if (![plist isKindOfClass:NSDictionary.class]) return -1;
+        id name = plist[@"ProductName"], version = plist[@"ProductVersion"], build = plist[@"ProductBuildVersion"];
+        if (![name isEqual:@"macOS"] || ![version isKindOfClass:NSString.class] ||
+            ![build isKindOfClass:NSString.class] || [version length] > 16 || [build length] > 16) return -1;
+        NSRegularExpression *versionPattern = [NSRegularExpression regularExpressionWithPattern:
+            @"[1-9][0-9]{0,2}\\.(0|[1-9][0-9]{0,2})(\\.(0|[1-9][0-9]{0,2}))?" options:0 error:NULL];
+        NSRegularExpression *buildPattern = [NSRegularExpression regularExpressionWithPattern:
+            @"[1-9][0-9]{0,2}[A-Z][1-9][0-9]{0,6}[a-z]?" options:0 error:NULL];
+        NSRange vr = NSMakeRange(0, [version length]), br = NSMakeRange(0, [build length]);
+        NSTextCheckingResult *vm = [versionPattern firstMatchInString:version options:0 range:vr];
+        NSTextCheckingResult *bm = [buildPattern firstMatchInString:build options:0 range:br];
+        if (!vm || !bm || !NSEqualRanges(vm.range, vr) || !NSEqualRanges(bm.range, br)) return -1;
+        if (!hg_guest_disk_unchanged(attachment->disk)) { *error = "image-identity-changed"; return -1; }
+        NSData *result = [NSJSONSerialization dataWithJSONObject:@{
+            @"schema": @1, @"product_name": name, @"product_version": version,
+            @"product_build_version": build, @"sonoma": @([version hasPrefix:@"14."]),
+            @"image_modified": @NO
+        } options:NSJSONWritingSortedKeys error:NULL];
+        if (!result) return -1;
+        *json = strndup(result.bytes, result.length);
+        if (!*json) return -1;
+        *error = NULL;
+        return 0;
+    }
+}
+
 static int close_mount(HGGuestReadonlyMount *mount, NSArray *rows)
 {
     if (!mount->path[0]) return 0;
