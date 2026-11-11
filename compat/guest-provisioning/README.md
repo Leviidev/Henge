@@ -420,3 +420,28 @@ create, independent inode/APFS identity, empty-media discard and unchanged sourc
 identity. arm64 iPadOS compilation passes. This is host qualification, not an
 iPad clone/mount or production replacement transaction; native role mutation,
 journaling/restoration, publication/rollback and activation remain unfinished.
+
+### Role restoration planning
+
+`HGGuestRoles` produces a bounded edit plan from retained original and observed
+strict catalogs. Neutralization targets only System/Data roles. Restoration
+preserves each historical record's original role; new checkpoint records inherit
+the current original volume's role only when OID, volume UUID and group UUID
+match. Unknown volumes, conflicting roles, duplicate current identities, invalid
+catalog bounds and changes to an old record's flags are rejected. Exact old
+records accept their original or neutral role, permitting a partially restored
+plan to be planned again without changing already restored roles.
+
+This is pure planning: it never opens or modifies an image. Sixteen native
+sanitizer-backed controls cover historical role preservation, newly created
+checkpoints, idempotence and conflicting identities. An executor still needs
+private clone write authority, full block/checksum revalidation, durable recovery
+journaling, media exclusion and publication/rollback. The planner is compiled
+into the packaged helper but has no production command or mount authority.
+
+`tools/compat/guest_roles_control.c` opens two authored images read-only under
+independent leases, checks matching GPT disk identity/geometry, obtains strict
+catalogs and reports the plan without executing it. The real authored original
+and role-neutral copy produced four restoration edits. A separate control used
+the real post-write catalog with modeled neutral roles to verify restoration of
+new checkpoints; that control is not a filesystem-write or recovery proof.
