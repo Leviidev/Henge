@@ -388,3 +388,12 @@ changed descriptor and rejected caller-supplied path arguments. The native
 implementation and helper compiled for arm64 iPadOS 17 with warnings treated as
 errors. These controls establish the installation input boundary; they do not
 qualify the actual iPad persona, a mount, guest installation or app activation.
+
+All 50 packaging/tool tests passed after integration. The full TrollStore package
+at `0dbaee70ee66` also built and passed signature inspection. Its helper is arm64,
+contains all five expected compiled identity constants and retains only the
+helper's no-sandbox entitlement. The guest archive remains byte-identical to the
+independent complete build above. This package is 15,180,969 bytes with SHA-256
+`6f14c9362293963fcca05e99802947e5f5cd792eeced48447c4fb2e457917c17`.
+It has not been deployed: both SSH and CoreDevice still report the iPad
+unavailable. No guest disk was opened or changed by these checks.
