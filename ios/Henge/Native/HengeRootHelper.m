@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -17,7 +18,7 @@ static double monotonic_now(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-char *henge_root_helper_probe(void)
+static char *run_helper(const char *operation, int image)
 {
     @autoreleasepool {
         NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"henge-root-helper"];
@@ -39,12 +40,25 @@ char *henge_root_helper_probe(void)
         posix_spawn_file_actions_t actions;
         BOOL initialized = NO;
         if (!error && pipe(pipes)) error = errno;
+        // Keep action sources away from stdio and the fixed image target FD 3.
+        if (!error) {
+            int high[2] = {fcntl(pipes[0], F_DUPFD_CLOEXEC, 10), -1};
+            if (high[0] >= 0) high[1] = fcntl(pipes[1], F_DUPFD_CLOEXEC, 10);
+            int saved = errno;
+            close(pipes[0]); close(pipes[1]);
+            pipes[0] = high[0]; pipes[1] = high[1];
+            if (high[0] < 0 || high[1] < 0) error = saved;
+        }
         if (!error) error = posix_spawn_file_actions_init(&actions);
         if (!error) initialized = YES;
         if (!error) error = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
         if (!error) error = posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
+        if (!error) error = posix_spawn_file_actions_addclose(&actions, pipes[0]);
+        if (!error) error = posix_spawn_file_actions_addclose(&actions, pipes[1]);
         if (!error) error = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-        char *argv[] = {(char *)path.fileSystemRepresentation, "probe-v1", NULL};
+        if (!error && image >= 0) error = posix_spawn_file_actions_adddup2(&actions, image, 3);
+        if (!error && image >= 0) error = posix_spawn_file_actions_addclose(&actions, image);
+        char *argv[] = {(char *)path.fileSystemRepresentation, (char *)operation, NULL};
         char *env[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", NULL};
         pid_t child = -1;
         if (!error) error = posix_spawn(&child, path.fileSystemRepresentation, &actions, &attr, argv, env);
@@ -92,12 +106,38 @@ char *henge_root_helper_probe(void)
         if ([report isKindOfClass:NSDictionary.class] && [report[@"payload_verified"] isEqual:@NO])
             NSLog(@"Henge bundled payload validation failed: %@", report[@"payload_verification"]);
         if (![report isKindOfClass:NSDictionary.class] ||
-            ![report[@"schema"] isEqual:@1] || ![report[@"operation"] isEqual:@"probe-v1"] ||
+            ![report[@"schema"] isEqual:@1] || ![report[@"operation"] isEqual:@(operation)] ||
             ![report[@"root"] isEqual:@YES] || ![report[@"uid"] isEqual:@0] ||
             ![report[@"euid"] isEqual:@0] || ![report[@"gid"] isEqual:@0] ||
-            ![report[@"egid"] isEqual:@0] || ![report[@"payload_verified"] isEqual:@YES] ||
-            ![report[@"guest_disk_accessed"] isEqual:@NO]) return NULL;
+            ![report[@"egid"] isEqual:@0] || ![report[@"payload_verified"] isEqual:@YES]) return NULL;
+        if (image < 0) {
+            if (![report[@"guest_disk_accessed"] isEqual:@NO]) return NULL;
+        } else if (![report[@"image_inspected"] isEqual:@YES] ||
+                   ![report[@"exclusive_lease_verified"] isEqual:@YES] ||
+                   ![report[@"image_modified"] isEqual:@NO] ||
+                   ![report[@"image_attached"] isEqual:@NO] ||
+                   ![report[@"volume_mounted"] isEqual:@NO]) return NULL;
         output[used] = '\0';
         return strdup(output);
     }
+}
+
+char *henge_root_helper_probe(void)
+{
+    return run_helper("probe-v1", -1);
+}
+
+char *henge_root_helper_inspect_disk(const char *path)
+{
+    if (!path) return NULL;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat info;
+    int high = -1;
+    if (!fstat(fd, &info) && S_ISREG(info.st_mode)) high = fcntl(fd, F_DUPFD_CLOEXEC, 10);
+    close(fd);
+    if (high < 0) return NULL;
+    char *report = run_helper("inspect-image-v1", high);
+    close(high);
+    return report;
 }

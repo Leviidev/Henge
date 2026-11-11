@@ -107,7 +107,8 @@ PY
     xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 \
         -Wall -Wextra -Werror -O2 -fobjc-arc -include "$PAYLOAD_HEADER" \
         "$IOS/../compat/guest-provisioning/root_helper.c" \
-        "$IOS/../compat/guest-provisioning/HGGuestPayload.m" -framework Foundation -lz \
+        "$IOS/../compat/guest-provisioning/HGGuestPayload.m" \
+        "$IOS/../compat/guest-provisioning/HGGuestDisk.c" -framework Foundation -lz \
         -o "$SAPP/henge-root-helper"
     HELPER_ENT="$STAGE/helper-entitlements.plist"
     python3 - "$HELPER_ENT" <<'PY'

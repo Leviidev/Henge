@@ -397,3 +397,31 @@ independent complete build above. This package is 15,180,969 bytes with SHA-256
 `6f14c9362293963fcca05e99802947e5f5cd792eeced48447c4fb2e457917c17`.
 It has not been deployed: both SSH and CoreDevice still report the iPad
 unavailable. No guest disk was opened or changed by these checks.
+
+### Native read-only image ownership and GPT inspection
+
+The native helper now accepts `inspect-image-v1` through inherited read-only FD 3,
+after successful payload authentication and root identity checks. Its app-side
+transport opens only regular no-follow resources, grants only the read-only
+descriptor, avoids descriptor target collisions and validates a no-write,
+no-attachment/no-mount response. This internal API is not yet an automatic
+installation flow.
+
+`HGGuestDisk.c` reopens the file independently, matches its inode/size/timestamps,
+acquires an exclusive nonblocking lease, checks both GPT headers and table CRCs,
+mirrored arrays, ranges, overlap, unique partition IDs and exactly one ordinary
+APFS type partition, then rechecks file identity. It closes ownership before
+return; callers must not use the report as authority for a later installation.
+
+Ten native authored-file groups passed, covering aliases, shared/exclusive
+conflicts, preservation of incoming locks, read-only/close-on-exec descriptors,
+changed files, CRC/mirror failures, GPT geometry, overlaps/duplicates, zero-type
+unused entries, missing/multiple APFS types and nonsector-sized files. The native
+inspector also accepted the authored 96 MiB GPT/APFS image and its whole-file hash
+remained unchanged. Fixed-FD process controls confirmed only read access and no
+path arguments, rejected symlink/FIFO inputs and rejected a write-bearing report.
+The components cross-compiled for arm64 iPadOS 17 with warnings treated as errors.
+
+These are Mac controls of inspection and transport, not proof of iPad persona
+permissions, physical attachment, IOMedia ownership or an actual Sonoma Data
+volume. No image attachment, mount or guest modification was performed.

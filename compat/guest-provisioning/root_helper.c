@@ -1,5 +1,7 @@
-/* Read-only identity/payload checks. No caller paths or guest disk operations. */
+/* Read-only identity, payload and inherited-image inspection. No caller paths. */
 #include "HGGuestPayload.h"
+#include "HGGuestDisk.h"
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,7 +21,8 @@ static const HGGuestPayloadIdentity payload_identity = {
 
 int main(int argc, char **argv)
 {
-    if (argc != 2 || (strcmp(argv[1], "probe-v1") && strcmp(argv[1], "verify-payload-v1"))) {
+    if (argc != 2 || (strcmp(argv[1], "probe-v1") && strcmp(argv[1], "verify-payload-v1") &&
+                     strcmp(argv[1], "inspect-image-v1"))) {
         fputs("unsupported helper operation\n", stderr);
         return 64;
     }
@@ -31,6 +34,36 @@ int main(int argc, char **argv)
         return verified;
     }
     int root = getuid() == 0 && geteuid() == 0 && getgid() == 0 && getegid() == 0;
+    if (!strcmp(argv[1], "inspect-image-v1")) {
+        if (verified) {
+            if (report) puts(report);
+            free(report);
+            return verified;
+        }
+        free(report);
+        HGGuestDisk disk = {.fd = -1};
+        const char *error = "root-required";
+        int status = -1;
+        if (root) {
+            int flags = fcntl(3, F_GETFD);
+            if (flags >= 0 && !fcntl(3, F_SETFD, flags | FD_CLOEXEC))
+                status = hg_guest_disk_inspect_fd(3, &disk, &error);
+            else error = "invalid-descriptor";
+        }
+        printf("{\"schema\":1,\"operation\":\"inspect-image-v1\",\"root\":%s,"
+               "\"uid\":%u,\"euid\":%u,\"gid\":%u,\"egid\":%u,"
+               "\"payload_verified\":true,\"image_inspected\":%s,\"error\":\"%s\","
+               "\"image_bytes\":%llu,\"partitions\":%u,\"first_apfs_lba\":%llu,"
+               "\"last_apfs_lba\":%llu,\"exclusive_lease_verified\":%s,"
+               "\"image_modified\":false,\"image_attached\":false,\"volume_mounted\":false}\n",
+               root ? "true" : "false", getuid(), geteuid(), getgid(), getegid(),
+               !status ? "true" : "false", error ? error : "",
+               (unsigned long long)disk.identity.st_size, disk.partitions,
+               (unsigned long long)disk.first_apfs_lba, (unsigned long long)disk.last_apfs_lba,
+               !status ? "true" : "false");
+        hg_guest_disk_close(&disk);
+        return !root ? 77 : !status ? 0 : !strcmp(error, "image-in-use") ? 75 : 65;
+    }
     printf("{\"schema\":1,\"operation\":\"probe-v1\",\"root\":%s,"
            "\"uid\":%u,\"euid\":%u,\"gid\":%u,\"egid\":%u,"
            "\"hdik_executable\":%s,\"mount_apfs_executable\":%s,"

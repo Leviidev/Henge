@@ -40,11 +40,11 @@ int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t *a, uid_t u)
 { (void)a; return u == 0 ? 0 : 22; }
 int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *a, uid_t u)
 { (void)a; return u == 0 ? 0 : 22; }
-int main(void) {
+int main(int argc, char **argv) {
     if (getenv("HENGE_CONTROL_INHERITED_FD")) {
         int fd = open("/dev/null", O_RDONLY); dup2(fd, 96); close(fd);
     }
-    char *p = henge_root_helper_probe();
+    char *p = argc == 2 ? henge_root_helper_inspect_disk(argv[1]) : henge_root_helper_probe();
     if (!p) return 1; puts(p); free(p); return 0; }
 ''')
         cls.runner = macos / 'Control'
@@ -58,19 +58,21 @@ int main(void) {
         subprocess.run(['clang', '-Wall', '-Wextra', '-Werror',
                         str(ROOT / 'compat/guest-provisioning/root_helper.c'),
                         '-fobjc-arc', str(ROOT / 'compat/guest-provisioning/HGGuestPayload.m'),
+                        str(ROOT / 'compat/guest-provisioning/HGGuestDisk.c'),
                         '-framework', 'Foundation', '-lz',
                         '-o', str(cls.real_helper)], check=True)
 
     def fixture(self, body):
         source = self.base / 'fixture.c'
         source.write_text('#include <stdio.h>\n#include <unistd.h>\n#include <signal.h>\n'
-                          '#include <stdlib.h>\nint main(void) {' + body + '}\n')
+                          '#include <stdlib.h>\n#include <fcntl.h>\n#include <string.h>\n'
+                          'int main(int argc,char **argv) {(void)argc;(void)argv;' + body + '}\n')
         subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', str(source),
                         '-o', str(self.helper)], check=True)
 
-    def run_probe(self, **environment):
+    def run_probe(self, image=None, **environment):
         import os
-        return subprocess.run([str(self.runner)], capture_output=True, timeout=6,
+        return subprocess.run([str(self.runner), *([str(image)] if image else [])], capture_output=True, timeout=6,
                               env={**os.environ, **environment})
 
     def test_helper_rejects_every_other_operation(self):
@@ -89,11 +91,12 @@ int main(void) {
         self.assertFalse(report['guest_disk_accessed'])
 
     def test_unbound_helper_never_accepts_payload_resources(self):
-        result = subprocess.run([str(self.real_helper), 'verify-payload-v1'], capture_output=True)
-        self.assertEqual(result.returncode, 65)
-        report = json.loads(result.stdout)
-        self.assertFalse(report['payload_verified'])
-        self.assertEqual(report['error'], 'unbound-build-identity')
+        for operation in ('verify-payload-v1', 'inspect-image-v1'):
+            result = subprocess.run([str(self.real_helper), operation], capture_output=True)
+            self.assertEqual(result.returncode, 65)
+            report = json.loads(result.stdout)
+            self.assertFalse(report['payload_verified'])
+            self.assertEqual(report['error'], 'unbound-build-identity')
 
     def test_protocol_and_process_failures(self):
         valid = dict(schema=1, operation='probe-v1', root=True, uid=0, euid=0,
@@ -144,6 +147,38 @@ int main(void) {
         self.helper.write_text('not executable')
         self.helper.chmod(0o644)
         self.assertEqual(self.run_probe().returncode, 1)
+
+    def test_image_is_passed_only_as_readonly_descriptor_three(self):
+        image = self.base / 'disk.img'
+        original = b'HGFD authored disk control'
+        image.write_bytes(original)
+        report = dict(schema=1, operation='inspect-image-v1', root=True, uid=0,
+                      euid=0, gid=0, egid=0, payload_verified=True, image_inspected=True,
+                      exclusive_lease_verified=True, image_modified=False,
+                      image_attached=False, volume_mounted=False)
+        checks = '''if(argc!=2 || strcmp(argv[1],"inspect-image-v1") ||
+            (fcntl(3,F_GETFL)&O_ACCMODE)!=O_RDONLY) return 91;
+            char b[4]; if(pread(3,b,4,0)!=4 || memcmp(b,"HGFD",4))return 92;
+            if(write(3,"bad",3)>=0)return 93;
+        '''
+        self.fixture(checks + 'puts(' + json.dumps(json.dumps(report)) + '); return 0;')
+        self.assertEqual(self.run_probe(image=image).returncode, 0)
+        self.assertEqual(image.read_bytes(), original)
+        report['image_modified'] = True
+        self.fixture('puts(' + json.dumps(json.dumps(report)) + '); return 0;')
+        self.assertEqual(self.run_probe(image=image).returncode, 1)
+
+    def test_image_path_symlink_and_fifo_are_rejected_before_spawn(self):
+        image = self.base / 'resource'
+        image.write_bytes(b'authored file')
+        alias = self.base / 'alias'
+        alias.symlink_to(image)
+        self.fixture('for (;;) pause();')
+        self.assertEqual(self.run_probe(image=alias).returncode, 1)
+        alias.unlink()
+        import os
+        os.mkfifo(alias)
+        self.assertEqual(self.run_probe(image=alias).returncode, 1)
 
 
 if __name__ == '__main__':

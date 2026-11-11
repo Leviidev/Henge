@@ -15,8 +15,8 @@ application context still requires qualification on the matching iPad.
 At launch, Henge runs a read-only `probe-v1` on a background queue. The helper
 accepts no caller paths. It reports real/effective user/group identity, tool
 availability and verification of its bundled payload. The additional
-`verify-payload-v1` operation reports only the read-only payload check. It never
-opens a guest image or creates a mountpoint. The launcher
+`verify-payload-v1` operation reports only the read-only payload check. Neither
+of these operations opens a guest image. The launcher
 checks all persona setup results, closes unrelated inherited descriptors,
 supplies a fixed environment, bounds output to 4095 bytes and kills/reaps a
 helper that does not complete within three seconds. Valid root identity and a
@@ -104,3 +104,36 @@ process to load the guest libraries and an isolated signed VLC candidate's own
 headless module loader to check all nine plugins. Content-based UUIDs are retained
 with reproducible linker mode. These build-time checks do not qualify guest
 execution or GUI behavior, and they never start the installed VLC app.
+
+## Read-only image inspection
+
+The internal `henge_root_helper_inspect_disk` API opens a caller-selected,
+machine-owned regular file read-only and passes it at fixed child FD 3; no image
+path appears in the helper command line. It rejects symlinks and nonregular
+resources before spawning. Pipe/image source descriptors are duplicated above
+stdio/FD 3, explicitly closed in the child after mapping, and excluded from other
+inheritance. The existing fixed environment, root persona and three-second limit
+apply. The helper's `inspect-image-v1` requires root and a verified bundled
+payload before inspecting the inherited image. It accepts no path arguments.
+
+`HGGuestDisk.c` obtains the descriptor's path, opens an independent read-only
+descriptor, matches its inode/size/timestamps before reading, and acquires an
+exclusive nonblocking lease. This preserves the incoming descriptor's locks and
+excludes cooperating VM readers/writers, including hard-link aliases. It holds
+ownership through inspection and closes the lease before the API returns.
+Installation must acquire a new lease and revalidate within its own transaction;
+this metadata report never reserves or authorizes a later write.
+
+The current profile checks 512-byte-sector GPT primary/backup headers, CRCs,
+mirrored bounded entry tables, usable ranges, partition overlap and unique IDs,
+and requires one ordinary Apple APFS partition. Unused zero-type entries may
+retain stale bytes. It reports partition bounds, not a mounted APFS container or
+Sonoma Data-volume identity. Noncooperating file changes are detected by a final
+identity check. Unsupported/corrupt/in-use images fail without writing or mounting.
+
+Native controls cover sparse GPT fixtures, locks/aliases, incoming lock
+preservation, descriptor authority, corruption, geometry and changed files.
+The authored 96 MiB APFS image passed native inspection with an unchanged whole
+file hash. This API is ready for the next provisioning step; it is not yet invoked
+as an automatic install flow. Physical attachment, verified IOMedia ancestry,
+Sonoma Data-volume selection and payload delivery/activation remain unfinished.
