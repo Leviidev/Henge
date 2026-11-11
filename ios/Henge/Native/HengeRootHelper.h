@@ -16,4 +16,10 @@ char *henge_root_helper_recover_workspaces(void);
  * and a successful report is not transferable write authority. A future
  * mutation operation must reattest its own live caller and target rights. */
 char *henge_root_helper_attest_caller(void);
+/* Qualifies live caller + explicit app-opened read/write capability for one
+ * machine-owned disk. Passes only fixed FDs 3/4, no path/UID argument. The
+ * helper inspects and leases but NEVER writes/attaches/mounts the source.
+ * Returned JSON is diagnostic only; all authority/leases expire on return.
+ * Future provisioning must retain/revalidate these within its own operation. */
+char *henge_root_helper_check_write_authority(const char *path);
 #endif

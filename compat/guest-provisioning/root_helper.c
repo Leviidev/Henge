@@ -5,6 +5,7 @@
 #include "HGGuestMedia.h"
 #include "HGGuestWorkspace.h"
 #include "HGGuestPeer.h"
+#include "HGGuestWriteAuthority.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
@@ -39,7 +40,7 @@ int main(int argc, char **argv)
 {
     if (argc != 2 || (strcmp(argv[1], "probe-v1") && strcmp(argv[1], "verify-payload-v1") &&
                      strcmp(argv[1], "inspect-image-v1") && strcmp(argv[1], "recover-workspaces-v1") &&
-                     strcmp(argv[1], "attest-caller-v1"))) {
+                     strcmp(argv[1], "attest-caller-v1") && strcmp(argv[1], "check-write-authority-v1"))) {
         fputs("unsupported helper operation\n", stderr);
         return 64;
     }
@@ -67,6 +68,50 @@ int main(int argc, char **argv)
                "\"caller_uid\":%u,\"caller_pid\":%d,\"guest_disk_accessed\":false,\"error\":\"%s\"}\n",
                root?"true":"false",getuid(),geteuid(),getgid(),getegid(),status?"false":"true",
                status?"false":"true",status?"false":"true",peer.uid,peer.pid,error?error:"");
+        return !root?77:status?65:0;
+    }
+    if (!strcmp(argv[1],"check-write-authority-v1")) {
+        if(verified){if(report)puts(report);free(report);return verified;}
+        free(report);
+        HGGuestPeer peer={0};HGGuestDisk disk={.fd=-1};
+        HGGuestWriteAuthority authority=HG_GUEST_WRITE_AUTHORITY_INIT;
+        const char *error="root-required";char *media=NULL;
+        int status=-1,executable=-1,caller=0,inspected=0,media_ok=0,attached=0;
+        if(root) {
+            executable=expected_app_executable();error="peer-executable-open";
+            if(executable>=0)status=hg_guest_peer_attest(executable,&peer,&error);
+        }
+        if(!status) {
+            caller=1;error="invalid-descriptor";
+            int a=fcntl(3,F_GETFD),b=fcntl(4,F_GETFD);
+            status=a<0 || b<0 || fcntl(3,F_SETFD,a|FD_CLOEXEC) || fcntl(4,F_SETFD,b|FD_CLOEXEC);
+            if(!status)status=hg_guest_disk_inspect_fd(3,&disk,&error);
+            if(!status)inspected=1;
+        }
+        if(!status)status=hg_guest_write_authority_open(&disk,4,peer.uid,&authority,&error);
+        if(!status) {
+            status=hg_guest_media_copy(&disk,&media,&error);
+            if(!status) {
+                media_ok=1;attached=strcmp(media,"[]")!=0;
+                if(attached){status=-1;error="image-already-attached";}
+            }
+        }
+        if(!status)status=hg_guest_peer_unchanged(executable,&peer,&error);
+        if(!status && !hg_guest_write_authority_unchanged(&authority)) {
+            status=-1;error="write-authority-changed";
+        }
+        printf("{\"schema\":1,\"operation\":\"check-write-authority-v1\",\"root\":%s,"
+               "\"uid\":%u,\"euid\":%u,\"gid\":%u,\"egid\":%u,\"payload_verified\":true,"
+               "\"caller_verified\":%s,\"caller_no_sandbox_entitled\":%s,\"caller_executable_verified\":%s,"
+               "\"caller_uid\":%u,\"caller_pid\":%d,\"write_authority_verified\":%s,"
+               "\"image_inspected\":%s,\"exclusive_lease_verified\":%s,\"media_inventory_verified\":%s,"
+               "\"image_modified\":false,\"image_attached\":%s,\"volume_mounted\":false,\"error\":\"%s\"}\n",
+               root?"true":"false",getuid(),geteuid(),getgid(),getegid(),caller?"true":"false",
+               caller?"true":"false",caller?"true":"false",peer.uid,peer.pid,status?"false":"true",
+               inspected?"true":"false",inspected?"true":"false",media_ok?"true":"false",
+               attached?"true":"false",error?error:"");
+        free(media);hg_guest_write_authority_close(&authority);hg_guest_disk_close(&disk);
+        if(executable>=0)close(executable);
         return !root?77:status?65:0;
     }
     if (!strcmp(argv[1], "recover-workspaces-v1")) {

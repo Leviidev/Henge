@@ -675,3 +675,27 @@ private no-sandbox entitlement was killed at launch, so there is no positive hos
 qualification of the actual iPad policy. Full positive app/root/device identity
 qualification, write-bearing transport, namespace policy and publication remain
 separate unfinished gates; original guest writes remain disabled.
+
+### Explicit app-opened write capability transport
+
+`henge_root_helper_check_write_authority` opens independent O_RDONLY and
+O_RDWR descriptors in the app and passes them as fixed helper FDs 3 and 4.
+It transmits no source path, UID or PID in arguments or environment. Both
+must identify the same regular inode; symlinks/nonregular inputs are refused
+before spawn. The helper verifies its actual parent, acquires an independent
+read-only exclusive disk lease, binds the write witness to that leased inode,
+checks the attested owner's file/parent DAC and ACL policy, requires a fresh
+empty IOMedia inventory, then reattests the caller and revalidates the authority.
+The root helper never opens the original image for writing.
+
+`check-write-authority-v1` is a qualification operation, not an installation:
+it does not write, clone, attach, mount or publish anything. Its descriptors
+and lease close before return. A returned report is not a capability token;
+a provisioning operation must perform and retain these checks itself. This
+operation is not invoked automatically during boot or while a VM is running.
+Fourteen helper process groups cover fixed-FD access modes/inode identity,
+malformed reports, isolated environment/descriptors, and invalid input paths;
+eleven native write-authority groups separately exercise namespace policy.
+The process test uses persona/helper stubs and does not qualify iPad root or
+privileged caller behavior. The physical privileged launch, role-neutral
+mount, installation and publication/rollback supervisor remain incomplete.

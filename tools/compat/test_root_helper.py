@@ -45,7 +45,8 @@ int main(int argc, char **argv) {
     if (getenv("HENGE_CONTROL_INHERITED_FD")) {
         int fd = open("/dev/null", O_RDONLY); dup2(fd, 96); close(fd);
     }
-    char *p = argc == 2 && !strcmp(argv[1],"--attest") ? henge_root_helper_attest_caller() :
+    char *p = argc == 3 && !strcmp(argv[1],"--authority") ? henge_root_helper_check_write_authority(argv[2]) :
+              argc == 2 && !strcmp(argv[1],"--attest") ? henge_root_helper_attest_caller() :
               argc == 2 && !strcmp(argv[1],"--recover") ? henge_root_helper_recover_workspaces() :
               argc == 2 ? henge_root_helper_inspect_disk(argv[1]) : henge_root_helper_probe();
     if (!p) return 1; puts(p); free(p); return 0; }
@@ -66,13 +67,14 @@ int main(int argc, char **argv) {
                         str(ROOT / 'compat/guest-provisioning/HGGuestWorkspace.c'),
                         str(ROOT / 'compat/guest-provisioning/HGGuestPeer.m'),
                         str(ROOT / 'compat/guest-provisioning/HGGuestCodeIdentity.c'),
+                        str(ROOT / 'compat/guest-provisioning/HGGuestWriteAuthority.c'),
                         '-framework', 'Foundation', '-lz',
                         '-o', str(cls.real_helper)], check=True)
 
     def fixture(self, body):
         source = self.base / 'fixture.c'
         source.write_text('#include <stdio.h>\n#include <unistd.h>\n#include <signal.h>\n'
-                          '#include <stdlib.h>\n#include <fcntl.h>\n#include <string.h>\n'
+                          '#include <stdlib.h>\n#include <fcntl.h>\n#include <string.h>\n#include <sys/stat.h>\n'
                           'int main(int argc,char **argv) {(void)argc;(void)argv;' + body + '}\n')
         subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', str(source),
                         '-o', str(self.helper)], check=True)
@@ -84,7 +86,7 @@ int main(int argc, char **argv) {
 
     def test_helper_rejects_every_other_operation(self):
         for args in ([], ['mount'], ['probe-v1', '/some/disk'], ['recover-workspaces-v1', '/some/path'],
-                     ['attest-caller-v1', '4242']):
+                     ['attest-caller-v1', '4242'], ['check-write-authority-v1', '/some/disk']):
             result = subprocess.run([str(self.real_helper), *args], capture_output=True)
             self.assertEqual(result.returncode, 64)
             self.assertFalse(result.stdout)
@@ -99,7 +101,7 @@ int main(int argc, char **argv) {
         self.assertFalse(report['guest_disk_accessed'])
 
     def test_unbound_helper_never_accepts_payload_resources(self):
-        for operation in ('verify-payload-v1', 'inspect-image-v1', 'recover-workspaces-v1', 'attest-caller-v1'):
+        for operation in ('verify-payload-v1', 'inspect-image-v1', 'recover-workspaces-v1', 'attest-caller-v1', 'check-write-authority-v1'):
             result = subprocess.run([str(self.real_helper), operation], capture_output=True)
             self.assertEqual(result.returncode, 65)
             report = json.loads(result.stdout)
@@ -149,7 +151,7 @@ int main(int argc, char **argv) {
                  (dict(valid, namespace_bounded=False), False),
                  (dict(valid, original_guest_disk_accessed=True), False),
                  (dict(valid, volume_mounted=True), False)]
-        prefix = 'if(argc!=2 || strcmp(argv[1],"recover-workspaces-v1") || fcntl(3,F_GETFD)!=-1)return 66;'
+        prefix = 'if(argc!=2 || strcmp(argv[1],"recover-workspaces-v1") || fcntl(3,F_GETFD)!=-1 || fcntl(4,F_GETFD)!=-1)return 66;'
         for report, accepted in cases:
             with self.subTest(report=report):
                 self.fixture(prefix + 'puts(' + json.dumps(json.dumps(report)) + '); return 0;')
@@ -168,12 +170,49 @@ int main(int argc, char **argv) {
                  (dict(valid, caller_uid=True), False), (dict(valid, caller_uid=-1), False),
                  (dict(valid, caller_pid=1), False), (dict(valid, caller_pid=2**31), False),
                  (dict(valid, guest_disk_accessed=True), False)]
-        prefix = 'if(argc!=2 || strcmp(argv[1],"attest-caller-v1") || fcntl(3,F_GETFD)!=-1)return 66;'
+        prefix = 'if(argc!=2 || strcmp(argv[1],"attest-caller-v1") || fcntl(3,F_GETFD)!=-1 || fcntl(4,F_GETFD)!=-1)return 66;'
         for report, accepted in cases:
             with self.subTest(report=report):
                 self.fixture(prefix + 'puts(' + json.dumps(json.dumps(report)) + '); return 0;')
                 result = self.run_probe(image='--attest')
                 self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
+
+    def test_write_capabilities_are_opened_by_app_and_passed_without_paths(self):
+        image=self.base/'authority.img';original=b'HGFD explicit authored capability';image.write_bytes(original)
+        valid=dict(schema=1,operation='check-write-authority-v1',root=True,uid=0,euid=0,gid=0,egid=0,
+                   payload_verified=True,caller_verified=True,caller_no_sandbox_entitled=True,
+                   caller_executable_verified=True,caller_uid=501,caller_pid=4242,write_authority_verified=True,
+                   image_inspected=True,exclusive_lease_verified=True,media_inventory_verified=True,
+                   image_modified=False,image_attached=False,volume_mounted=False)
+        checks='''if(argc!=2 || strcmp(argv[1],"check-write-authority-v1") ||
+            (fcntl(3,F_GETFL)&O_ACCMODE)!=O_RDONLY || (fcntl(4,F_GETFL)&O_ACCMODE)!=O_RDWR ||
+            fcntl(96,F_GETFD)!=-1)return 91;
+            struct stat a,b;if(fstat(3,&a)||fstat(4,&b)||a.st_dev!=b.st_dev||a.st_ino!=b.st_ino)return 92;
+            char data[4];if(pread(3,data,4,0)!=4||memcmp(data,"HGFD",4)||pread(4,data,4,0)!=4||memcmp(data,"HGFD",4))return 93;
+        '''
+        cases=[(valid,True)]
+        for key in ('caller_verified','caller_no_sandbox_entitled','caller_executable_verified',
+                    'write_authority_verified','image_inspected','exclusive_lease_verified','media_inventory_verified'):
+            cases.append((dict(valid,**{key:False}),False))
+        for key in ('image_modified','image_attached','volume_mounted'):
+            cases.append((dict(valid,**{key:True}),False))
+        for report,accepted in cases:
+            self.fixture(checks+'puts('+json.dumps(json.dumps(report))+');return 0;')
+            result=subprocess.run([str(self.runner),'--authority',str(image)],capture_output=True,timeout=6)
+            self.assertEqual(result.returncode,0 if accepted else 1,result.stderr)
+        self.assertEqual(image.read_bytes(),original)
+
+    def test_authority_transport_rejects_nonregular_and_symlink_inputs(self):
+        image=self.base/'authority-target.img';image.write_bytes(b'authored')
+        link=self.base/'authority-symlink';link.symlink_to(image)
+        fifo=self.base/'authority-fifo'
+        import os
+        os.mkfifo(fifo)
+        self.fixture('return 99;')
+        for path in (link,fifo,self.base,self.base/'missing'):
+            result=subprocess.run([str(self.runner),'--authority',str(path)],capture_output=True,timeout=2)
+            self.assertEqual(result.returncode,1)
+        self.assertEqual(image.read_bytes(),b'authored')
 
     def test_parent_environment_and_descriptors_are_not_inherited(self):
         valid = json.dumps(dict(schema=1, operation='probe-v1', root=True, uid=0,

@@ -31,7 +31,7 @@ static double monotonic_now(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-static char *run_helper(const char *operation, int image)
+static char *run_helper(const char *operation, int image, int witness)
 {
     @autoreleasepool {
         NSString *path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"henge-root-helper"];
@@ -53,7 +53,7 @@ static char *run_helper(const char *operation, int image)
         posix_spawn_file_actions_t actions;
         BOOL initialized = NO;
         if (!error && pipe(pipes)) error = errno;
-        // Keep action sources away from stdio and the fixed image target FD 3.
+        // Keep action sources away from stdio and the fixed image/witness target FDs 3/4.
         if (!error) {
             int high[2] = {fcntl(pipes[0], F_DUPFD_CLOEXEC, 10), -1};
             if (high[0] >= 0) high[1] = fcntl(pipes[1], F_DUPFD_CLOEXEC, 10);
@@ -71,6 +71,8 @@ static char *run_helper(const char *operation, int image)
         if (!error) error = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
         if (!error && image >= 0) error = posix_spawn_file_actions_adddup2(&actions, image, 3);
         if (!error && image >= 0) error = posix_spawn_file_actions_addclose(&actions, image);
+        if (!error && witness >= 0) error = posix_spawn_file_actions_adddup2(&actions, witness, 4);
+        if (!error && witness >= 0) error = posix_spawn_file_actions_addclose(&actions, witness);
         char *argv[] = {(char *)path.fileSystemRepresentation, (char *)operation, NULL};
         char *env[] = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=C", NULL};
         pid_t child = -1;
@@ -123,12 +125,20 @@ static char *run_helper(const char *operation, int image)
             ![report[@"root"] isEqual:@YES] || ![report[@"uid"] isEqual:@0] ||
             ![report[@"euid"] isEqual:@0] || ![report[@"gid"] isEqual:@0] ||
             ![report[@"egid"] isEqual:@0] || ![report[@"payload_verified"] isEqual:@YES]) return NULL;
-        if (!strcmp(operation,"attest-caller-v1") &&
+        if ((!strcmp(operation,"attest-caller-v1") || !strcmp(operation,"check-write-authority-v1")) &&
             (![report[@"caller_verified"] isEqual:@YES] ||
              ![report[@"caller_no_sandbox_entitled"] isEqual:@YES] ||
              ![report[@"caller_executable_verified"] isEqual:@YES] ||
              bounded_integer(report,@"caller_uid",UINT32_MAX-1LL)<0 ||
              bounded_integer(report,@"caller_pid",INT32_MAX)<=1)) return NULL;
+        if (!strcmp(operation,"check-write-authority-v1") &&
+            (![report[@"write_authority_verified"] isEqual:@YES] ||
+             ![report[@"image_inspected"] isEqual:@YES] ||
+             ![report[@"exclusive_lease_verified"] isEqual:@YES] ||
+             ![report[@"media_inventory_verified"] isEqual:@YES] ||
+             ![report[@"image_modified"] isEqual:@NO] ||
+             ![report[@"image_attached"] isEqual:@NO] ||
+             ![report[@"volume_mounted"] isEqual:@NO])) return NULL;
         if (!strcmp(operation,"recover-workspaces-v1")) {
             long long total=bounded_count(report,@"enumerated"),candidates=bounded_count(report,@"candidates"),
                 recovered=bounded_count(report,@"recovered"),busy=bounded_count(report,@"busy"),
@@ -159,16 +169,16 @@ static char *run_helper(const char *operation, int image)
 
 char *henge_root_helper_probe(void)
 {
-    return run_helper("probe-v1", -1);
+    return run_helper("probe-v1", -1, -1);
 }
 
 char *henge_root_helper_recover_workspaces(void)
 {
-    return run_helper("recover-workspaces-v1", -1);
+    return run_helper("recover-workspaces-v1", -1, -1);
 }
 char *henge_root_helper_attest_caller(void)
 {
-    return run_helper("attest-caller-v1", -1);
+    return run_helper("attest-caller-v1", -1, -1);
 }
 
 char *henge_root_helper_inspect_disk(const char *path)
@@ -181,7 +191,29 @@ char *henge_root_helper_inspect_disk(const char *path)
     if (!fstat(fd, &info) && S_ISREG(info.st_mode)) high = fcntl(fd, F_DUPFD_CLOEXEC, 10);
     close(fd);
     if (high < 0) return NULL;
-    char *report = run_helper("inspect-image-v1", high);
+    char *report = run_helper("inspect-image-v1", high, -1);
     close(high);
+    return report;
+}
+
+char *henge_root_helper_check_write_authority(const char *path)
+{
+    if (!path) return NULL;
+    // Open both capabilities in the app, before acquiring root persona. The
+    // helper never opens a caller-selected source path with root write access.
+    int readFD=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    int writeFD=open(path,O_RDWR|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    struct stat a,b;int highRead=-1,highWrite=-1;
+    if (readFD>=0 && writeFD>=0 && !fstat(readFD,&a) && !fstat(writeFD,&b) &&
+        S_ISREG(a.st_mode) && a.st_dev==b.st_dev && a.st_ino==b.st_ino) {
+        highRead=fcntl(readFD,F_DUPFD_CLOEXEC,10);
+        if (highRead>=0) highWrite=fcntl(writeFD,F_DUPFD_CLOEXEC,10);
+    }
+    if(readFD>=0)close(readFD);
+    if(writeFD>=0)close(writeFD);
+    char *report=NULL;
+    if(highRead>=0 && highWrite>=0)report=run_helper("check-write-authority-v1",highRead,highWrite);
+    if(highRead>=0)close(highRead);
+    if(highWrite>=0)close(highWrite);
     return report;
 }
