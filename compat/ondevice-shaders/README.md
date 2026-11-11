@@ -55,10 +55,12 @@ recipe identity, header contracts and bundled LLVM license. A missing or stale
 an archive alone is insufficient. The build helper rejects source changes while
 compilation is in progress.
 
-The original explicit compiler/provider build sequence passed native controls;
-the clean pinned-source `rebuild_llvm.py` convenience path was syntax checked but
-not independently rerun in a second clean environment. Archive bytes and recipes
-may change across build paths/toolchains. Regenerate and record the recipe instead
+The pinned-source helper completed a new native and iOS build from a clean LLVM
+checkout, then passed the generated native controls, including 256 exact compute
+values. A complete iOS app package also passed the staged-provider check. This is
+build/native evidence; the newly reconciled app still needs its own iPad runtime
+gate. See [distribution validation](../../docs/compatibility/distribution-validation.md).
+Archive bytes and recipes may change across build paths/toolchains. Regenerate and record the recipe instead
 of assigning a previous binary's identity to a rebuild. Preserve the included
 LLVM license and exact dependency/source provenance when distributing a build.
 

@@ -19,12 +19,12 @@ authored tests, OpenGL discovery and VLC export source patches are retained.
 | Requirement | Current evidence or remaining work |
 | --- | --- |
 | Ordinary graphics fixes enabled in the installed app | Production lineage qualified on iPadOS 17.0 / Sonoma 14.6.1. The newly reconciled binary still needs a device gate. |
-| Cold executable shaders entirely on the iPad | In-process provider is linked by default; package creation refuses a missing provider. A fresh-source build exposed and fixed the iOS CMake bundle default; a second complete build is running. Authored native provider controls passed, including 256 exact compute values. No imported cache may be used as proof of cold success. |
+| Cold executable shaders entirely on the iPad | In-process provider is linked by default; package creation refuses a missing or stale provider. The clean pinned-source build, authored native controls and full iOS package passed. Newly reconciled on-device cold rendering remains a separate gate. No imported cache may be used as proof of cold success. |
 | All prior OpenGL discovery work available automatically | Incomplete: current implementation requires a process-scoped guest launcher. Implement automatic discovery for a fresh guest, preserving ordinary application signing policies. |
 | All prior dynamic-library work entirely on the iPad | Incomplete: cold stateless dependency closures currently use Apple tools on a Mac. Port the supported closure path and transport to the iPad; do not substitute an offline cache or external companion. |
 | Existing VLC decoding/export work carried forward | Source recipes and patches are included. Automatic guest delivery of the compatibility components and the patched VLC build is not yet integrated. Preserve stock apps and user data. |
 | Manual icon/cache repairs unnecessary | New clean guest must show the icons without cache repair. Existing blank guest caches need a versioned, backup-preserving migration if normal invalidation does not suffice. |
-| Reproducible release build | Pin dependency sources, build the provider in CI, include its license, build the complete app and inspect the produced package from clean source. |
+| Reproducible release build | Pinned clean-source provider and complete local app build passed; package recipe and license inspected. CI includes the build and controls, but fork workflow dispatch is not yet registered. See [exact validation scope](distribution-validation.md). |
 | Compatibility with new upstream snapshots | Snapshot state carries mapper admission and task epochs. Check inactive CPU wake, pending replay/shader jobs, GPU copyback and background save before claiming the combination qualified. |
 | Upstream PR | Publish the complete source changes and an accurate validation report. A draft is not completion of this plan. |
 
