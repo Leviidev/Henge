@@ -335,7 +335,7 @@ An alternate on-device provisioning path is required. A host copy-on-write clone
 of the authored fixture was created, but ordinary `diskutil` role clearing was
 refused with -69599. The `0` role argument is a no-op, not a role reset; a command
 returning success for `0` is not evidence of neutralization. No guest disk role
-was changed, and no clone workaround has been qualified. Do not remove the iOS
+was changed, and no clone workaround has been qualified on iPad. Do not remove the iOS
 guard based on host mocks or the old roleless scratch test.
 
 ### Alternate path investigation: isolated clone and bounded APFS identities
@@ -432,7 +432,7 @@ catalog bounds and changes to an old record's flags are rejected. Exact old
 records accept their original or neutral role, permitting a partially restored
 plan to be planned again without changing already restored roles.
 
-This is pure planning: it never opens or modifies an image. Sixteen native
+This is pure planning: it never opens or modifies an image. Eighteen native
 sanitizer-backed controls cover historical role preservation, newly created
 checkpoints, idempotence and conflicting identities. An executor still needs
 private clone write authority, full block/checksum revalidation, durable recovery
@@ -476,6 +476,28 @@ partial/torn writes, image sync and readback failures. Inventory is stubbed in
 these fault controls. A separate authored 4 GiB image control with the production
 IOMedia scanner passed four-block neutralization/restoration, byte-exact full
 image comparison, owned discard and unchanged source identity without mounting.
-This does not yet qualify mounted writes/new checkpoints or iPad execution. The
+That no-mount roundtrip alone does not qualify mounted writes/new checkpoints or
+iPad execution; the separate host mounted-write control is described below. The
 primitive is packaged in the helper but has no production command; activation,
 restart recovery, replacement rollback and the iOS mount gate remain unfinished.
+
+The developer control's optional `--external-write` mode pauses after
+neutralization and restoration, prints the private copy path, and accepts `GO`
+only after external tools have detached it. Restoration is run again to check
+idempotence, including newly created checkpoints whose roles are already restored.
+Normal mode still performs the byte-exact roundtrip without external tools.
+
+A host-only `--external-write-unlocked` variant releases the *copy* lease during
+these pauses and reacquires it nonblocking before native restoration. This is
+needed because host `hdiutil` refuses an exclusively leased image; direct `hdik`
+requires root. The source lease remains held. This variant must never be used by
+production provisioning and does not qualify iPad attachment under a held lease.
+
+On the authored 4 GiB fixture this host control staged the real 19-file payload
+and a synchronized marker on the mounted neutral copy, detached it, restored
+seven records using the native writer, and remounted Data read-only with its
+original Data role. Marker bytes and all payload members/modes reverified;
+macOS volume verification passed. Repeated native restoration performed no
+further edits. The copy was discarded with empty media inventory and source
+identity unchanged. This qualifies host mounted-write restoration, with the
+explicit copy-lease accommodation above; it is not iPad or publication proof.

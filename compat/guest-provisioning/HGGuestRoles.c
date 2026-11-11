@@ -65,7 +65,7 @@ int hg_guest_roles_plan(const HGGuestAPFSCatalog *original,
             /* Checkpoints produced by the mounted copy inherit the neutral role
              * of the current original volume, never an older historical role. */
             if (!restore || !current || v->xid<=original->latest_checkpoint_xid ||
-                v->role!=neutral(current->role)) goto conflict;
+                (v->role!=neutral(current->role) && v->role!=current->role)) goto conflict;
             target=current->role;
         }
         if (v->role!=target) {

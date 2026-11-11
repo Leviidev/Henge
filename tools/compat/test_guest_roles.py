@@ -51,6 +51,9 @@ int main(void) {
  b.records[3].first_checkpoint_xid=b.records[3].last_checkpoint_xid=4;
  assert(!hg_guest_roles_plan(&a,&b,1,&p,&error));
  assert(p->count==1 && p->edits[0].target_role==64 && p->edits[0].expected.xid==4);free(p);
+ b.records[3].volume.role=64;
+ assert(!hg_guest_roles_plan(&a,&b,1,&p,&error));assert(!p->count);free(p);
+ b.records[3].volume.role=1;reject(1);
  b.records[3].volume.uuid[0]=99;reject(1);
  reset();b.records[0].volume.group_uuid[0]=99;reject(1);
  reset();b.records[0].volume.role=2;reject(1);
@@ -63,7 +66,7 @@ int main(void) {
  reset();b.block_size=8192;reject(1);
  reset();b.record_count=HG_APFS_MAX_RECORDS+1;reject(1);
  reset();reject(2);
- puts("16 role-planning controls passed");return 0;
+ puts("18 role-planning controls passed");return 0;
 }
 ''')
             binary = Path(tmp) / 'control'
