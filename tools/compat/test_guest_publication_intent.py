@@ -71,11 +71,35 @@ static int test_sync(int fd) {
 #define fsync test_sync
 #include "HGGuestPublicationMetadata.c"
 ''')
+        snapshot_shim=folder/'snapshot-shim.c'
+        snapshot_shim.write_text(r'''
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static int mode(const char *s){const char *m=getenv("HENGE_PUBLICATION_TEST");return m && !strcmp(m,s);}
+static int test_sync(int fd) {
+ char path[4096];if(fcntl(fd,F_GETPATH,path))return -1;
+ const char *name=strrchr(path,'/');
+ if(name && !strcmp(name,"/snapshot-invalidation") && mode("snapshot-sync-fail")){errno=EIO;return -1;}
+ return fsync(fd);
+}
+static int test_rename(int a,const char *b,int c,const char *d,unsigned flags) {
+ static int calls;calls++;
+ if(calls==2 && mode("snapshot-second-rename-fail")){errno=EIO;return -1;}
+ return renameatx_np(a,b,c,d,flags);
+}
+#define fsync test_sync
+#define renameatx_np test_rename
+#include "HGGuestSnapshotInvalidation.c"
+''')
         cls.control = folder / 'control'
         subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror',
                         '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                         '-I', str(native), str(ROOT / 'tools/compat/guest_publication_intent_control.c'),
-                        str(shim), str(metadata_shim), *[str(native / f) for f in [
+                        str(shim), str(metadata_shim), str(snapshot_shim), *[str(native / f) for f in [
                             'HGGuestDisk.c', 'HGGuestAPFS.c', 'HGGuestClone.c',
                             'HGGuestRoles.c', 'HGGuestRoleWrite.c', 'HGGuestWorkspace.c',
                             'HGGuestWriteAuthority.c']], '-lz', '-o', str(cls.control)], check=True)
@@ -89,7 +113,8 @@ static int test_sync(int fd) {
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         fixture.emit()
-        self.source = fixture.path
+        self.source = fixture.path.with_name("disk.img")
+        fixture.path.rename(self.source)
         self.parent = fixture.path.parent / 'private'
         self.parent.mkdir(mode=0o700)
         self.original = self.source.read_bytes()
@@ -126,6 +151,122 @@ static int test_sync(int fd) {
         finally:
             os.close(left)
             os.close(right)
+
+    def snapshot_inspect(self, valid=True, complete=False, mode=""):
+        r=subprocess.run([str(self.control),'snapshot-complete' if complete else 'snapshot-inspect',str(self.source),str(self.parent),self.workspace.name],
+                         capture_output=True,text=True,timeout=10,env={**os.environ,"HENGE_PUBLICATION_TEST":mode})
+        self.assertEqual(r.returncode,0 if valid else 1,r.stdout+r.stderr)
+        return json.loads(r.stdout)
+
+    def test_snapshot_quarantine_is_durable_and_preserves_bytes_inodes(self):
+        saved=self.source.parent/'resume.hsnap';partial=self.source.parent/'resume.hsnap.part'
+        saved.write_bytes(b'authored saved RAM');partial.write_bytes(b'authored partial RAM')
+        identities=(saved.stat().st_ino,partial.stat().st_ino)
+        self.prepare(operation='snapshot')
+        self.assertFalse(saved.exists());self.assertFalse(partial.exists())
+        quarantined=(self.workspace/'ram-resume.hsnap',self.workspace/'ram-resume.hsnap.part')
+        self.assertEqual(tuple(p.stat().st_ino for p in quarantined),identities)
+        self.assertEqual(tuple(p.read_bytes() for p in quarantined),(b'authored saved RAM',b'authored partial RAM'))
+        self.assertEqual((self.workspace/'snapshot-invalidation').stat().st_mode & 0o777,0o600)
+        self.assertTrue(self.snapshot_inspect()['passed'])
+        retained={p.name:p.stat().st_ino for p in self.workspace.iterdir()}
+        r=subprocess.run([str(self.control),'discard',str(self.source),str(self.parent),self.workspace.name],
+                         capture_output=True,text=True,timeout=10)
+        self.assertEqual(r.returncode,1)
+        self.assertEqual(retained,{p.name:p.stat().st_ino for p in self.workspace.iterdir()})
+
+    def test_no_snapshot_still_requires_durable_absence_receipt(self):
+        self.prepare(operation='snapshot')
+        self.assertTrue(self.snapshot_inspect()['passed'])
+        (self.source.parent/'resume.hsnap').write_bytes(b'new saved RAM')
+        self.assertEqual(self.snapshot_inspect(False)['error'],'snapshot-invalidation-incomplete')
+        self.assertEqual((self.source.parent/'resume.hsnap').read_bytes(),b'new saved RAM')
+
+    def test_snapshot_absence_verify_survives_swap_but_recovery_refuses_swapped_pair(self):
+        self.prepare(operation='snapshot')
+        self.exchange_fixture()
+        self.assertTrue(self.snapshot_inspect()['passed'])
+        self.assertEqual(self.snapshot_inspect(False,complete=True)['error'],'snapshot-invalidation-precondition')
+        self.exchange_fixture()
+        self.assertTrue(self.snapshot_inspect(complete=True)['passed'])
+
+    def test_snapshot_completion_rejects_new_source_metadata_after_restart(self):
+        self.source.chmod(0o600)
+        self.prepare(operation='snapshot')
+        self.source.chmod(0o640)
+        self.assertEqual(self.snapshot_inspect(False,complete=True)['error'],'publication-authority-record')
+        self.assertEqual(self.source.stat().st_mode & 0o777,0o640)
+        self.assertTrue(self.snapshot_inspect()['passed'])
+
+    def test_snapshot_receipt_cannot_be_reused_for_another_publication(self):
+        self.prepare(operation='snapshot')
+        receipt=(self.workspace/'snapshot-invalidation').read_bytes()
+        self.prepare(operation='snapshot')
+        (self.workspace/'snapshot-invalidation').write_bytes(receipt)
+        self.assertEqual(self.snapshot_inspect(False)['error'],'snapshot-invalidation-receipt')
+
+    def test_snapshot_partial_move_retains_both_and_refuses_completion(self):
+        saved=self.source.parent/'resume.hsnap';partial=self.source.parent/'resume.hsnap.part'
+        saved.write_bytes(b'first');partial.write_bytes(b'second')
+        d=self.prepare(operation='snapshot',mode='snapshot-second-rename-fail',valid=False)
+        self.assertEqual(d['error'],'snapshot-invalidation-rename')
+        self.assertFalse(saved.exists());self.assertEqual((self.workspace/'ram-resume.hsnap').read_bytes(),b'first')
+        self.assertEqual(partial.read_bytes(),b'second')
+        self.assertEqual(self.snapshot_inspect(False)['error'],'snapshot-invalidation-incomplete')
+        self.assertTrue(self.snapshot_inspect(complete=True)['passed'])
+        self.assertFalse(partial.exists())
+        self.assertEqual((self.workspace/'ram-resume.hsnap.part').read_bytes(),b'second')
+        self.assertTrue(self.snapshot_inspect(complete=True)['passed'])
+
+    def test_snapshot_recovery_preflights_all_names_before_moving_any(self):
+        saved=self.source.parent/'resume.hsnap';saved.write_bytes(b'first')
+        partial=self.source.parent/'resume.hsnap.part';partial.write_bytes(b'second')
+        self.prepare(operation='snapshot',mode='snapshot-sync-fail',valid=False)
+        self.snapshot_inspect(False,complete=True,mode='snapshot-sync-fail')
+        self.assertEqual(saved.read_bytes(),b'first');self.assertEqual(partial.read_bytes(),b'second')
+        retained=partial.with_suffix('.retained');partial.rename(retained);partial.write_bytes(b'replacement')
+        self.assertFalse(self.snapshot_inspect(False,complete=True)['passed'])
+        self.assertEqual(saved.read_bytes(),b'first')
+        self.assertFalse((self.workspace/'ram-resume.hsnap').exists())
+        partial.unlink();retained.rename(partial)
+        self.assertTrue(self.snapshot_inspect(complete=True)['passed'])
+
+    def test_snapshot_sync_failure_moves_nothing(self):
+        saved=self.source.parent/'resume.hsnap';saved.write_bytes(b'unchanged RAM')
+        d=self.prepare(operation='snapshot',mode='snapshot-sync-fail',valid=False)
+        self.assertEqual(d['error'],'snapshot-invalidation-sync')
+        self.assertEqual(saved.read_bytes(),b'unchanged RAM')
+        self.assertFalse((self.workspace/'ram-resume.hsnap').exists())
+        self.assertTrue((self.workspace/'snapshot-invalidation').exists())
+
+    def test_snapshot_symlink_hardlink_and_busy_files_refused_before_receipt(self):
+        import fcntl
+        saved=self.source.parent/'resume.hsnap'
+        target=self.source.parent/'ram-target';target.write_bytes(b'private RAM')
+        saved.symlink_to(target)
+        self.prepare(operation='snapshot',valid=False)
+        self.assertFalse((self.workspace/'snapshot-invalidation').exists());saved.unlink()
+        os.link(target,saved)
+        self.prepare(operation='snapshot',valid=False)
+        self.assertFalse((self.workspace/'snapshot-invalidation').exists());saved.unlink()
+        saved.write_bytes(b'locked RAM')
+        with saved.open('rb') as f:
+            fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            self.prepare(operation='snapshot',valid=False)
+            self.assertFalse((self.workspace/'snapshot-invalidation').exists())
+        self.assertEqual(saved.read_bytes(),b'locked RAM')
+
+    def test_snapshot_receipt_corruption_and_quarantine_replacement_are_refused(self):
+        saved=self.source.parent/'resume.hsnap';saved.write_bytes(b'known RAM')
+        self.prepare(operation='snapshot')
+        record=self.workspace/'snapshot-invalidation';original=record.read_bytes()
+        record.write_bytes(b'partial')
+        self.assertEqual(self.snapshot_inspect(False)['error'],'snapshot-invalidation-receipt')
+        record.write_bytes(original)
+        private=self.workspace/'ram-resume.hsnap';retained=private.with_suffix('.retained');private.rename(retained)
+        private.write_bytes(b'known RAM')
+        self.assertEqual(self.snapshot_inspect(False)['error'],'snapshot-invalidation-incomplete')
+        self.assertEqual(retained.read_bytes(),b'known RAM')
 
     def test_private_copy_handoff_preserves_source_metadata_and_bytes(self):
         self.source.chmod(0o640)

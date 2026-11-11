@@ -118,6 +118,7 @@ PY
         "$IOS/../compat/guest-provisioning/HGGuestWriteAuthority.c" \
         "$IOS/../compat/guest-provisioning/HGGuestPublicationIntent.c" \
         "$IOS/../compat/guest-provisioning/HGGuestPublicationMetadata.c" \
+        "$IOS/../compat/guest-provisioning/HGGuestSnapshotInvalidation.c" \
         "$IOS/../compat/guest-provisioning/HGGuestCodeIdentity.c" \
         "$IOS/../compat/guest-provisioning/HGGuestPeer.m" \
         "$IOS/../compat/guest-provisioning/HGGuestAttachment.m" \

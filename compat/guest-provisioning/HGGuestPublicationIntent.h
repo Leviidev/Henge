@@ -38,5 +38,10 @@ int hg_guest_publication_intent_open(const HGGuestWorkspace *workspace,
  * unchanged contents, media exclusion, activation or successful guest boot. */
 int hg_guest_publication_intent_pair(const HGGuestPublicationIntent *intent,
     int target_parent_fd,HGGuestPublicationPair *pair,const char **error);
+/* Match freshly retained original-source authority to the durable intent's
+ * namespace, inode, size, owner/mode/flags and mtime. Refuses a swapped pair or
+ * changed source metadata across restart. This is not a full-content hash. */
+int hg_guest_publication_intent_authority_matches(const HGGuestPublicationIntent *intent,
+    const HGGuestWriteAuthority *authority,const char **error);
 void hg_guest_publication_intent_close(HGGuestPublicationIntent *intent);
 #endif

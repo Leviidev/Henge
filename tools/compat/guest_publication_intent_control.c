@@ -1,8 +1,10 @@
-/* Authored-image evidence only. Records/inspects intent, never exchanges files.
+/* Authored-image evidence only. No source image exchange. May change private
+ * copy metadata and quarantine authored RAM snapshots after durable intent.
  * principal UID here is test-supplied, not kernel caller attestation. */
 #include "HGGuestPublicationIntent.h"
 #include "HGGuestRoleWrite.h"
 #include "HGGuestPublicationMetadata.h"
+#include "HGGuestSnapshotInvalidation.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,9 +12,9 @@
 int main(int argc,char **argv) {
     if(argc!=4 && argc!=5)return 64;
     int discard=argc==5 && !strcmp(argv[1],"discard");
-    int inspect=discard || (argc==5 && !strcmp(argv[1],"inspect"));
+    int inspect=discard || (argc==5 && (!strcmp(argv[1],"inspect") || !strcmp(argv[1],"snapshot-inspect") || !strcmp(argv[1],"snapshot-complete")));
     if(!inspect && argc!=4)return 64;
-    if(!inspect && strcmp(argv[1],"prepare") && strcmp(argv[1],"neutral") && strcmp(argv[1],"tainted") && strcmp(argv[1],"handoff") && strcmp(argv[1],"handoff-restore") && strcmp(argv[1],"handoff-twice"))return 64;
+    if(!inspect && strcmp(argv[1],"prepare") && strcmp(argv[1],"neutral") && strcmp(argv[1],"tainted") && strcmp(argv[1],"handoff") && strcmp(argv[1],"handoff-restore") && strcmp(argv[1],"handoff-twice") && strcmp(argv[1],"snapshot"))return 64;
     int incoming=open(argv[2],O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
     int witness=open(argv[2],O_RDWR|O_NOFOLLOW|O_CLOEXEC);
     int parent=open(argv[3],O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
@@ -43,6 +45,12 @@ int main(int argc,char **argv) {
         if(!status && !strcmp(argv[1],"handoff-restore"))
             status=hg_guest_publication_metadata_set(&intent,&clone,&authority,1,&error);
     }
+    if(!status && !strcmp(argv[1],"snapshot"))
+        status=hg_guest_snapshot_invalidate(&intent,&authority,&error);
+    if(!status && !strcmp(argv[1],"snapshot-complete"))
+        status=hg_guest_snapshot_invalidation_complete(&intent,&authority,&error);
+    if(!status && !strcmp(argv[1],"snapshot-inspect"))
+        status=hg_guest_snapshot_invalidation_verify(&intent,authority.directory_fd,&error);
     printf("{\"passed\":%s,\"error\":\"%s\",\"workspace\":\"%s\",\"clone\":\"%s\","
            "\"pair\":%d,\"source_unchanged\":%s,\"intent_opened\":%s,\"copy_tainted\":%s}\n",
            status?"false":"true",error?error:"",workspace.name,clone.name,(int)pair,

@@ -721,3 +721,35 @@ hash matched and its mode returned to 0600. This host control uses the test
 process UID, not kernel-attested app authority; it qualifies no iPad behavior.
 No exchange, payload activation, snapshot invalidation, restart rollback,
 health commit or automatic installation is enabled by this API.
+
+### RAM snapshot quarantine before publication
+
+`HGGuestSnapshotInvalidation` handles the fixed `resume.hsnap` and
+`resume.hsnap.part` names beside a machine's `disk.img`. After durable publication
+intent, retained write authority and an original-active image pair, it inventories
+ordinary caller-owned snapshots, rejects links/ACLs/flags/busy files, and persists
+a root-private 256-byte receipt bound to the exact publication record's SHA-256.
+It then moves the recorded snapshot inodes into fixed private names using
+exclusive rename. No snapshot/image bytes are modified or deleted. The original
+snapshot file modes/ownership are preserved inside the private directory.
+
+A freshly authorized original-active transaction can complete an interrupted
+quarantine from that receipt. It re-syncs/read-backs the receipt before any move,
+matches the fresh source authority to the original intent metadata (not a full
+content hash), preflights all public/private inode locations, refuses replacements/duplicates,
+moves only remaining known inodes, synchronizes both directories and verifies
+all public snapshot names absent. An already-complete retry is idempotent and
+still performs durability barriers. Read-only absence verification also works
+across the two known image-pair positions; it grants no publication/boot rights.
+Generic workspace cleanup retains these records, images and quarantined RAM.
+
+Twenty-two ASan/UBSan intent/metadata/snapshot groups now pass. Snapshot controls
+cover both names, absent inputs, partial moves and retry, receipt sync failure
+including retry, replaced files, symlinks/hardlinks/busy snapshots, recreation of
+a public name, cross-publication receipt rejection and swapped-image refusal for
+completion. A real authored 4 GiB GPT/APFS COW host control with the production
+media scanner preserved the source full hash/metadata and snapshot bytes/inodes,
+and verified/completed the quarantine in separate processes. These are host
+controls, not iPad qualification. No app/helper operation invokes quarantine yet:
+production atomic exchange, restart supervisor, activation and health commit
+remain incomplete. The iOS System/Data mount panic guard remains unchanged.

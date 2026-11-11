@@ -175,3 +175,22 @@ int hg_guest_publication_intent_pair(const HGGuestPublicationIntent *i,int paren
     else return -1;
     *error=NULL;return 0;
 }
+
+int hg_guest_publication_intent_authority_matches(const HGGuestPublicationIntent *i,
+    const HGGuestWriteAuthority *a,const char **error) {
+    if(!error)return -1;
+    *error="publication-authority-record";
+    if(!i || !a || !hg_guest_write_authority_unchanged(a) || !record_unchanged(i))return -1;
+    const struct stat *s=&a->source->identity,*d=&a->directory_identity;
+    const unsigned char *p=i->record;
+    if((uint64_t)d->st_dev!=get(p+24) || (uint64_t)d->st_ino!=get(p+32) ||
+       (uint64_t)s->st_dev!=get(p+40) || (uint64_t)s->st_ino!=get(p+48) ||
+       (uint64_t)s->st_size!=get(p+56) || s->st_uid!=get(p+88) || a->principal_uid!=get(p+88) ||
+       s->st_gid!=get(p+96) || s->st_mode!=get(p+104) ||
+       (uint64_t)s->st_mtimespec.tv_sec!=get(p+112) || (uint64_t)s->st_mtimespec.tv_nsec!=get(p+120) ||
+       s->st_flags!=get(p+144) || strcmp(a->name,(const char *)p+160))return -1;
+    HGGuestPublicationPair pair=HG_PUBLICATION_PAIR_UNKNOWN;
+    if(hg_guest_publication_intent_pair(i,a->directory_fd,&pair,error))return -1;
+    if(pair!=HG_PUBLICATION_ORIGINAL_ACTIVE){*error="publication-authority-record";return -1;}
+    *error=NULL;return 0;
+}
