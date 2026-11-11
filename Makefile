@@ -5,14 +5,14 @@ B = build
 
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
        $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
-HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
+HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o $(B)/lifecycle_gate.o
 DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o
 ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_virtio_discard
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_virtio_discard $(B)/test_pvg_store_action
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -83,6 +83,13 @@ $(B)/test_jit_region: tests/test_jit_region.c $(B)/jit_region.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
+$(B)/test_pvg_store_action: tests/test_pvg_store_action.c devices/pvg_store_action.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_store_action_metal: tests/test_pvg_store_action.m devices/pvg_store_action.h | $(B)
+	$(CC) $(CFLAGS) -fobjc-arc -Wno-deprecated-declarations $< -framework AppKit -framework Metal -o $@
+test-pvg-store-action: $(B)/test_pvg_store_action $(B)/test_pvg_store_action_metal
+	$(B)/test_pvg_store_action
+	$(B)/test_pvg_store_action_metal $(B)/pvg-store-action-result.json
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
 
@@ -95,6 +102,18 @@ $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 
 $(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
 	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
+
+$(B)/test_lifecycle_gate: tests/test_lifecycle_gate.c host/lifecycle_gate.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+
+$(B)/test_vm_pause: tests/test_vm_pause.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/snapshot.o $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
+	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
+
+test-vm-pause: $(B)/test_lifecycle_gate $(B)/test_vm_pause
+	$(B)/test_lifecycle_gate
+	$(B)/test_vm_pause
+	python3 tests/test_vm_natural_exit_paused.py
+.PHONY: test-vm-pause
 
 test-vm-lifecycle: $(B)/test_vm_lifecycle
 	$(B)/test_vm_lifecycle
@@ -135,11 +154,12 @@ clean:
 # of libslirp and glib from Husk's sysroot (scripts there make them); see ios/README.md.
 IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
-# ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
-IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
-IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+HUSK ?= $(HOME)/Documents/Coding/Husk
+# Prefer installed headers, otherwise use the explicitly selected Husk source build.
+IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HUSK)/build/ios-arm64/sysroot)
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I"$(IOS_DEPS)/include/slirp"
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/lifecycle_gate.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
 
@@ -271,3 +291,50 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+# Portable compatibility controls: authored inputs, no guest cache or Apple shader assets.
+COMPAT_TESTS = $(B)/test_panic_candidates $(B)/test_pvg_texture_record $(B)/test_pvg_surface_pages $(B)/test_pvg_surface_copyback_plan
+$(B)/test_panic_candidates: tests/test_panic_candidates.c devices/panic_candidates.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_texture_record: tests/test_pvg_texture_record.c devices/pvg_texture_record.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_surface_pages: tests/test_pvg_surface_pages.c devices/pvg_surface_pages.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+$(B)/test_pvg_surface_copyback_plan: tests/test_pvg_surface_copyback.c devices/pvg_surface_copyback.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
+test-sonoma-compat: $(COMPAT_TESTS) $(B)/test_virtio_discard
+	@for test in $^; do "$$test" || exit 1; done
+	python3 -m unittest discover -s tools/compat -p 'test_*.py'
+.PHONY: test-sonoma-compat
+
+# Opt-in provenance helper: two successful authored compiles, no GPU dispatch.
+$(B)/test_agx_journal: tests/agx_journal/normal_journal_test.m devices/pvg_agx_journal.h | $(B)
+	$(CC) $(CFLAGS) -fobjc-arc -Wno-deprecated-declarations $< -framework Foundation -framework Metal -o $@
+$(B)/agx_journal_%.metallib: tests/agx_journal/normal_%.metal | $(B)
+	xcrun -sdk macosx metal -c $< -o $(B)/agx_journal_$*.air
+	xcrun -sdk macosx metallib $(B)/agx_journal_$*.air -o $@
+test-agx-journal: $(B)/test_agx_journal $(B)/agx_journal_a.metallib $(B)/agx_journal_b.metallib
+	$(B)/test_agx_journal $(B)/agx-journal-$$(date +%s)-$$$$ $(B)/agx_journal_a.metallib $(B)/agx_journal_b.metallib
+
+# Execute the actual replay lifetime helpers without GPU or device calls.
+test-pvg-task-lifecycle:
+	python3 tests/test_pvg_task_lifecycle.py
+.PHONY: test-pvg-task-lifecycle
+
+# CPU-only ordinary texture decoding under ASan and UBSan.
+test-pvg-ordinary-texture:
+	python3 tests/test_pvg_ordinary_texture.py
+.PHONY: test-pvg-ordinary-texture
+
+# CPU/file-protocol controls for deferred replay; no Metal dispatch or guest.
+test-ordered-replay:
+	python3 tests/test_pvg_replay_queue.py
+	python3 tests/test_pvg_task_view.py
+	python3 tests/test_pvg_mapper_queue.py
+	python3 tests/test_pvg_preflight.py
+	python3 tests/test_pvg_local_provider_binding.py
+	python3 tests/test_pvg_shader_request_api.py
+	python3 tests/test_pvg_render_status.py
+	python3 tests/test_pvg_merged_lifecycle_queue.py
+	python3 tests/test_pvg_complaint_concurrency.py
+.PHONY: test-ordered-replay

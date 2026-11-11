@@ -941,6 +941,19 @@ static int run_loop(HvCpu *cpu, int one) {
     hv_self = cpu;
     unpark(cpu);
     for (;;) {
+        if (!cpu->halted && m->host_run_allowed && !m->host_run_allowed()) {
+            /* Park before waiting: no device/translation/big lock is held,
+               and TLB invalidation/stop-the-world peers do not wait for us. */
+            hv_big_unlock(m);
+            park(cpu);
+            m->host_wait_run();
+            unpark(cpu);
+            hv_big_lock(m);
+            cpu->excl_addr = ~0ull;
+            pending_chain = NULL; prev_b = NULL;
+            last_reason = HV_EXIT_EXCEPTION;
+            continue;
+        }
         if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) {
             stop_the_world(cpu);
             pending_chain = NULL;

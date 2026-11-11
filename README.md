@@ -84,9 +84,15 @@ On a Mac with Xcode 27 or later and `xcodegen`. Henge takes StikJIT, on-device p
 ```bash
 ios/scripts/fetch_deps.sh
 tools/build_ios_restore.sh
+python3 tools/compat/build_ondevice_provider.py \
+  --llvm-source /path/to/pinned/floor_llvm --output /path/to/new/provider-build
 make ios-lib
 ios/scripts/package_ipa.sh
 ```
+
+The provider uses the public LLVM source and exact revision documented in
+[the on-device compiler guide](compat/ondevice-shaders/README.md). It is linked
+into Henge; running the resulting app needs no Mac compiler or shader cache import.
 
 That produces `~/Desktop/Henge.ipa`, and `package_ipa.sh --trollstore` writes `Henge.tipa`.
 

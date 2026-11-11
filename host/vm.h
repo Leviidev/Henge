@@ -36,7 +36,11 @@ HvCpu *hv_vm_cpu(int index);
 extern void (*hv_prof_register)(void); /* debugging: each thread that will run guest code calls this */
 /* Frames go to this CAMetalLayer, drawn by the GPU, instead of hv_vm_boot_display. */
 void hv_vm_set_display_layer(void *layer);
+/* Caller holds the machine lifetime lock; redraw whichever target is current. */
+void hv_vm_refresh_display(void);
+void hv_vm_resume_drain(void (*done)(void *, int), void *opaque);
 uint64_t hv_vm_gpu_frames(void);
+int hv_vm_render_status(char *message,uint32_t length);
 int hv_vm_ncpus(void);
 
 /* The boot framebuffer iBoot hands the kernel (XNU's boot_args video info):

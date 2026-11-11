@@ -1,0 +1,26 @@
+{
+  "include/llvm/Support/ErrorHandling.h": {
+    "before_sha256": "db2a42ae38633e76ba15cc4f36a61cbd28495d3089f933447ea5ca1f868d116d",
+    "after_sha256": "d8f39f394c1617e3559567243b7fc24224aefac87083ec4cc6e3f6e3d863b51b"
+  },
+  "lib/Support/ErrorHandling.cpp": {
+    "before_sha256": "dee8165df78de5aff04190fdd2c5980b038a9035140b8e16d34b0b2ce7e61880",
+    "after_sha256": "4528ae5851b4d995329a368e6a5b8f012488559b87f0c9d7f375162d07f76b5a"
+  },
+  "lib/Bitstream/Reader/BitstreamReader.cpp": {
+    "before_sha256": "f1ee428443b07665b143d34dcec9e498737cff7fba4d02af8502bafae2b64188",
+    "after_sha256": "a52109ff9022997094e2d892023835cc227144106016842bfd45009fc7bbac97"
+  },
+  "lib/Bitcode/Reader/ValueList.h": {
+    "before_sha256": "f51c7ffc19e193a60765f3df493b452c951c6437a5e6fa019767125d4a340c1a",
+    "after_sha256": "0a52db836ecf4e67bd977a72b7cda9b578f78a44bc7d0e486ea7f0cbee3feaf8"
+  },
+  "lib/Bitcode/Reader/MetadataLoader.cpp": {
+    "before_sha256": "577e747a82db05504501aeeee0d14564d5c298d6606a8bb9087654b444a388dd",
+    "after_sha256": "e7a52c21733785fe4758cde9950e3f1cb4dfe439f773bb06ff4168b76c20dd12"
+  },
+  "lib/Bitcode/Reader/BitcodeReader.cpp": {
+    "before_sha256": "2ac6efaa83ad00bf168655935d0be585e89762ababdac728d5a5394546ba0753",
+    "after_sha256": "ea73c6ef34101a74f29f62aa73ba891941fd7655fa76ec1c25a48e9903dfb1bf"
+  }
+}
