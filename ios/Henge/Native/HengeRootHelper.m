@@ -114,6 +114,7 @@ static char *run_helper(const char *operation, int image)
             if (![report[@"guest_disk_accessed"] isEqual:@NO]) return NULL;
         } else if (![report[@"image_inspected"] isEqual:@YES] ||
                    ![report[@"exclusive_lease_verified"] isEqual:@YES] ||
+                   ![report[@"media_inventory_verified"] isEqual:@YES] ||
                    ![report[@"image_modified"] isEqual:@NO] ||
                    ![report[@"image_attached"] isEqual:@NO] ||
                    ![report[@"volume_mounted"] isEqual:@NO]) return NULL;

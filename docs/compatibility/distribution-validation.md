@@ -442,3 +442,30 @@ change that outcome. This is an unqualified executable launch, not evidence of
 GPT rejection or successful image access. The live Sonoma guest was not stopped,
 attached, mounted or modified by this attempt. App-persona inspection remains an
 outstanding device gate.
+
+### On-iPad native media and persona controls
+
+The standalone launch failure above was localized with the device unified log:
+System Policy denied execution from `/private/var/tmp`. Running the same signed
+native inspector from the jailbreak executable directory succeeded. It verified
+the actual 64 GiB Sonoma image: three GPT partitions and exactly one ordinary
+APFS partition, unchanged during inspection. No guest attachment or mount occurred.
+
+A separate developer app-bundle control, running as mobile UID 501 and carrying
+no-sandbox/persona-mgmt, used the production app-side launcher and payload-bound
+helper. It obtained real/effective UID/GID 0, verified all 19 payload files and
+successfully inspected that same guest. This qualifies the native launcher and
+helper in that CLI context; actual Henge UIKit/TrollStore launch remains a gate.
+
+The new native IOMedia inventory independently identified four read-only media
+belonging to the authored 96 MiB APFS scratch image. It observed an empty inventory
+before attachment and after ejection. The production helper rejected inspection
+while that image was attached (status 75); the mobile launcher rejected the
+response too. Inspection succeeded again after ejection and the whole-file SHA-256
+was unchanged. Only the developer control attaches/ejects scratch media; production
+inspection remains read-only. The complete tool suite passed 67 tests, including
+five test-only IOKit fixture groups and the strengthened app response checks.
+
+These checks do not establish a native attachment/mount transaction, selection of
+the actual Sonoma Data volume, payload installation, rollback, normal app activation
+or fresh-guest acceptance. The existing Henge process and guest were preserved.

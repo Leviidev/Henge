@@ -59,6 +59,7 @@ int main(int argc, char **argv) {
                         str(ROOT / 'compat/guest-provisioning/root_helper.c'),
                         '-fobjc-arc', str(ROOT / 'compat/guest-provisioning/HGGuestPayload.m'),
                         str(ROOT / 'compat/guest-provisioning/HGGuestDisk.c'),
+                        str(ROOT / 'compat/guest-provisioning/HGGuestMedia.m'),
                         '-framework', 'Foundation', '-lz',
                         '-o', str(cls.real_helper)], check=True)
 
@@ -154,7 +155,7 @@ int main(int argc, char **argv) {
         image.write_bytes(original)
         report = dict(schema=1, operation='inspect-image-v1', root=True, uid=0,
                       euid=0, gid=0, egid=0, payload_verified=True, image_inspected=True,
-                      exclusive_lease_verified=True, image_modified=False,
+                      exclusive_lease_verified=True, media_inventory_verified=True, image_modified=False,
                       image_attached=False, volume_mounted=False)
         checks = '''if(argc!=2 || strcmp(argv[1],"inspect-image-v1") ||
             (fcntl(3,F_GETFL)&O_ACCMODE)!=O_RDONLY) return 91;
@@ -164,9 +165,11 @@ int main(int argc, char **argv) {
         self.fixture(checks + 'puts(' + json.dumps(json.dumps(report)) + '); return 0;')
         self.assertEqual(self.run_probe(image=image).returncode, 0)
         self.assertEqual(image.read_bytes(), original)
-        report['image_modified'] = True
-        self.fixture('puts(' + json.dumps(json.dumps(report)) + '); return 0;')
-        self.assertEqual(self.run_probe(image=image).returncode, 1)
+        for field, invalid in (('image_modified', True), ('image_attached', True),
+                               ('media_inventory_verified', False)):
+            altered = {**report, field: invalid}
+            self.fixture('puts(' + json.dumps(json.dumps(altered)) + '); return 0;')
+            self.assertEqual(self.run_probe(image=image).returncode, 1)
 
     def test_image_path_symlink_and_fifo_are_rejected_before_spawn(self):
         image = self.base / 'resource'

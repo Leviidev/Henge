@@ -137,3 +137,34 @@ The authored 96 MiB APFS image passed native inspection with an unchanged whole
 file hash. This API is ready for the next provisioning step; it is not yet invoked
 as an automatic install flow. Physical attachment, verified IOMedia ancestry,
 Sonoma Data-volume selection and payload delivery/activation remain unfinished.
+
+## Native existing-media inventory
+
+`HGGuestMedia.m` enumerates IOMedia and follows its disk-image ancestry. It opens
+regular no-follow image ancestors and matches device/inode to the leased image;
+BSD names, volume labels and `hdik` output do not grant ownership. It validates
+bounded device names, registry entry IDs, sizes and typed flags, and releases
+registry objects on success and failure. A stale/unresolvable image ancestor,
+missing API, failed enumeration or changed image fails closed. Hard-link aliases
+are recognized by inode identity. The query never attaches, detaches or mounts.
+
+`inspect-image-v1` now requires this inventory to succeed and be empty. An already
+attached image is rejected with status 75. The app transport requires the new
+`media_inventory_verified` field in addition to its existing no-write checks.
+This is a prerequisite for a later attachment transaction, not an installer.
+
+Five native authored-file/test-only IOKit fixture groups cover aliases, unrelated
+media, byte-string ancestors, stale paths, malformed properties, duplicate names,
+missing APIs and enumeration bounds. These stubs are not device permission proof.
+The native scanner separately identified all four media from a read-only attached
+96 MiB scratch image on the iPad and observed an empty inventory after ejection.
+The bound production helper rejected that attachment, accepted the image again
+after ejection, and the complete image hash was unchanged.
+
+`tools/compat/root_helper_device_control.m` builds a separate developer app-bundle
+control using the production app-side launcher. On the matching iPad, running it
+as UID 501 with no-sandbox/persona-mgmt started the signed helper as UID/GID 0,
+verified all 19 payload files, and inspected the actual 64 GiB Sonoma disk without
+attaching, mounting or changing it. The same control rejected the attached scratch
+image. This developer jailbreak CLI launch is stronger evidence than persona
+stubs, but it does not replace the final UIKit/TrollStore application launch gate.
