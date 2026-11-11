@@ -19,6 +19,8 @@ def verify(root):
     receipt = json.loads((library.parent / RECEIPT).read_text())
     expected = {p.name: digest(p) for p in source.iterdir() if p.is_file()
                 and p.name not in ('README.md', '.gitignore')}
+    for name in ('stateless_link.cpp', 'HGStatelessLink.h'):
+        expected['dynamic/' + name] = digest(root / 'compat/ondevice-dynamic' / name)
     if receipt['source_package'] != expected:
         raise ValueError('On-device compiler source changed; rebuild the provider')
     if digest(library) != receipt['archive_sha256']:

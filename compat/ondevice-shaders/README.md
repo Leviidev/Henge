@@ -49,6 +49,15 @@ archive once and `libc++`; do not separately compile the provider/CABI sources
 into the same app. No shader assets or private Apple compiler binaries are bundled.
 The caller header and profile contract copies must match `devices/` before build.
 
+The same archive now contains the bounded stateless compute linker from
+[`ondevice-dynamic`](../ondevice-dynamic/README.md). Both ordinary conversion and
+closure linking share one LLVM runtime; they must never execute concurrently.
+The guest closure transport is not implemented yet. It must enqueue closure jobs
+on the provider's process-wide serial compiler queue before activation. Direct
+single-threaded controls are separate from that runtime integration requirement.
+Dynamic source hashes are checked alongside the ordinary provider source.
+
+
 The packaging step verifies the staged archive hash, exact provider-source hashes,
 recipe identity, header contracts and bundled LLVM license. A missing or stale
 `ios/deps/lib/libHGOnDeviceShader.build.json` requires a provider rebuild; copying

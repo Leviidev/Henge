@@ -14,7 +14,7 @@ for name in ['llvm','cmake']:shutil.copytree(s/name,r/'llvm-source'/name,symlink
 run(['python3','harden_llvm.py'])
 common=['-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DCMAKE_CXX_FLAGS=-DHENGE_AIR_EMBEDDED=1','-DLLVM_ENABLE_EH=ON','-DLLVM_ENABLE_RTTI=ON','-DLLVM_ENABLE_THREADS=OFF','-DLLVM_TARGETS_TO_BUILD=','-DLLVM_ENABLE_PROJECTS=','-DLLVM_BUILD_TOOLS=OFF','-DLLVM_INCLUDE_TESTS=OFF','-DLLVM_INCLUDE_BENCHMARKS=OFF','-DLLVM_ENABLE_ZLIB=OFF','-DLLVM_ENABLE_ZSTD=OFF','-DLLVM_ENABLE_LIBXML2=OFF','-DLLVM_ENABLE_TERMINFO=OFF','-DLLVM_ENABLE_CURL=OFF']
 run(['cmake','-S','llvm-source/llvm','-B','llvm-native',*common,'-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0'])
-targets=['LLVMBitReader','LLVMBitWriter140','LLVMBitWriter']
+targets=['LLVMLinker','LLVMBitReader','LLVMBitWriter140','LLVMBitWriter']
 run(['cmake','--build','llvm-native','-j',str(a.jobs),'--target','llvm-config','llvm-tblgen',*targets])
 run(['cmake','-S','llvm-source/llvm','-B','llvm-ios',*common,'-DCMAKE_SYSTEM_NAME=iOS','-DCMAKE_MACOSX_BUNDLE=OFF','-DCMAKE_OSX_SYSROOT=iphoneos','-DCMAKE_OSX_ARCHITECTURES=arm64','-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0','-DLLVM_TABLEGEN='+str(r/'llvm-native/bin/llvm-tblgen')])
 run(['cmake','--build','llvm-ios','-j',str(a.jobs),'--target',*targets])

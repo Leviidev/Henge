@@ -122,6 +122,19 @@ jobs:
           "$RUNNER_TEMP/henge-ondevice-provider/native_provider_tests" \
             "$RUNNER_TEMP/henge-provider-assets" "$RUNNER_TEMP/henge-provider-results"
 
+      - name: Qualify the embedded stateless closure backend
+        working-directory: Henge
+        run: |
+          python3 compat/ondevice-dynamic/build_fixtures.py --output "$RUNNER_TEMP/henge-closure-assets"
+          python3 compat/ondevice-dynamic/build_control.py \
+            --provider-build "$RUNNER_TEMP/henge-ondevice-provider" \
+            --provider-archive "$RUNNER_TEMP/henge-ondevice-provider/lib-macosx/libHGOnDeviceShader.a" \
+            --output "$RUNNER_TEMP/henge-closure-control"
+          python3 compat/ondevice-dynamic/qualify_native.py \
+            --control "$RUNNER_TEMP/henge-closure-control/native-control" \
+            --fixtures "$RUNNER_TEMP/henge-closure-assets" \
+            --output "$RUNNER_TEMP/henge-closure-results"
+
       - name: Run portable compatibility controls
         working-directory: Henge
         run: make test-sonoma-compat test-ordered-replay test-pvg-ordinary-texture

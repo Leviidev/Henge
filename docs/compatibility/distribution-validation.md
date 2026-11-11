@@ -68,3 +68,35 @@ success is claimed.
 The remaining automatic runtime integration and fresh-install gates are tracked
 in [the distribution plan](distribution-plan.md). Historical device results must
 not be attributed to this newly reconciled binary.
+
+
+## Embedded dynamic closure port
+
+The new `compat/ondevice-dynamic` C ABI ports the existing supported stateless
+compute closure to the pinned public LLVM reader/linker/writer. It takes only
+supplied byte arrays and declared origins, with no Apple tools, subprocess,
+network access or filesystem dependency search during execution.
+
+- Direct native Metal execution passed loader-relative, absolute-install-name
+  and explicit-preload controls: 768 exact outputs, zero mismatches. Latest
+  semantic validation also rejected missing origins, missing loader dependencies,
+  missing explicit preloads and an otherwise valid dependency whose container
+  export name disagreed with the concrete AIR definition. No library was
+  published in those four rejection cases.
+- A temporary, normally development-signed audit app ran the same three success
+  classes directly on the iPad's Apple M1 GPU under iPadOS 17.0. All 768 outputs
+  matched after on-device linking and iOS retargeting, library loading, pipeline
+  creation and GPU completion. It used no JIT entitlement or Mac compiler service
+  while executing. Build-machine Apple tools only generated the authored fixtures.
+- That iPad test preceded the additional export/definition binding guard. The
+  guard has native validation; its revised source and the integrated Henge binary
+  still require an iPad gate. The audit app was removed after saving its report.
+- This is a bounded compute-only Metal 3.1 / AIR 2.6 / MTLB 2.7 profile. It does
+  not establish support for arbitrary dynamic libraries, graphics entrypoints,
+  mutable dependency state, indirect calls or other input versions.
+
+The provider build now compiles the combined ordinary/dynamic translation unit
+once, includes the required public LLVM Linker component and binds both dynamic
+source files into its recipe and packaging receipt. CI controls explicitly link
+against that combined archive. Guest transport and automatic activation remain
+unimplemented; merely packaging the backend does not complete the no-setup goal.

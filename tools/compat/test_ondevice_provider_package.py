@@ -25,6 +25,10 @@ class ProviderPackageTests(unittest.TestCase):
         (self.root / 'ios/Henge/Resources/legal/LICENSE-LLVM.txt').write_text(
             'authored license fixture')
         (self.lib / 'libHGOnDeviceShader.a').write_bytes(b'authored archive fixture')
+        dynamic = self.root / 'compat/ondevice-dynamic'
+        dynamic.mkdir()
+        for name in ('stateless_link.cpp', 'HGStatelessLink.h'):
+            (dynamic / name).write_text('authored dynamic ' + name)
         manifest = {'authored': 'test recipe'}
         encoded = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
         self.receipt = {
@@ -34,7 +38,15 @@ class ProviderPackageTests(unittest.TestCase):
             'compiler_recipe': {'recipe': hashlib.sha256(encoded).hexdigest(),
                                 'manifest': manifest},
         }
+        for name in ('stateless_link.cpp', 'HGStatelessLink.h'):
+            self.receipt['source_package']['dynamic/' + name] = hashlib.sha256(
+                (dynamic / name).read_bytes()).hexdigest()
         self.write_receipt()
+
+    def test_stale_dynamic_linker(self):
+        (self.root / 'compat/ondevice-dynamic/stateless_link.cpp').write_text('changed linker')
+        with self.assertRaisesRegex(ValueError, 'source changed'):
+            verify(self.root)
 
     def write_receipt(self):
         (self.lib / RECEIPT).write_text(json.dumps(self.receipt))
