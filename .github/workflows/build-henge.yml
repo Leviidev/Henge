@@ -74,6 +74,16 @@ jobs:
             rustup target add aarch64-apple-ios
           }
 
+      - name: Cache verified VLC build inputs
+        uses: actions/cache@v4
+        with:
+          # Downloads only; no compiled plugins or guest state.
+          path: |
+            Henge/.compat-local/vlc-archives/*.dmg
+            Henge/.compat-local/vlc-archives/*.tar.gz
+            Henge/.compat-local/vlc-archives/*.tar.xz
+          key: henge-vlc-inputs-${{ hashFiles('Henge/compat/vlc/inputs.lock.json', 'Henge/compat/vlc/reference.lock.json') }}
+
       # build_ios.sh builds from third_party/build/<name>; the sources are
       # fetched by fetch_sources.sh, which Husk's own ci_build.sh runs first.
       - name: Fetch Husk's third-party sources

@@ -9,17 +9,46 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import tarfile
 
 from check_ondevice_provider import verify as verify_provider
 
 ROOT = Path(__file__).resolve().parents[2]
 LIBRARIES = ('libHengeDynamic.dylib', 'libHengeCGLDiscovery.dylib')
-FILES = (*LIBRARIES, 'LICENSE-Henge-GPL-2.0.txt')
+VLC_PLUGINS = ('libaacdecgap_plugin.dylib', 'libaacgap_plugin.dylib',
+               'libaacpacketgap_plugin.dylib', 'libavgap_plugin.dylib',
+               'libmacosx_plugin.dylib', 'libmux_mp4_plugin.dylib',
+               'libsamplerate_plugin.dylib', 'libstream_out_transcode_plugin.dylib',
+               'libx265_plugin.dylib')
+EXECUTABLES = (*LIBRARIES, *VLC_PLUGINS)
+VLC_LICENSES = {
+    'LICENSE-VLC-GPL-2.0.txt': 'sources/vlc-3.0.24/COPYING',
+    'LICENSE-VLC-LGPL-2.1.txt': 'sources/vlc-3.0.24/COPYING.LIB',
+    'LICENSE-FFmpeg-LGPL-2.1.txt': 'sources/ffmpeg-8.1.2/COPYING.LGPLv2.1',
+    'LICENSE-x265-GPL-2.0.txt': 'sources/x265_4.1/COPYING',
+    'LICENSE-libsamplerate-BSD.txt': 'sources/libsamplerate-0.1.9/COPYING',
+}
+FILES = (*EXECUTABLES, 'LICENSE-Henge-GPL-2.0.txt', *VLC_LICENSES,
+         'vlc-build-receipt.json')
 SOURCES = ('compat/dynamic-libraries/guest/runtime.m',
            'compat/dynamic-libraries/guest/adapter.m',
            'compat/dynamic-libraries/guest/transport.m',
-           'compat/opengl-discovery/registry_discovery.m', 'LICENSE')
+           'compat/opengl-discovery/registry_discovery.m', 'LICENSE',
+           'tools/compat/build_guest_payload.py')
+SOURCES += tuple('compat/vlc/' + name for name in (
+    'build.py', 'reference.py', 'reference.lock.json', 'inputs.lock.json',
+    'source-provenance.json', 'COPYING', 'COPYING.LIB'))
+SOURCES += tuple(str(path.relative_to(ROOT)) for directory in ('patches', 'support')
+                 for path in sorted((ROOT / 'compat/vlc' / directory).iterdir()) if path.is_file())
+
+
+def vlc_target(root=ROOT):
+    lock = json.loads((root / 'compat/vlc/reference.lock.json').read_text())
+    return dict(version=lock['version'], bundle_identifier=lock['bundle_identifier'],
+                reference_core_sha256=lock['core_sha256'],
+                reference_lock_sha256=digest(root / 'compat/vlc/reference.lock.json'),
+                plugins=list(VLC_PLUGINS), installation='unimplemented')
 
 
 def digest(path):
@@ -49,7 +78,7 @@ def archive_payload(folder, target):
                 archive.addfile(item, io.BytesIO(data))
 
 
-def verify_payload(folder, expected_recipe):
+def verify_payload(folder, expected_recipe, root=ROOT):
     """Check bundle integrity before embedding, not authenticity of external input.
 
     The release app signature is the trust anchor for the embedded manifest.
@@ -70,7 +99,7 @@ def verify_payload(folder, expected_recipe):
             stat.S_IMODE((folder / 'manifest.json').stat().st_mode) != 0o644):
         raise ValueError('Invalid payload manifest size or mode')
     if set(manifest) != {'schema', 'kind', 'architecture', 'minimum_macos',
-                         'compiler_recipe', 'sources', 'files', 'activation', 'payload_id'}:
+                         'compiler_recipe', 'sources', 'files', 'activation', 'payload_id', 'vlc'}:
         raise ValueError('Unsupported payload manifest fields')
     if (manifest['schema'] != 1 or manifest['kind'] != 'henge-sonoma-guest-compatibility' or
             manifest['architecture'] != 'arm64' or manifest['minimum_macos'] != '14.0' or
@@ -79,6 +108,8 @@ def verify_payload(folder, expected_recipe):
         raise ValueError('Payload identity, target or compiler recipe mismatch')
     if set(manifest['files']) != set(FILES):
         raise ValueError('Payload inventory mismatch')
+    if manifest['vlc'] != vlc_target(root):
+        raise ValueError('VLC compatibility unit or target ABI mismatch')
     if (set(manifest['sources']) != set(SOURCES) or
             not all(isinstance(value, str) and re.fullmatch('[0-9a-f]{64}', value)
                     for value in manifest['sources'].values())):
@@ -88,21 +119,23 @@ def verify_payload(folder, expected_recipe):
         path = folder / name
         if (set(record) != {'sha256', 'bytes', 'mode'} or
                 record['sha256'] != digest(path) or record['bytes'] != path.stat().st_size or
-                record['mode'] != (0o755 if name in LIBRARIES else 0o644) or
+                record['mode'] != (0o755 if name in EXECUTABLES else 0o644) or
                 stat.S_IMODE(path.stat().st_mode) != record['mode']):
             raise ValueError('Payload member identity mismatch: ' + name)
     return manifest
 
 
-def build(root, output):
+def build(root, output, vlc_archives=None):
     recipe = verify_provider(root)
+    if (root / 'tools/compat/build_guest_payload.py').read_bytes() != Path(__file__).read_bytes():
+        raise ValueError('Payload builder differs from the selected source root')
+    source_snapshot = {name: digest(root / name) for name in SOURCES}
     output.mkdir(parents=True, exist_ok=False)
     payload = output / 'payload'
     payload.mkdir()
     compiler = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--find', 'clang'], text=True).strip()
     sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
     guest = root / 'compat/dynamic-libraries/guest'
-    sources = [root / name for name in SOURCES]
     discovery = root / 'compat/opengl-discovery/registry_discovery.m'
     commands = []
     for name, source, frameworks in (
@@ -124,18 +157,54 @@ def build(root, output):
         if b'HENGE_EMBEDDED_TEST_ENDPOINT' in target.read_bytes():
             raise ValueError('Native-only transport override leaked into production payload')
         target.chmod(0o755)
-    license_file = payload / FILES[-1]
+    license_file = payload / 'LICENSE-Henge-GPL-2.0.txt'
     license_file.write_bytes((root / 'LICENSE').read_bytes())
     license_file.chmod(0o644)
+    vlc_build = output / 'vlc-build'
+    if vlc_archives is None:
+        vlc_archives = root / '.compat-local/vlc-archives'
+    subprocess.run([sys.executable, str(root / 'compat/vlc/build.py'),
+                    '--archives', str(vlc_archives.resolve()), '--output', str(vlc_build),
+                    '--fetch'], check=True)
+    vlc_receipt = json.loads((vlc_build / 'build-receipt.json').read_text())
+    target_abi = vlc_target(root)
+    if (vlc_receipt['state'] != 'built; not installed' or
+            vlc_receipt['reference_core_sha256'] != target_abi['reference_core_sha256'] or
+            set(vlc_receipt['plugins']) != set(VLC_PLUGINS) or
+            vlc_receipt['reference_provenance'] != dict(mode='pinned-automatic',
+                lock_sha256=target_abi['reference_lock_sha256'], official_signature_verified=True)):
+        raise ValueError('Incomplete or mismatched VLC source build')
+    for name in VLC_PLUGINS:
+        source = vlc_build / 'plugins' / name
+        if digest(source) != vlc_receipt['plugins'][name]:
+            raise ValueError('VLC build output differs from its receipt: ' + name)
+        target = payload / name
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o755)
+        subprocess.run(['codesign', '--force', '--sign', '-', '--timestamp=none', str(target)], check=True)
+        subprocess.run(['codesign', '--verify', '--strict', str(target)], check=True)
+        if subprocess.check_output(['lipo', '-archs', str(target)], text=True).strip() != 'arm64':
+            raise ValueError('Unexpected VLC plugin architecture')
+        exported = subprocess.check_output(['nm', '-gU', str(target)], text=True)
+        if '_vlc_entry__3_0_0f' not in exported.split():
+            raise ValueError('Missing VLC 3.0 plugin entry point: ' + name)
+    for name, source in VLC_LICENSES.items():
+        target = payload / name
+        target.write_bytes((vlc_build / source).read_bytes())
+        target.chmod(0o644)
+    (payload / 'vlc-build-receipt.json').write_bytes((vlc_build / 'build-receipt.json').read_bytes())
+    (payload / 'vlc-build-receipt.json').chmod(0o644)
+    if {name: digest(root / name) for name in SOURCES} != source_snapshot:
+        raise ValueError('Guest payload source changed during the build')
     manifest = dict(schema=1, kind='henge-sonoma-guest-compatibility', architecture='arm64',
-                    minimum_macos='14.0', compiler_recipe=recipe, activation='unimplemented',
-                    sources={str(p.relative_to(root)): digest(p) for p in sources},
+                    minimum_macos='14.0', compiler_recipe=recipe, activation='unimplemented', vlc=target_abi,
+                    sources=source_snapshot,
                     files={name: dict(sha256=digest(payload / name), bytes=(payload / name).stat().st_size,
                                       mode=stat.S_IMODE((payload / name).stat().st_mode)) for name in FILES})
     manifest['payload_id'] = identity(manifest)
     (payload / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
     (payload / 'manifest.json').chmod(0o644)
-    verify_payload(payload, recipe)
+    verify_payload(payload, recipe, root)
     archive = output / 'henge-guest-payload.tar.gz'
     archive_payload(payload, archive)
     descriptor = dict(schema=1, payload_id=manifest['payload_id'], compiler_recipe=recipe,
@@ -155,8 +224,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--vlc-archives', type=Path,
+                        help='Build-time download cache; default .compat-local/vlc-archives')
     args = parser.parse_args()
-    print(build(args.root.resolve(), args.output.resolve())['payload_id'])
+    print(build(args.root.resolve(), args.output.resolve(), args.vlc_archives)['payload_id'])
 
 
 if __name__ == '__main__':

@@ -298,3 +298,23 @@ or oversized input rejection, no implicit fetch, failed-mount cleanup, reuse
 verification and retention of a staging directory after failed detach instead
 of recursively deleting a mounted filesystem. This removes a build-time manual
 input; it does not integrate VLC into the release payload or guest installation.
+
+### Complete VLC unit in the release payload
+
+The release payload builder now invokes the pinned VLC source build by default
+and embeds all nine compatibility plugins together. It rejects an incomplete
+unit, a different official core/lock identity or a plugin that differs from the
+build receipt. Before embedding, every plugin is ad-hoc signed and checked for
+strict signature validity, arm64 architecture and its VLC 3.0 entry point. The
+flat archive includes VLC, FFmpeg, x265 and libsamplerate license texts and the
+source build receipt, but excludes the reference app and its frameworks.
+
+The combined source build passed. Eight payload controls passed, including a
+missing plugin, partial unit and wrong core hash. All 37 packaging/tool tests
+passed. The manifest captures source hashes before compilation and refuses to
+publish if they change during the build. Plugin install names use `@rpath` and
+omit random UUIDs; source prefix maps and FFmpeg's runtime configuration string
+normalize transient build paths. Actual compiler flags remain in the builder.
+This records the build changes; equality of independent complete release builds
+and the finished IPA remain separate checks. No guest installation, app update
+or normal launch gate is established by bundling these files.

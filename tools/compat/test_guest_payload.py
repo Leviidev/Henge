@@ -5,7 +5,8 @@ import tempfile
 import tarfile
 import unittest
 
-from build_guest_payload import FILES, LIBRARIES, SOURCES, archive_payload, digest, identity, verify_payload
+from build_guest_payload import (EXECUTABLES, FILES, LIBRARIES, SOURCES, VLC_PLUGINS,
+                                archive_payload, digest, identity, verify_payload, vlc_target)
 
 
 class GuestPayloadTests(unittest.TestCase):
@@ -16,11 +17,11 @@ class GuestPayloadTests(unittest.TestCase):
         for name in FILES:
             path = self.folder / name
             path.write_bytes(('authored fixture ' + name).encode())
-            path.chmod(0o755 if name in LIBRARIES else 0o644)
+            path.chmod(0o755 if name in EXECUTABLES else 0o644)
         self.recipe = 'a' * 64
         self.manifest = dict(schema=1, kind='henge-sonoma-guest-compatibility',
                              architecture='arm64', minimum_macos='14.0',
-                             compiler_recipe=self.recipe, activation='unimplemented',
+                             compiler_recipe=self.recipe, activation='unimplemented', vlc=vlc_target(),
                              sources={name: 'b' * 64 for name in SOURCES},
                              files={name: dict(sha256=digest(self.folder / name),
                                               bytes=(self.folder / name).stat().st_size,
@@ -103,9 +104,25 @@ class GuestPayloadTests(unittest.TestCase):
                 self.assertEqual(member.uid, 0)
                 self.assertEqual(member.gid, 0)
                 self.assertEqual(member.mtime, 0)
-                self.assertEqual(member.mode, 0o755 if member.name in LIBRARIES else 0o644)
+                self.assertEqual(member.mode, 0o755 if member.name in EXECUTABLES else 0o644)
                 self.assertEqual(hashlib.sha256(archive.extractfile(member).read()).hexdigest(),
                                  digest(self.folder / member.name))
+
+    def test_vlc_unit_requires_all_plugins_and_exact_core(self):
+        self.manifest['vlc']['plugins'].pop()
+        self.write()
+        with self.assertRaises(ValueError):
+            verify_payload(self.folder, self.recipe)
+        self.manifest['vlc'] = vlc_target()
+        self.manifest['vlc']['reference_core_sha256'] = '0' * 64
+        self.write()
+        with self.assertRaises(ValueError):
+            verify_payload(self.folder, self.recipe)
+        self.manifest['vlc'] = vlc_target()
+        (self.folder / VLC_PLUGINS[0]).unlink()
+        self.write()
+        with self.assertRaises(ValueError):
+            verify_payload(self.folder, self.recipe)
 
 
 if __name__ == '__main__':

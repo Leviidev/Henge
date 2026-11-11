@@ -78,18 +78,27 @@ def main():
     (out/'build-receipt.json').write_text(json.dumps(receipt,indent=2))
     if a.prepare_only:return
     prefix=f'-ffile-prefix-map={out}=.'
-    flags=f'-O2 -mmacosx-version-min=14.0 -fvisibility=hidden {prefix}'
+    source_prefix=f'-ffile-prefix-map={HERE}=compat/vlc'
+    flags=f'-O2 -mmacosx-version-min=14.0 -fvisibility=hidden {prefix} {source_prefix}'
     configure=['./configure','--cc=clang','--arch=aarch64','--target-os=darwin','--disable-everything','--disable-autodetect','--disable-network','--disable-doc','--disable-debug','--disable-shared','--enable-static','--enable-pic','--disable-programs','--disable-avdevice','--disable-avfilter','--disable-swscale','--disable-swresample','--disable-iconv','--disable-videotoolbox','--disable-audiotoolbox','--disable-securetransport','--enable-avformat','--enable-protocol=file','--enable-demuxer=mov','--enable-parser=aac,h264,hevc','--enable-encoder=aac','--enable-decoder=aac','--extra-cflags='+flags,'--extra-ldflags=-mmacosx-version-min=14.0']
-    checked(configure,ff,logs/'ffmpeg-configure.log');checked(['make','-j',str(a.jobs)],ff,logs/'ffmpeg-build.log')
+    checked(configure,ff,logs/'ffmpeg-configure.log')
+    # FFmpeg also embeds the configure command as a runtime information string.
+    # Normalize paths in that string only; real compilation still uses its maps.
+    config=ff/'config.h';lines=config.read_text().splitlines(keepends=True)
+    matches=[i for i,line in enumerate(lines)if line.startswith('#define FFMPEG_CONFIGURATION ')]
+    if len(matches)!=1:raise ValueError('Missing FFmpeg runtime configuration declaration')
+    i=matches[0];lines[i]=lines[i].replace(str(out),'.').replace(str(HERE),'compat/vlc')
+    config.write_text(''.join(lines))
+    checked(['make','-j',str(a.jobs)],ff,logs/'ffmpeg-build.log')
     xb=out/'x265-build'
-    checked(['cmake','-S',str(x265/'source'),'-B',str(xb),'-DCMAKE_BUILD_TYPE=Release','-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0','-DENABLE_SHARED=OFF','-DENABLE_CLI=OFF','-DENABLE_ASSEMBLY=OFF','-DCMAKE_C_FLAGS='+prefix,'-DCMAKE_CXX_FLAGS='+prefix],out,logs/'x265-configure.log')
+    checked(['cmake','-S',str(x265/'source'),'-B',str(xb),'-DCMAKE_BUILD_TYPE=Release','-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0','-DENABLE_SHARED=OFF','-DENABLE_CLI=OFF','-DENABLE_ASSEMBLY=OFF','-DCMAKE_C_FLAGS='+prefix+' '+source_prefix,'-DCMAKE_CXX_FLAGS='+prefix+' '+source_prefix],out,logs/'x265-configure.log')
     checked(['cmake','--build',str(xb),'--parallel',str(a.jobs)],out,logs/'x265-build.log')
     env=os.environ.copy();env['CFLAGS']=flags;env['LDFLAGS']='-mmacosx-version-min=14.0'
     checked(['./configure','--disable-shared','--enable-static','--disable-fftw','--disable-sndfile'],src,logs/'samplerate-configure.log',env);checked(['make','-j',str(a.jobs)],src,logs/'samplerate-build.log',env)
     plugins=out/'plugins';plugins.mkdir();obj=out/'objects';obj.mkdir();encoder=out/'encoder';encoder.mkdir();support=HERE/'support';core=app/'Contents/MacOS/lib'
     for name in ['encoder.c','fourcc.c','chroma.c','chroma.h','avcodec.h','avcommon.h','avcommon_compat.h']:shutil.copy(vlc/'modules/codec/avcodec'/name,encoder/name)
     path=encoder/'avcodec.h';path.write_text(path.read_text().replace('sout-aacfix-','sout-aacgap-'))
-    common=['clang','-c','-O2','-fvisibility=hidden','-mmacosx-version-min=14.0',prefix,'-D__PLUGIN__','-DENABLE_SOUT','-DHAVE_LIBAVFORMAT_AVFORMAT_H','-DHAVE_LIBAVCODEC_AVCODEC_H','-DHAVE_LIBAVUTIL_AVUTIL_H','-DHAVE_LIBAVUTIL_CHANNEL_LAYOUT_H','-DPACKAGE_STRING="VLC 3.0.24 compatibility"','-I'+str(vlc/'include'),'-I'+str(ff),'-I'+str(encoder),'-I'+str(vlc/'modules/mux'),'-include',str(support/'config_local.h')]
+    common=['clang','-c','-O2','-fvisibility=hidden','-mmacosx-version-min=14.0',prefix,source_prefix,'-D__PLUGIN__','-DENABLE_SOUT','-DHAVE_LIBAVFORMAT_AVFORMAT_H','-DHAVE_LIBAVCODEC_AVCODEC_H','-DHAVE_LIBAVUTIL_AVUTIL_H','-DHAVE_LIBAVUTIL_CHANNEL_LAYOUT_H','-DPACKAGE_STRING="VLC 3.0.24 compatibility"','-I'+str(vlc/'include'),'-I'+str(ff),'-I'+str(encoder),'-I'+str(vlc/'modules/mux'),'-include',str(support/'config_local.h')]
     ff_libs=[str(ff/x)for x in ['libavformat/libavformat.a','libavcodec/libavcodec.a','libavutil/libavutil.a']]
     (obj/'demux_module.c').write_text('''#include <vlc_common.h>
 #include <vlc_plugin.h>
@@ -117,7 +126,7 @@ vlc_module_end()
         objects=[]
         for index,file in enumerate(files):
             target=obj/f'{name}-{index}.o';objects.append(str(target));checked(common+list(extra)+['-DMODULE_STRING="'+name+'"',str(file),'-o',str(target)],out,logs/f'{name}-{index}.log')
-        checked(['clang++'if cxx else'clang','-dynamiclib','-mmacosx-version-min=14.0','-o',str(plugins/f'lib{name}_plugin.dylib')]+objects+list(libs)+['-L'+str(core),'-lvlccore','-framework','CoreFoundation','-framework','CoreVideo','-framework','CoreMedia','-Wl,-exported_symbols_list,'+str(support/'exports.txt')],out,logs/f'{name}-link.log')
+        checked(['clang++'if cxx else'clang','-dynamiclib','-mmacosx-version-min=14.0','-Wl,-no_uuid','-install_name',f'@rpath/lib{name}_plugin.dylib','-o',str(plugins/f'lib{name}_plugin.dylib')]+objects+list(libs)+['-L'+str(core),'-lvlccore','-framework','CoreFoundation','-framework','CoreVideo','-framework','CoreMedia','-Wl,-exported_symbols_list,'+str(support/'exports.txt')],out,logs/f'{name}-link.log')
     build('aacgap',[encoder/'encoder.c',support/'module.c',encoder/'fourcc.c',encoder/'chroma.c',support/'audio_format.c'],ff_libs)
     build('avgap',[obj/'demux_module.c',vlc/'modules/demux/avformat/demux.c',encoder/'fourcc.c',encoder/'chroma.c'],ff_libs)
     build('aacdecgap',[obj/'decoder_module.c',vlc/'modules/codec/avcodec/audio.c',vlc/'modules/codec/avcodec/helpers.c',encoder/'fourcc.c',encoder/'chroma.c'],ff_libs)
@@ -126,12 +135,12 @@ vlc_module_end()
     build('mux_mp4',[vlc/f'modules/mux/mp4/{name}.c'for name in ['mp4','libmp4mux']]+[vlc/f'modules/packetizer/{name}.c'for name in ['hxxx_nal','h264_nal','hevc_nal']])
     build('samplerate',[vlc/'modules/audio_filter/resampler/src.c'],[str(src/'src/.libs/libsamplerate.a')],['-I'+str(src/'src')])
     build('x265',[vlc/'modules/codec/x265.c'],[str(xb/'libx265.a')],['-I'+str(x265/'source'),'-I'+str(xb),'-DNDEBUG'],True)
-    gui_flags=['clang','-c','-O2','-fobjc-exceptions','-fobjc-arc','-fvisibility=hidden','-mmacosx-version-min=14.0',prefix,'-D__PLUGIN__','-DMODULE_STRING="macosx"','-I'+str(support),'-I'+str(vlc/'include'),'-I'+str(vlc/'src'),'-I'+str(vlc/'modules/gui/macosx'),'-F'+str(app/'Contents/Frameworks'),'-include',str(support/'gui_config.h'),'-Wno-deprecated-declarations']
+    gui_flags=['clang','-c','-O2','-fobjc-exceptions','-fobjc-arc','-fvisibility=hidden','-mmacosx-version-min=14.0',prefix,source_prefix,'-D__PLUGIN__','-DMODULE_STRING="macosx"','-I'+str(support),'-I'+str(vlc/'include'),'-I'+str(vlc/'src'),'-I'+str(vlc/'modules/gui/macosx'),'-F'+str(app/'Contents/Frameworks'),'-include',str(support/'gui_config.h'),'-Wno-deprecated-declarations']
     files=sorted((vlc/'modules/gui/macosx').rglob('*.m'))
     def gui(file):
         target=obj/('gui-'+str(file.relative_to(vlc/'modules/gui/macosx')).replace('/','_')+'.o');checked(gui_flags+[str(file),'-o',str(target)],out,logs/(target.name+'.log'));return str(target)
     with ThreadPoolExecutor(max_workers=a.jobs)as pool:objects=list(pool.map(gui,files))
-    command=['clang','-dynamiclib','-mmacosx-version-min=14.0','-fobjc-arc','-o',str(plugins/'libmacosx_plugin.dylib')]+objects+['-L'+str(core),'-lvlccore','-F'+str(app/'Contents/Frameworks'),'-Wl,-install_name,@rpath/libmacosx_plugin.dylib']
+    command=['clang','-dynamiclib','-mmacosx-version-min=14.0','-Wl,-no_uuid','-fobjc-arc','-o',str(plugins/'libmacosx_plugin.dylib')]+objects+['-L'+str(core),'-lvlccore','-F'+str(app/'Contents/Frameworks'),'-Wl,-install_name,@rpath/libmacosx_plugin.dylib']
     for f in ['Cocoa','CoreServices','AVFoundation','CoreMedia','IOKit','AddressBook','WebKit','CoreAudio','SystemConfiguration','ScriptingBridge','QuartzCore','MediaPlayer','Sparkle']:command+=['-framework',f]
     checked(command,out,logs/'gui-link.log')
     receipt.update(state='built; not installed',plugins={p.name:sha(p)for p in sorted(plugins.glob('*.dylib'))},gui_sources=len(files))

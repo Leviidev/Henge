@@ -76,7 +76,9 @@ if [ -n "$(find "$STAGE" -iname 'AVPBooter*' -o -iname 'AVPSEPBooter*')" ]; then
   exit 1
 fi
 sign() { codesign --force --sign - --timestamp=none "$@"; }
-python3 "$IOS/../tools/compat/build_guest_payload.py" --output "$STAGE/guest-build"
+GUEST_BUILD_ARGS=(--output "$STAGE/guest-build")
+[ -n "${HENGE_VLC_ARCHIVES:-}" ] && GUEST_BUILD_ARGS+=(--vlc-archives "$HENGE_VLC_ARCHIVES")
+python3 "$IOS/../tools/compat/build_guest_payload.py" "${GUEST_BUILD_ARGS[@]}"
 cp "$STAGE/guest-build/henge-guest-payload.tar.gz" "$SAPP/"
 cp "$STAGE/guest-build/henge-guest-payload.json" "$SAPP/"
 if [ "$TROLLSTORE" = true ]; then

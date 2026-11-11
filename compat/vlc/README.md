@@ -2,6 +2,15 @@
 
 These patches repair ordinary H.264/HEVC + AAC export on the tested arm64 Sonoma route. They are separate from Henge's GPU renderer changes. This directory distributes source and patch provenance, not a VLC app, signed plugins, Apple frameworks, encoded fixtures or captured audio.
 
+Henge's release packager now invokes this source build automatically and embeds
+all nine plugins as one versioned, core-hash-bound unit in the guest payload,
+with VLC/FFmpeg/x265/libsamplerate licenses and the build receipt. Its iOS archive
+does not include the reference VLC app or frameworks. Compiled code stays inside
+the payload archive, isolated from iOS signing. This packaging integration does
+not yet install or update the guest's app, replace normal launch validation, or
+solve automatic OpenGL discovery. Download caching can be selected with
+`HENGE_VLC_ARCHIVES`; a compiled plugin build is always produced from source.
+
 The six VLC patches cover AAC priming/end padding through demux/packetizer/decoder, delayed encoder samples and planar final flush, cumulative resampling duration, final transcode/mux drain and MP4 edit timing, x265 timestamps and VUI forwarding, and the native macOS HEVC codec menu. A libsamplerate patch drains constant-rate EOF correctly, including the final 44.1 kHz rounding sample. x265's small CMake patch allows the pinned static build. `source-provenance.json` records exact before/after source hashes; `inputs.lock.json` pins archives. Do not cherry-pick only a gapless metadata consumer: all nine plugins form one compatibility unit and share the versioned metadata extension. Build-time ABI checks preserve the official core's structure sizes and pointer offsets.
 
 On an Apple Silicon Mac, use Xcode/command-line tools, Python3, CMake and make. With `--fetch`, `build.py` automatically obtains the pinned official thin arm64 VLC3.0.24 reference and the locked public source archives. The reference image hash and length, official Apple-anchored VideoLAN Developer ID signature, version, architecture and exact core hash are checked; it is mounted read-only at a private mountpoint, copied into the build cache and detached. A cached copy is reverified before reuse. `reference.lock.json` records the image and VideoLAN's published checksum URL. Supplying `--vlc-app` remains available for an explicit read-only reference. The build compiles FFmpeg8.1.2 (minimal static AAC/MOV), x2654.1 build215 (assembly disabled), libsamplerate0.1.9 and the nine plugins for macOS14.0+. All intermediate sources, exact commands and logs remain under the output directory. The reference app's libvlccore and Sparkle are linked read-only, never redistributed by this source package.

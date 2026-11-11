@@ -50,10 +50,10 @@ process-local activation requirement; bundling it does not solve global discover
 Packaging runs this build automatically and embeds `henge-guest-payload.tar.gz`
 plus a descriptor binding archive hash/size, manifest hash, payload identity and
 compiler recipe. Guest Mach-O files stay inside the archive so an iOS package
-signer cannot rewrite their signatures. The flat archive contains only the two
-ad-hoc-signed dylibs, Henge's GPL-2.0 license and the manifest. Timestamps and
-archive ownership are normalized, and content identity excludes build-directory
-paths and wall-clock time. The manifest includes source hashes, exact file hashes,
+signer cannot rewrite their signatures. The flat archive contains the two
+compatibility dylibs, all nine VLC plugins, their licenses/build receipt, Henge's
+GPL-2.0 license and the manifest. Timestamps and archive ownership are normalized.
+The manifest includes source hashes, exact file hashes,
 sizes, permissions, target architecture and minimum macOS version.
 
 The app signature authenticates the embedded descriptor and archive. The Python
@@ -63,3 +63,14 @@ input to these resources in the signed app, reject unexpected paths and validate
 everything before making any guest change. Payload installation, version
 activation, rollback and VLC delivery remain unfinished. Neither the helper nor
 the app currently extracts this archive onto the guest.
+
+The VLC plugins are one compatibility unit bound to the exact official 3.0.24
+core hash; partial units or other core versions are rejected. Packaging builds
+them automatically using the pinned reference/source download cache (override
+with `HENGE_VLC_ARCHIVES` or the builder's `--vlc-archives`). Compiled plugins are
+never reused from that cache. All plugin signatures, arm64 architecture and VLC
+3.0 entry points are checked before embedding. Source hashes are captured before
+the build and checked again afterward, so an edit during compilation cannot
+produce a falsely bound manifest. VLC itself and its reference frameworks are
+not bundled by this payload. Updating an installed app, preserving its data and
+signature policy, and checking normal launches remain separate guest gates.
