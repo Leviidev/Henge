@@ -160,3 +160,48 @@ int hg_guest_media_copy(const HGGuestDisk *disk, char **json, const char **error
         return 0;
     }
 }
+
+int hg_guest_media_copy_sonoma_data(const HGGuestDisk *disk, char **json, const char **error)
+{
+    if (json) *json = NULL;
+    if (!json || !error) return -1;
+    char *inventory = NULL;
+    if (hg_guest_media_copy(disk, &inventory, error)) return -1;
+    @autoreleasepool {
+        NSData *bytes = [NSData dataWithBytes:inventory length:strlen(inventory)];
+        free(inventory);
+        NSArray *rows = [NSJSONSerialization JSONObjectWithData:bytes options:0 error:NULL];
+        *error = "unsupported-volume-group";
+        if (![rows isKindOfClass:NSArray.class]) return -1;
+        NSDictionary *system = nil, *data = nil;
+        for (NSDictionary *row in rows) {
+            if (![row[@"content"] isEqual:@"41504653-0000-11AA-AA11-00306543ECAC"]) continue;
+            NSDictionary *metadata = row[@"apfs_metadata"];
+            NSNumber *role = metadata[@"RoleValue"];
+            // Exact roles only: unknown combinations never acquire authority.
+            if ([role isEqual:@1]) { if (system) return -1; system = row; }
+            if ([role isEqual:@64]) { if (data) return -1; data = row; }
+        }
+        if (!system || !data) return -1;
+        NSDictionary *s = system[@"apfs_metadata"], *d = data[@"apfs_metadata"];
+        NSString *group = s[@"VolGroupUUID"];
+        if (!group || [group isEqual:@"00000000-0000-0000-0000-000000000000"] ||
+            ![group isEqual:d[@"VolGroupUUID"]] || !s[@"UUID"] || !d[@"UUID"] ||
+            [s[@"UUID"] isEqual:d[@"UUID"]] ||
+            ![system[@"leaf"] isEqual:@YES] || ![data[@"leaf"] isEqual:@YES]) return -1;
+        for (NSDictionary *m in @[s, d]) {
+            // Missing lock/encryption evidence must not mean false.
+            if (![m[@"Encrypted"] isEqual:@NO] || ![m[@"Locked"] isEqual:@NO]) return -1;
+        }
+        if (!hg_guest_disk_unchanged(disk)) { *error = "image-identity-changed"; return -1; }
+        NSData *result = [NSJSONSerialization dataWithJSONObject:@{
+            @"schema": @1, @"system": system, @"data": data, @"volume_group_uuid": group,
+            @"volume_mounted": @NO, @"image_modified": @NO
+        } options:NSJSONWritingSortedKeys error:NULL];
+        if (!result) return -1;
+        *json = strndup(result.bytes, result.length);
+        if (!*json) return -1;
+        *error = NULL;
+        return 0;
+    }
+}

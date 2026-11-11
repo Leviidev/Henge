@@ -176,4 +176,13 @@ imply an unencrypted, unlocked or Data-role volume. Malformed supplied metadata
 rejects inventory. iPadOS exposed these fields on the read-only scratch attachment,
 which was ejected after observation. Six native fixture groups passed, including
 invalid metadata and absent-field controls; arm64 iPadOS compilation passed.
-Role/group-based volume selection and mounting remain unimplemented.
+`hg_guest_media_copy_sonoma_data` now selects one exact System-role (1) and one
+exact Data-role (64) APFS volume from a fresh owned-media inventory while the
+caller retains the image lease. It requires distinct volume UUIDs, one matching
+nonzero volume-group UUID, leaf media and explicit unlocked/unencrypted evidence.
+Missing fields, combined roles, duplicate candidates and ambiguous groups fail.
+It reports identity only: it neither proves the installed macOS version nor grants
+mount/write authority after the lease is released. Native fixtures cover valid
+selection and these refusal cases. The roleless iPad scratch image is deliberately
+unsupported. Real System/Data device qualification, attachment, mounting and
+payload delivery/activation remain unfinished.
