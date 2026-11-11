@@ -18,6 +18,7 @@ mkdir -p "$(dirname "$OUT")"
     echo "Missing on-device shader provider. See compat/ondevice-shaders/README.md and tools/compat/build_ondevice_provider.py." >&2
     exit 1
 }
+python3 "$IOS/../tools/compat/check_ondevice_provider.py"
 cd "$IOS"
 xcodegen generate >/dev/null
 DD="${HENGE_DERIVED_DATA:-$IOS/build/DerivedData}"

@@ -46,6 +46,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Leviidev/Husk
+          ref: afe83d45b31194c4cc9f7b3db7ec2c757db8346e
           path: Husk
 
       - name: Check out pinned on-device shader compiler source
@@ -66,7 +67,7 @@ jobs:
       - name: Install build tools
         run: |
           set -euxo pipefail
-          brew install xcodegen cmake meson ninja pkg-config
+          brew install xcodegen cmake meson ninja pkg-config python@3.11
           # Runner images ship rustup; add the iOS target if it's missing.
           rustup target add aarch64-apple-ios || {
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -106,6 +107,24 @@ jobs:
           python3 tools/compat/build_ondevice_provider.py \
             --llvm-source "$GITHUB_WORKSPACE/floor-llvm" \
             --output "$RUNNER_TEMP/henge-ondevice-provider" --jobs 4
+
+      - name: Install host test dependencies
+        working-directory: Henge
+        run: |
+          python3.11 -m venv .venv
+          .venv/bin/python -m pip install -r requirements-compat.txt
+          echo "$GITHUB_WORKSPACE/Henge/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Exercise the rebuilt native shader provider
+        working-directory: Henge
+        run: |
+          python3 tests/build_ondevice_fixtures.py --output "$RUNNER_TEMP/henge-provider-assets"
+          "$RUNNER_TEMP/henge-ondevice-provider/native_provider_tests" \
+            "$RUNNER_TEMP/henge-provider-assets" "$RUNNER_TEMP/henge-provider-results"
+
+      - name: Run portable compatibility controls
+        working-directory: Henge
+        run: make test-sonoma-compat test-ordered-replay test-pvg-ordinary-texture
 
       - name: Build the engine
         working-directory: Henge

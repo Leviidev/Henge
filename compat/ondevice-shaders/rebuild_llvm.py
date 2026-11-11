@@ -16,6 +16,6 @@ common=['-G','Ninja','-DCMAKE_BUILD_TYPE=Release','-DCMAKE_CXX_FLAGS=-DHENGE_AIR
 run(['cmake','-S','llvm-source/llvm','-B','llvm-native',*common,'-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0'])
 targets=['LLVMBitReader','LLVMBitWriter140','LLVMBitWriter']
 run(['cmake','--build','llvm-native','-j',str(a.jobs),'--target','llvm-config','llvm-tblgen',*targets])
-run(['cmake','-S','llvm-source/llvm','-B','llvm-ios',*common,'-DCMAKE_SYSTEM_NAME=iOS','-DCMAKE_OSX_SYSROOT=iphoneos','-DCMAKE_OSX_ARCHITECTURES=arm64','-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0','-DLLVM_TABLEGEN='+str(r/'llvm-native/bin/llvm-tblgen')])
+run(['cmake','-S','llvm-source/llvm','-B','llvm-ios',*common,'-DCMAKE_SYSTEM_NAME=iOS','-DCMAKE_MACOSX_BUNDLE=OFF','-DCMAKE_OSX_SYSROOT=iphoneos','-DCMAKE_OSX_ARCHITECTURES=arm64','-DCMAKE_OSX_DEPLOYMENT_TARGET=17.0','-DLLVM_TABLEGEN='+str(r/'llvm-native/bin/llvm-tblgen')])
 run(['cmake','--build','llvm-ios','-j',str(a.jobs),'--target',*targets])
 run(['python3','build_provider.py'])

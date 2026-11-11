@@ -289,6 +289,7 @@ test-sonoma-compat: $(COMPAT_TESTS) $(B)/test_virtio_discard
 	@for test in $^; do "$$test" || exit 1; done
 	python3 -m unittest discover -s ios/scripts -p 'test_*.py'
 	python3 -m unittest discover -s ios/scripts -p '*_test.py'
+	python3 -m unittest discover -s tools/compat -p 'test_*.py'
 .PHONY: test-sonoma-compat
 
 # Opt-in provenance helper: two successful authored compiles, no GPU dispatch.

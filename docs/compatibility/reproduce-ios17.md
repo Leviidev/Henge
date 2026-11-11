@@ -52,6 +52,9 @@ export HUSK=/absolute/path/to/pinned/Husk
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 ios/scripts/fetch_deps.sh
 make test-sonoma-compat
+python3 tools/compat/build_ondevice_provider.py \
+  --llvm-source /absolute/path/to/pinned/floor_llvm \
+  --output /absolute/path/to/new/provider-build --jobs 4
 make ios-lib
 tools/build_ios_restore.sh
 HENGE_IPA_OUTPUT="$PWD/build/artifacts/Henge.tipa" ios/scripts/package_ipa.sh --trollstore
@@ -137,22 +140,26 @@ Use your own Sonoma 14.6.1 installation. Henge's host engine supports
 restore availability are external requirements; an existing personal guest
 must be backed up, not silently replaced to make a test pass.
 
-The current first-use shader companion is explicitly opt-in:
+Ordinary executable shader conversion runs inside Henge on the iPad by default.
+The app build must include the [pinned on-device provider](../../compat/ondevice-shaders/README.md).
+A fresh install does not require SSH, a compiler Mac, prewarmed shaders, imported
+cache files, or a shader-compiler configuration. Cache entries are an optimization;
+new supported shaders are translated as needed on the iPad.
 
-```sh
-python3 ios/scripts/shader_companion.py --help
-python3 ios/scripts/sync_shader_conversions.py --help
-```
+The old `shader_companion.py` and `sync_shader_conversions.py` tools remain opt-in
+for diagnostics and explicitly configured legacy workflows. They are not setup
+steps for ordinary Sonoma rendering. Generated Apple libraries remain private
+local data and must not be distributed in a PR or release.
 
-Supply your SSH host and the exact application Documents path. The companion
-uses a recipe-qualified/hash-checked cache and a short-lived lease. Existing
-valid cache entries work offline; uncached conversions currently require the
-Mac companion. Generated Apple libraries remain private local data. The separate [dynamic-library package](../../compat/dynamic-libraries/README.md)
-has its own explicit compiler/configuration and offline-cache boundary; do not
-infer it from this static conversion companion. It is selected-process, stateless
-compute only. Its production injected package passed an independent guest cold
-transport gate and cached offline controls; those results remain separate from
-the precursor and native controls. Cold misses still need the Mac compiler.
+Two separate compatibility features still have additional runtime requirements:
+[OpenGL discovery](../../compat/opengl-discovery/README.md) currently uses a
+selected-process guest launcher, and the
+[dynamic-library adapter](../../compat/dynamic-libraries/README.md) still needs a
+Mac compiler for cold dependency closures. Ordinary on-device executable conversion
+does not establish on-device dynamic linking. The
+[distribution acceptance plan](distribution-plan.md) tracks removal of these
+requirements before claiming that the entire compatibility series works without
+additional setup.
 
 ## Installation, rollback and health checks
 

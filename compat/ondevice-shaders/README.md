@@ -49,6 +49,12 @@ archive once and `libc++`; do not separately compile the provider/CABI sources
 into the same app. No shader assets or private Apple compiler binaries are bundled.
 The caller header and profile contract copies must match `devices/` before build.
 
+The packaging step verifies the staged archive hash, exact provider-source hashes,
+recipe identity, header contracts and bundled LLVM license. A missing or stale
+`ios/deps/lib/libHGOnDeviceShader.build.json` requires a provider rebuild; copying
+an archive alone is insufficient. The build helper rejects source changes while
+compilation is in progress.
+
 The original explicit compiler/provider build sequence passed native controls;
 the clean pinned-source `rebuild_llvm.py` convenience path was syntax checked but
 not independently rerun in a second clean environment. Archive bytes and recipes
