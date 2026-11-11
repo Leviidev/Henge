@@ -2,6 +2,7 @@
 #define HG_GUEST_ATTACHMENT_H
 #include "HGGuestDisk.h"
 #include <limits.h>
+#include <sys/types.h>
 
 typedef struct {
     char path[PATH_MAX];

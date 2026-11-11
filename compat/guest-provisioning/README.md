@@ -314,3 +314,26 @@ not qualify writes to guest APFS mounts. No production helper command invokes
 staging yet. This API does not activate code or choose guest paths, and it does
 not grant disk-lease/mount authority. Writable mounting, guest path policy,
 activation/rollback, VLC integration and end-to-end acceptance remain unfinished.
+
+### Confirmed iPadOS mount policy failure
+
+After jailbreak access returned, the device panic report confirmed the physical
+mount attempt caused `unencrypted data volume is not allowed` in
+`apfs_vfsops.c:2261`, with `mount_apfs` as the panicked task on iPadOS 17.0. This
+is a kernel policy failure; longer timeouts or different retry behavior cannot
+make this mount profile valid. The earlier roleless scratch-volume mount did not
+exercise this Data-role restriction.
+
+The mount API now rejects iOS-family calls with
+`ios-volume-group-mount-unsupported` before querying media or invoking a mount
+tool. Fifteen native control groups pass, including a forced-iOS policy control.
+A separately signed native control on the iPad confirmed this refusal without
+accessing an image or invoking a mount. The old developer mount executable was
+removed. Root-helper production commands still do not invoke mounting.
+
+An alternate on-device provisioning path is required. A host copy-on-write clone
+of the authored fixture was created, but ordinary `diskutil` role clearing was
+refused with -69599. The `0` role argument is a no-op, not a role reset; a command
+returning success for `0` is not evidence of neutralization. No guest disk role
+was changed, and no clone workaround has been qualified. Do not remove the iOS
+guard based on host mocks or the old roleless scratch test.

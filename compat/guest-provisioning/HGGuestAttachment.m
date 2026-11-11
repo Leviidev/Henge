@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
 #include "HGGuestAttachment.h"
 #include "HGGuestMedia.h"
 #include <errno.h>
@@ -225,6 +226,9 @@ static int open_mount(NSDictionary *row, HGGuestReadonlyMount *mount)
 int hg_guest_attachment_mount_readonly(HGGuestAttachment *attachment, const char **error)
 {
     if (!attachment || !attachment->disk || !error) return -1;
+    // iPadOS 17 APFS panics when mounting an unencrypted Data-role volume,
+    // including grouped mounts. Keep this profile disabled before any tool call.
+    if (TARGET_OS_IPHONE) { *error = "ios-volume-group-mount-unsupported"; return -1; }
     if (attachment->system_mount.path[0] || attachment->data_mount.path[0]) {
         *error = "volumes-already-mounted"; return -1;
     }

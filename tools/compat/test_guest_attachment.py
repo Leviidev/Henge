@@ -180,6 +180,27 @@ int main(int argc,char **argv){@autoreleasepool{
         subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-Werror',
                         '-I', str(native), str(source), str(native / 'HGGuestDisk.c'),
                         '-framework', 'Foundation', '-lz', '-o', str(cls.control)], check=True)
+        policy_source = base / 'ios-policy.m'
+        policy_source.write_text(r'''
+#import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
+#undef TARGET_OS_IPHONE
+#define TARGET_OS_IPHONE 1
+#include "HGGuestAttachment.m"
+int main(void) {
+ HGGuestDisk disk={.fd=-1};HGGuestAttachment attachment={.disk=&disk};
+ const char *error=NULL;
+ int result=hg_guest_attachment_mount_readonly(&attachment,&error);
+ if(!result || !error || strcmp(error,"ios-volume-group-mount-unsupported") ||
+    attachment.system_mount.path[0] || attachment.data_mount.path[0])return 1;
+ return 0;
+}
+''')
+        cls.ios_policy_control = base / 'ios-policy'
+        subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(native), str(policy_source), str(native / 'HGGuestDisk.c'),
+                        str(native / 'HGGuestMedia.m'), '-framework', 'Foundation', '-lz',
+                        '-o', str(cls.ios_policy_control)], check=True)
 
     def run_control(self, scenario):
         with tempfile.NamedTemporaryFile() as image:
@@ -195,6 +216,9 @@ int main(int argc,char **argv){@autoreleasepool{
         self.assertTrue(r['closed'])
         self.assertFalse(r['attached'])
         self.assertEqual(r['ejects'], 1)
+
+    def test_ios_group_mount_is_blocked_before_media_or_mount_operations(self):
+        subprocess.run([str(self.ios_policy_control)], check=True, timeout=5)
 
     def test_readonly_mounts_close_before_ejection(self):
         r = self.run_control('mount-valid')
