@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <sys/ucontext.h>
 #include <stdio.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -290,9 +291,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         signals_installed = 1;
     }
     signal(SIGPIPE, SIG_IGN); /* a guest connection closing at the far end must not end the machine */
-    if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
+    if (hv_disk_open(&disk, c->disk, 0, 0) != 0)
+        return fail(err, errlen, errno == EWOULDBLOCK ? "The disk image is in use by another operation." : "Cannot open the disk image.");
     if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
-        return fail(err, errlen, "Cannot open the auxiliary storage.");
+        return fail(err, errlen, errno == EWOULDBLOCK ? "The auxiliary storage is in use by another operation." : "Cannot open the auxiliary storage.");
     size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)768 << 20;
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");

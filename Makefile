@@ -276,7 +276,12 @@ test-jit-advice: $(B)/test_jit_advice
 .PHONY: test-jit-advice
 
 # Portable compatibility controls: authored inputs, no guest cache or Apple shader assets.
-COMPAT_TESTS = $(B)/test_panic_candidates $(B)/test_pvg_texture_record $(B)/test_pvg_surface_pages $(B)/test_pvg_surface_copyback_plan
+COMPAT_TESTS = $(B)/test_panic_candidates $(B)/test_pvg_texture_record $(B)/test_pvg_surface_pages $(B)/test_pvg_surface_copyback_plan $(B)/test_disk_ownership
+$(B)/test_disk_ownership: tests/test_disk_ownership.c host/disk.c host/disk.h core/machine.h | $(B)
+	$(CC) $(CFLAGS) tests/test_disk_ownership.c host/disk.c -o $@
+test-disk-ownership: $(B)/test_disk_ownership
+	$<
+.PHONY: test-disk-ownership
 $(B)/test_panic_candidates: tests/test_panic_candidates.c devices/panic_candidates.h | $(B)
 	$(CC) $(CFLAGS) $< -o $@
 $(B)/test_pvg_texture_record: tests/test_pvg_texture_record.c devices/pvg_texture_record.h | $(B)

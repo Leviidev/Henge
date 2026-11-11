@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -12,12 +13,23 @@
 
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     d->wfd = -1;
-    d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
+    d->fd = open(path, (readonly ? O_RDONLY : O_RDWR) | O_CLOEXEC);
     if (d->fd < 0) return -1;
+    /* The VM owns its writable image until close, including while suspended.
+       Offline guest provisioning takes the same inode lock before attachment.
+       Fail immediately rather than racing another VM, writer or provisioner. */
+    if (flock(d->fd, (readonly ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0) {
+        int saved = errno;
+        close(d->fd); d->fd = -1; errno = saved;
+        return -1;
+    }
     struct stat st;
-    if (fstat(d->fd, &st) != 0 || (uint64_t)st.st_size < offset) {
+    int stat_result = fstat(d->fd, &st);
+    if (stat_result != 0 || (uint64_t)st.st_size < offset) {
+        int saved = stat_result != 0 ? errno : EINVAL;
         close(d->fd);
         d->fd = -1;
+        errno = saved;
         return -1;
     }
     d->offset = offset;
@@ -29,8 +41,11 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
        work was no faster. The phone's installer turns it on for the restore, which writes ~15 GB at once. */
     const char *wc = getenv("HV_WRITE_CACHE");
     if (!readonly && wc && !atoi(wc)) {
-        d->wfd = open(path, O_RDWR);
-        if (d->wfd >= 0 && fcntl(d->wfd, F_NOCACHE, 1) == -1) {
+        d->wfd = open(path, O_RDWR | O_CLOEXEC);
+        struct stat alternate;
+        if (d->wfd >= 0 && (fstat(d->wfd, &alternate) != 0 ||
+            alternate.st_dev != st.st_dev || alternate.st_ino != st.st_ino ||
+            fcntl(d->wfd, F_NOCACHE, 1) == -1)) {
             close(d->wfd);
             d->wfd = -1;
         }
@@ -39,8 +54,8 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
 }
 
 void hv_disk_close(HvDisk *d) {
-    if (d->fd >= 0) close(d->fd);
     if (d->wfd >= 0) close(d->wfd);
+    if (d->fd >= 0) close(d->fd); /* release ownership after the alternate writer */
     d->fd = d->wfd = -1;
 }
 

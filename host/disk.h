@@ -13,6 +13,9 @@ typedef struct HvDisk {
     int readonly;
 } HvDisk;
 
+/* Nonblocking inode ownership: writable opens take LOCK_EX; readonly opens
+   take LOCK_SH. The lock lasts through pause/snapshot until hv_disk_close.
+   Offline provisioners must acquire LOCK_EX before attaching an image. */
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly);
 void hv_disk_close(HvDisk *d);
 /* Return 0, or -1 on an I/O error or an access past the end. */

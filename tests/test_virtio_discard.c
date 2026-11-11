@@ -1,6 +1,6 @@
 /* Offline integration test: actual virtio queue parser, block worker and file
  * backend. Only physical RAM/PCI/CPU-wake plumbing is stubbed; no guest/image.
- * Worker lifetime is process lifetime, matching the device's current API. */
+ * Workers stop before releasing or reopening their image ownership. */
 #include "virtio_blk.h"
 #include <assert.h>
 #include <fcntl.h>
@@ -212,11 +212,13 @@ int main(void) {
     check(!(plain->vio.features&F_DISCARD)&&!cfg32(plain,36),"plain device unchanged");
     check(!(root->vio.features&F_DISCARD)&&!cfg32(root,36),"root device unchanged");
     setup(root);discard_case(root,fd,"root discard unsupported",r,1,2);
+    hv_virtio_blk_stop(b);hv_virtio_blk_stop(plain);hv_virtio_blk_stop(root);
+    hv_disk_close(&disk);
     HvDisk ro;check(!hv_disk_open(&ro,path,PREFIX,1),"read-only backend");
     HvVirtioBlk *readonly=hv_virtio_blk_create(&machine,NULL,&ro,HV_VBLK_AUX);
     check(!(readonly->vio.features&F_DISCARD)&&!cfg32(readonly,36),"read-only aux does not advertise discard");
     setup(readonly);discard_case(readonly,fd,"read-only discard rejects without writes",r,1,1);
-    hv_disk_close(&ro);hv_disk_close(&disk);close(fd);unlink(path);
+    hv_virtio_blk_stop(readonly);hv_disk_close(&ro);close(fd);unlink(path);
     printf("PASS %d checks: real virtqueue/worker/file discard, malformed requests, limits, errors, ordering, prefix preservation\n",checks);
     return 0;
 }

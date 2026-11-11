@@ -5,6 +5,7 @@
 #include "vm.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -98,6 +99,16 @@ int main(void) {
     int initial_fds = fds();
     unsigned initial_threads = threads();
     unsigned initial_dead_ports = dead_ports();
+    for (int which = 0; which < 2; ++which) {
+        int owner = open(which ? aux : disk, O_RDWR | O_CLOEXEC);
+        if (owner < 0 || flock(owner, LOCK_EX | LOCK_NB)) return 1;
+        check("offline owner prevents boot", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
+        check("busy image error is explicit", strstr(error, "in use by another operation") != NULL);
+        check("busy image allows retry", henge_vm_state() == 0 && henge_vm_can_start());
+        close(owner);
+        check("busy-image failure releases partially opened files", fds() == initial_fds);
+        check("busy-image failure leaves no workers", threads() == initial_threads);
+    }
     /* Missing ROM fails after disks, RAM and device workers were created. */
     for (int i = 0; i < 3; i++) {
         check("failed boot reports an error", henge_vm_boot(rom, disk, aux, 1, 0, 64, 4, error, sizeof error) != 0);
@@ -205,6 +216,6 @@ int main(void) {
     pthread_join(reader, NULL);
     hv_jit_region_close(&jit);
     unlink(rom); unlink(disk); unlink(aux); rmdir(dir);
-    printf("VM lifecycle: 12 power cycles, 3 failed boots and a suspend/resume, %d failures\n", failures);
+    printf("VM lifecycle: 12 power cycles, 3 missing-ROM and 2 busy-image failures, and a suspend/resume, %d failures\n", failures);
     return failures != 0;
 }

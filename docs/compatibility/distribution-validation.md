@@ -179,3 +179,59 @@ upload deadline and admission after the timeout. The direct dynamic controls
 
 Automatic guest delivery/activation and final-binary iPad/fresh-guest acceptance
 are still required. Their absence cannot be replaced by these native controls.
+
+
+## Offline guest provisioning foundation
+
+An on-iPad control established a filesystem route that does not type commands
+into the guest. It used only an authored empty 96 MiB GPT/APFS image, created by
+the build Mac and copied to the test iPad. No running guest image was attached.
+The initial mount under the temporary folder failed. Mounting below
+`/private/var/mnt` succeeded, consistent with the
+[Dopamine maintainer's mountpoint restriction](https://github.com/opa334/Dopamine/issues/595).
+A writable attachment additionally requires `hdik -drivekey write-protected=false`;
+without it, the media are explicitly read-only even for a writable raw image.
+
+The tracked developer control `tools/compat/audit_guest_disk_mount.py` then passed
+on the iPad. It holds a nonblocking exclusive inode lock for the whole operation,
+checks the actual IOMedia image-path ancestry, writable state and physical size,
+mounts with `noexec,nosuid`, writes and synchronizes an authored marker, unmounts,
+remounts read-only and verifies the marker. It finally unmounts and ejects the
+owned attachment. The report observed both marker roundtrip and complete cleanup.
+The tool requires an explicitly named 96 MiB scratch fixture and never reformats
+an image. Python/SSH were developer instrumentation, not a completed application
+bootstrap or a requirement to impose on users.
+
+`host/disk.c` now holds the matching inode ownership lock while a VM has an image
+open, including during pause/snapshot. Writable opens are exclusive; read-only
+opens share ownership but still exclude a provisioner. Lock conflicts fail
+immediately with a specific VM error. Both disk descriptors close on exec, and
+an alternate uncached writer must match the locked inode and close before the
+ownership descriptor. This prevents helper execution from retaining an old disk
+lease after shutdown.
+
+All 18 native ownership controls passed, covering hard-link aliases, competing
+VM/provisioning opens, shared readers, inherited descriptors, exec cleanup,
+invalid-offset cleanup, uncached writes and release. The iOS engine build and
+native VM phase/pause/lifecycle/snapshot controls also passed. This does not
+qualify the final app's device path or a mount of the actual Sonoma Data volume.
+
+Remaining production requirements include a bundled native root helper and
+source-built guest payload, normal-app activation, identification of the owned
+Sonoma Data volume, backup-preserving atomic version changes and a device gate.
+[TrollStore documents the root-helper/persona mechanism](https://github.com/opa334/TrollStore#root-helpers),
+but that mechanism has not yet been qualified in this Henge build. Provisioning
+must first inspect read-only, avoid mounted/live guest state, and never change a
+suspended guest's disk beneath its saved RAM. An already-current payload must
+leave disk identity unchanged so ordinary snapshot resume stays valid. No global
+DYLD injection, app re-signing or security-policy change is established by the
+scratch mount result.
+
+
+The full native bridge also rejected two deliberately busy-image boots (root disk
+and auxiliary storage), reported the ownership conflict and returned to a
+retryable idle state without descriptor or worker leaks. Its remaining 12-cycle,
+missing-ROM and snapshot controls passed. The DISCARD control was updated to stop
+its writable workers and release ownership before reopening the same fixture
+read-only; all 1647 checks passed. Compatibility Python checks remained at
+65 tests/13 skips, 82 tests/39 skips and 16 packaging/tool tests.
