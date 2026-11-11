@@ -74,9 +74,10 @@ class GuestAPFSTests(unittest.TestCase):
             struct.pack_into('<I', b, 104, 2)
             struct.pack_into('<Q', b, 112, 1)
             struct.pack_into('<Q', b, 160, 3)
-            struct.pack_into('<IQQ', b, 180, 2, 101, 102)
+            struct.pack_into('<IQQ', b, 180, 2, 101 if index else 0, 102 if index else 0)
             self.blocks[index] = b
         omap = object_block(3, 2, 0x4000000b)
+        struct.pack_into('<I', omap, 40, 0x40000002)
         struct.pack_into('<Q', omap, 48, 4)
         self.blocks[3] = omap
         self.blocks[4] = node(True, True, [(oid, struct.pack('<IIQ', 0, 4096, address))
@@ -105,8 +106,9 @@ class GuestAPFSTests(unittest.TestCase):
                 stream.seek(40 * 512 + index * 4096)
                 stream.write(block)
 
-    def inspect(self, valid=False):
-        r = subprocess.run([str(self.control), str(self.path)], capture_output=True, timeout=5)
+    def inspect(self, valid=False, catalog=False):
+        command = [str(self.control), str(self.path)] + (['--catalog'] if catalog else [])
+        r = subprocess.run(command, capture_output=True, timeout=5)
         self.assertEqual(r.returncode, 0 if valid else 1, r.stderr)
         report = json.loads(r.stdout)
         self.assertEqual(report['passed'], valid)
@@ -141,6 +143,63 @@ class GuestAPFSTests(unittest.TestCase):
         struct.pack_into('<Q', self.blocks[1], 160, 9)
         self.emit()
         self.assertEqual(self.inspect()['error'], 'ambiguous-apfs-checkpoint')
+
+    def test_catalog_includes_empty_old_checkpoint_and_deduplicates_exact_copies(self):
+        self.emit()
+        r = self.inspect(True, catalog=True)
+        self.assertEqual(r['checkpoint_count'], 2)
+        self.assertEqual(len(r['volumes']), 2)
+        self.blocks[0] = self.blocks[1][:]
+        self.emit()
+        self.assertEqual(self.inspect(True, catalog=True)['checkpoint_count'], 1)
+
+    def test_catalog_deduplicates_shared_records_across_transactions(self):
+        struct.pack_into('<Q', self.blocks[0], 16, 2)
+        struct.pack_into('<QQ', self.blocks[0], 184, 101, 102)
+        struct.pack_into('<Q', self.blocks[1], 16, 3)
+        self.emit()
+        r = self.inspect(True, catalog=True)
+        self.assertEqual(r['checkpoint_count'], 2)
+        self.assertEqual(len(r['volumes']), 2)
+        for volume in r['volumes']:
+            self.assertEqual(volume['first_checkpoint_xid'], 2)
+            self.assertEqual(volume['last_checkpoint_xid'], 3)
+
+    def test_catalog_does_not_skip_unresolvable_old_populated_checkpoint(self):
+        struct.pack_into('<QQ', self.blocks[0], 184, 101, 102)
+        self.emit()
+        self.inspect(True)
+        self.inspect(catalog=True)
+
+    def test_catalog_rejects_conflicting_historical_transaction_even_when_latest_is_valid(self):
+        struct.pack_into('<Q', self.blocks[0], 16, 2)
+        struct.pack_into('<Q', self.blocks[1], 16, 3)
+        self.blocks[2] = self.blocks[1][:]
+        struct.pack_into('<Q', self.blocks[2], 16, 2)
+        self.emit()
+        self.inspect(True)
+        self.assertEqual(self.inspect(catalog=True)['error'], 'ambiguous-apfs-checkpoint')
+
+    def test_catalog_retains_historical_roles_in_different_physical_records(self):
+        struct.pack_into('<Q', self.blocks[0], 16, 2)
+        struct.pack_into('<QQ', self.blocks[0], 184, 101, 102)
+        struct.pack_into('<Q', self.blocks[1], 16, 3)
+        struct.pack_into('<Q', self.blocks[1], 160, 8)
+        struct.pack_into('<H', self.blocks[6], 964, 0)
+        self.blocks[8] = object_block(8, 3, 0x4000000b)
+        struct.pack_into('<I', self.blocks[8], 40, 0x40000002)
+        struct.pack_into('<Q', self.blocks[8], 48, 9)
+        self.blocks[9] = node(True, True, [(101, struct.pack('<IIQ', 0, 4096, 5)),
+                                          (102, struct.pack('<IIQ', 0, 4096, 10))])
+        struct.pack_into('<QQ', self.blocks[9], 8, 9, 3)
+        struct.pack_into('<Q', self.blocks[9], 88, 3)
+        self.blocks[10] = self.blocks[6][:]
+        struct.pack_into('<Q', self.blocks[10], 16, 3)
+        struct.pack_into('<H', self.blocks[10], 964, 64)
+        self.emit()
+        r = self.inspect(True, catalog=True)
+        self.assertEqual(r['checkpoint_count'], 2)
+        self.assertEqual(sorted(v['role'] for v in r['volumes']), [0, 1, 64])
 
     def test_geometry_and_feature_profile_refusal(self):
         for index, offset, fmt, value in ((0, 36, '<I', 8193), (0, 64, '<Q', 3),

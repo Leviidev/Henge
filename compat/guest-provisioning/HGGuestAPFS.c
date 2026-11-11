@@ -21,11 +21,13 @@ static int checksum(const unsigned char *p, uint32_t size) {
 }
 typedef struct {
     const HGGuestDisk *disk;
-    uint64_t base, bytes, count, xid;
+    uint64_t base, bytes, count, xid, budget;
     uint32_t size;
     const char **error;
 } Reader;
 static int bytes(Reader *r, uint64_t offset, unsigned char *p, uint32_t n) {
+    if (n>r->budget) { *r->error="apfs-read-budget";return -1; }
+    r->budget-=n;
     if (offset>r->bytes || n>r->bytes-offset) { *r->error="apfs-block-range"; return -1; }
     size_t done=0;
     while (done<n) {
@@ -56,7 +58,7 @@ static int omap_lookup(Reader *r, uint64_t tree, uint64_t oid, uint64_t *physica
         uint16_t type=(uint16_t)u32(p+24), flags=u16(p+32), level=u16(p+34);
         uint32_t count=u32(p+36), off=u16(p+40), length=u16(p+42);
         uint32_t keybase=56+off+length, end=r->size-((flags&1)?40:0);
-        if (type!=(depth?3:2) || u32(p+28)!=11 || u64(p+16)>r->xid ||
+        if (type!=(depth?3:2) || u64(p+8)!=tree || u32(p+28)!=11 || u64(p+16)>r->xid ||
             (flags&~7) || !(flags&4) || !!(flags&1)!=!depth || !!(flags&2)!=!level ||
             level>=previous || !count || count>r->size/20 || count*4>length ||
             keybase>end || off>r->size-56) goto done;
@@ -94,6 +96,43 @@ done:
     return result;
 }
 
+static int checkpoint_volumes(Reader *r, const unsigned char *nx, unsigned char *p,
+                              HGGuestAPFS *apfs) {
+    memset(apfs,0,sizeof(*apfs));
+    *r->error="unsupported-apfs-checkpoint";
+    r->xid=u64(nx+16);
+    uint32_t slots=u32(nx+180);
+    if (!slots || slots>100 || 184+slots*8>r->size || !r->xid) goto invalid;
+    int populated=0;
+    for (uint32_t i=0;i<slots;i++) if (u64(nx+184+i*8)) populated=1;
+    if (!populated) goto complete;
+    uint64_t omap=u64(nx+160);
+    if (block(r,omap,p)) goto invalid;
+    if (u32(p+24)!=0x4000000b || u64(p+8)!=omap || u64(p+16)>r->xid ||
+        u32(p+40)!=0x40000002) goto invalid;
+    uint64_t tree=u64(p+48);
+    for (uint32_t i=0;i<slots;i++) {
+        uint64_t oid=u64(nx+184+i*8), address=0,xid=0;
+        if (!oid) continue;
+        for (uint32_t j=0;j<apfs->volume_count;j++) if (apfs->volumes[j].oid==oid) goto invalid;
+        if (omap_lookup(r,tree,oid,&address,&xid) || block(r,address,p)) goto invalid;
+        if (u32(p+24)!=13 || memcmp(p+32,"APSB",4) ||
+            u64(p+8)!=oid || u64(p+16)!=xid || !nonzero(p+240,16)) goto invalid;
+        HGGuestAPFSVolume *v=&apfs->volumes[apfs->volume_count++];
+        v->oid=oid;v->xid=xid;v->physical_block=address;v->role=u16(p+964);v->flags=u64(p+264);
+        memcpy(v->uuid,p+240,16);memcpy(v->group_uuid,p+1008,16);
+        for (uint32_t j=0;j+1<apfs->volume_count;j++)
+            if (!memcmp(apfs->volumes[j].uuid,v->uuid,16)) goto invalid;
+    }
+complete:
+    if (!hg_guest_disk_unchanged(r->disk)) goto invalid;
+    apfs->block_size=r->size;apfs->block_count=r->count;apfs->checkpoint_xid=r->xid;
+    *r->error=NULL;return 0;
+invalid:
+    memset(apfs,0,sizeof(*apfs));
+    return -1;
+}
+
 int hg_guest_apfs_inspect(const HGGuestDisk *disk, HGGuestAPFS *apfs, const char **error) {
     if (!disk || !apfs || !error) return -1;
     memset(apfs,0,sizeof(*apfs)); *error="unsupported-apfs-container";
@@ -101,7 +140,8 @@ int hg_guest_apfs_inspect(const HGGuestDisk *disk, HGGuestAPFS *apfs, const char
         disk->first_apfs_lba>UINT64_MAX/512 || disk->last_apfs_lba==UINT64_MAX ||
         disk->last_apfs_lba+1>UINT64_MAX/512) return -1;
     Reader r={.disk=disk,.base=disk->first_apfs_lba*512,
-              .bytes=(disk->last_apfs_lba-disk->first_apfs_lba+1)*512,.error=error};
+              .bytes=(disk->last_apfs_lba-disk->first_apfs_lba+1)*512,.error=error,
+              .budget=256u*1024u*1024u};
     if (r.base>(uint64_t)disk->identity.st_size || r.bytes>(uint64_t)disk->identity.st_size-r.base) return -1;
     unsigned char initial[4096];
     if (bytes(&r,0,initial,sizeof(initial))) return -1;
@@ -129,30 +169,86 @@ int hg_guest_apfs_inspect(const HGGuestDisk *disk, HGGuestAPFS *apfs, const char
             *error="ambiguous-apfs-checkpoint";goto done;
         }
     }
-    r.xid=u64(nx+16);
-    uint32_t slots=u32(nx+180);
-    if (!slots || slots>100 || 184+slots*8>r.size || !r.xid) goto done;
-    if (block(&r,u64(nx+160),p)) goto done;
-    if ((u32(p+24)&0xffff)!=11 || u64(p+16)>r.xid) goto done;
-    uint64_t tree=u64(p+48);
-    for (uint32_t i=0;i<slots;i++) {
-        uint64_t oid=u64(nx+184+i*8), address=0,xid=0;
-        if (!oid) continue;
-        for (uint32_t j=0;j<apfs->volume_count;j++) if (apfs->volumes[j].oid==oid) goto done;
-        if (omap_lookup(&r,tree,oid,&address,&xid) || block(&r,address,p)) goto done;
-        if ((u32(p+24)&0xffff)!=13 || memcmp(p+32,"APSB",4) ||
-            u64(p+8)!=oid || u64(p+16)!=xid || !nonzero(p+240,16)) goto done;
-        HGGuestAPFSVolume *v=&apfs->volumes[apfs->volume_count++];
-        v->oid=oid;v->xid=xid;v->physical_block=address;v->role=u16(p+964);v->flags=u64(p+264);
-        memcpy(v->uuid,p+240,16);memcpy(v->group_uuid,p+1008,16);
-        for (uint32_t j=0;j+1<apfs->volume_count;j++)
-            if (!memcmp(apfs->volumes[j].uuid,v->uuid,16)) goto done;
-    }
-    if (!apfs->volume_count || !hg_guest_disk_unchanged(disk)) goto done;
-    apfs->block_size=r.size;apfs->block_count=r.count;apfs->checkpoint_xid=r.xid;
-    *error=NULL;result=0;
+    result=checkpoint_volumes(&r,nx,p,apfs);
+    if (!result && !apfs->volume_count) { *error="apfs-volume-inventory-empty";result=-1; }
 done:
     free(nx);free(p);
     if (result) memset(apfs,0,sizeof(*apfs));
     return result;
+}
+
+typedef struct { uint64_t xid; unsigned char identities[24+100*8]; } SeenCheckpoint;
+static int catalog_checkpoint(Reader *r,const unsigned char *nx,unsigned char *work,
+                              SeenCheckpoint *seen,HGGuestAPFSCatalog *catalog) {
+    uint64_t xid=u64(nx+16);
+    for (uint32_t i=0;i<catalog->checkpoint_count;i++) if (seen[i].xid==xid) {
+        if (memcmp(seen[i].identities,nx+160,sizeof(seen[i].identities))) {
+            *r->error="ambiguous-apfs-checkpoint";return -1;
+        }
+        return 0;
+    }
+    if (catalog->checkpoint_count>=4097) { *r->error="apfs-checkpoint-limit";return -1; }
+    HGGuestAPFS apfs;
+    if (checkpoint_volumes(r,nx,work,&apfs)) return -1;
+    SeenCheckpoint *entry=&seen[catalog->checkpoint_count++];
+    entry->xid=xid;memcpy(entry->identities,nx+160,sizeof(entry->identities));
+    for (uint32_t i=0;i<apfs.volume_count;i++) {
+        HGGuestAPFSVolume *v=&apfs.volumes[i];
+        HGGuestAPFSRecord *record=NULL;
+        for (uint32_t j=0;j<catalog->record_count;j++)
+            if (catalog->records[j].volume.physical_block==v->physical_block) {
+                record=&catalog->records[j];break;
+            }
+        if (record) {
+            HGGuestAPFSVolume *old=&record->volume;
+            if (old->oid!=v->oid || old->xid!=v->xid || old->role!=v->role ||
+                old->flags!=v->flags || memcmp(old->uuid,v->uuid,16) ||
+                memcmp(old->group_uuid,v->group_uuid,16)) {
+                *r->error="ambiguous-apfs-physical-record";return -1;
+            }
+            if (xid<record->first_checkpoint_xid) record->first_checkpoint_xid=xid;
+            if (xid>record->last_checkpoint_xid) record->last_checkpoint_xid=xid;
+        } else {
+            if (catalog->record_count>=HG_APFS_MAX_RECORDS) { *r->error="apfs-record-limit";return -1; }
+            record=&catalog->records[catalog->record_count++];
+            record->volume=*v;record->first_checkpoint_xid=record->last_checkpoint_xid=xid;
+        }
+    }
+    return 0;
+}
+
+int hg_guest_apfs_copy_catalog(const HGGuestDisk *disk,HGGuestAPFSCatalog **output,
+                               const char **error) {
+    if (output) *output=NULL;
+    if (!disk || !output || !error) return -1;
+    HGGuestAPFS latest;
+    if (hg_guest_apfs_inspect(disk,&latest,error)) return -1;
+    Reader r={.disk=disk,.base=disk->first_apfs_lba*512,
+              .bytes=(disk->last_apfs_lba-disk->first_apfs_lba+1)*512,.error=error,
+              .size=latest.block_size,.count=latest.block_count,.budget=256u*1024u*1024u};
+    HGGuestAPFSCatalog *catalog=calloc(1,sizeof(*catalog));
+    SeenCheckpoint *seen=calloc(4097,sizeof(*seen));
+    unsigned char *boot=malloc(r.size),*nx=malloc(r.size),*work=malloc(r.size);
+    int result=-1;
+    if (!catalog || !seen || !boot || !nx || !work) { *error="apfs-allocation";goto done; }
+    catalog->block_size=r.size;catalog->latest_checkpoint_xid=latest.checkpoint_xid;
+    if (block(&r,0,boot) || catalog_checkpoint(&r,boot,work,seen,catalog)) goto done;
+    uint32_t descriptors=u32(boot+104);uint64_t base=u64(boot+112);
+    if (!descriptors || descriptors>4096 || base>=r.count || descriptors>r.count-base) {
+        *error="unsupported-apfs-container";goto done;
+    }
+    for (uint32_t i=0;i<descriptors;i++) {
+        if (bytes(&r,(base+i)*r.size,nx,r.size)) goto done;
+        if (memcmp(nx+32,"NXSB",4)) continue;
+        if (!checksum(nx,r.size)) { *error="apfs-object-checksum";goto done; }
+        if ((u32(nx+24)&0xffff)!=1 || u32(nx+36)!=r.size || u64(nx+40)!=r.count ||
+            memcmp(nx+72,boot+72,16) || u64(nx+64)!=2) {
+            *error="unsupported-apfs-container";goto done;
+        }
+        if (catalog_checkpoint(&r,nx,work,seen,catalog)) goto done;
+    }
+    if (!hg_guest_disk_unchanged(disk)) { *error="image-identity-changed";goto done; }
+    *output=catalog;catalog=NULL;*error=NULL;result=0;
+done:
+    free(catalog);free(seen);free(boot);free(nx);free(work);return result;
 }

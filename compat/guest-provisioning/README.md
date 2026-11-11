@@ -361,14 +361,33 @@ bad offsets/mappings and changed image identity. The current format profile requ
 the ordinary version-2 container layout, bounded descriptor arrays, fixed-size
 object-map records and at most 100 volumes; unsupported formats fail closed.
 
-Seven synthetic native groups pass with address/undefined-behavior sanitizers,
+The initial seven native groups passed with address/undefined-behavior sanitizers,
 including interior-node traversal, corruption at every metadata layer and bounds
 refusal. On the real authored fixtures, it independently resolved the original
 roles and the newer Data superblock after payload writes/restoration. arm64 iPadOS
-compilation passes. The inspector reports only the latest checkpoint and does
+compilation passes. `hg_guest_apfs_inspect` reports only the latest checkpoint and does
 not authorize a role rewrite, checkpoint rollback, clone publication or mounting.
-An implementation that handles all recoverable checkpoints, interrupted writes,
+A complete mutation/rollback policy for recoverable checkpoints, interrupted writes,
 clone ownership/publication and device acceptance is still required. The iOS
 mount guard remains in place.
 
 Layout reference: [Apple File System Reference](https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf).
+
+`hg_guest_apfs_copy_catalog` additionally resolves every distinct NX checkpoint
+present in the bounded descriptor area. It preserves historical role/UUID/group
+records, deduplicates physical superblocks and records the checkpoint range that
+references each one. Exact duplicate checkpoints are counted once. Initial empty
+container checkpoints contribute no volume references; an unresolvable populated
+checkpoint fails the entire catalog, even if the latest checkpoint is valid.
+No older candidate is silently ignored. Reads are limited to a fixed byte budget;
+checkpoint and record counts are bounded. The returned catalog is caller-freed.
+
+Twelve native sanitizer-backed groups now pass, including empty/duplicate/shared
+checkpoints, historical role changes, conflicts in older transactions and refusal
+of unresolved older references. The authored post-install fixture resolves 16
+checkpoints and 14 distinct volume records. A separate host-only clone experiment
+neutralized all System/Data records identified by the original seven-checkpoint
+catalog, without scanning file contents; the resulting copy passed the host APFS
+checker. This catalog still does not grant rewrite or mount authority. Production
+clone ownership, mutation journaling, restoration after filesystem writes,
+publication/rollback and device acceptance remain unfinished; the iOS guard stays.
