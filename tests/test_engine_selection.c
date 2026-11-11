@@ -51,6 +51,10 @@ int main(int argc, char **argv) {
     assert(henge_vm_can_start() && henge_vm_generation() == 0);
     assert(henge_vm_balloon(-1) == -1);
     assert(henge_vm_dns(0) == 0 && henge_vm_dns(1) == 0 && henge_vm_dns(2) == 0);
+    assert(henge_vm_continue() == -1);
+    assert(henge_vm_pause(error, sizeof error) == -1);
+    assert(henge_vm_save("/nonexistent/henge.hsnap", "test", error, sizeof error) == -1);
+    assert(henge_vm_saved_ok("/nonexistent/henge.hsnap", "test", NULL, NULL) == -1);
     assert(henge_vm_exit_outcome() == HENGE_VM_OUTCOME_ERROR);
     henge_vm_free_display(NULL);
     assert(henge_vm_guest_el0() == 0 && henge_vm_cpus_on() == 0);
@@ -67,12 +71,16 @@ int main(int argc, char **argv) {
     henge_vm_set_rosetta(!rosetta);
     assert(henge_vm_boot(NULL, NULL, NULL, 0, 0, 0, 1, error, sizeof error) == -1);
     assert(strstr(error, "Quit Henge and reopen"));
+    assert(henge_vm_resume(NULL, NULL, NULL, 0, 0, 0, 1, NULL, NULL, error, sizeof error) == -1);
+    assert(strstr(error, "Quit Henge and reopen"));
     assert(henge_vm_install(NULL, NULL, NULL, 0, NULL, NULL, 0, 1, error, sizeof error) == -1);
     assert(strstr(error, "Quit Henge and reopen"));
     assert(loaded(rosetta) == 1 && loaded(!rosetta) == 0);
     /* Reverting the toggle keeps the current engine usable; JIT is checked next. */
     henge_vm_set_rosetta(rosetta);
     assert(henge_vm_boot(NULL, NULL, NULL, 0, 0, 0, 1, error, sizeof error) == -1);
+    assert(strstr(error, "JIT"));
+    assert(henge_vm_resume(NULL, NULL, NULL, 0, 0, 0, 1, NULL, NULL, error, sizeof error) == -1);
     assert(strstr(error, "JIT"));
     assert(henge_vm_install(NULL, NULL, NULL, 0, NULL, NULL, 0, 1, error, sizeof error) == -1);
     assert(strstr(error, "JIT"));

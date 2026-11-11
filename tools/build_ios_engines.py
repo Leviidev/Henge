@@ -94,7 +94,7 @@ def main():
         bundle = frameworks / f'{name}.framework'
         bundle.mkdir(exist_ok=True)
         binary = bundle / name
-        libs = ['-l' + lib for lib in ['slirp', 'glib-2.0', 'intl', 'pcre2-8', 'iconv', 'resolv', 'z']]
+        libs = ['-l' + lib for lib in ['slirp', 'glib-2.0', 'intl', 'pcre2-8', 'iconv', 'resolv', 'z', 'compression']]
         frameworks_flags = [item for framework in ['Foundation', 'CoreFoundation', 'Security', 'CFNetwork',
                             'SystemConfiguration', 'Metal', 'IOSurface', 'AudioToolbox', 'AVFAudio', 'QuartzCore', 'CoreGraphics']
                             for item in ['-framework', framework]]

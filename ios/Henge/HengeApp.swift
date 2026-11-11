@@ -46,6 +46,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var running: VirtualMac?
     @State private var tab = Tab.macs
+    @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
 
     var body: some View {
         ZStack {
@@ -63,10 +64,11 @@ struct RootView: View {
             .tint(Desk.accentLight)
             if let running {
                 SessionView(mac: running) { self.running = nil }
+                    .environment(\.colorScheme, .dark) // still dark while it fades out over a light page
                     .transition(.opacity)
             }
         }
-        .preferredColorScheme(.dark)
+        .background(WindowStyle(style: running != nil ? .dark : appearance.style))
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
         .task(id: scenePhase) {
             jit.scenePhaseChanged(scenePhase)

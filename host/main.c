@@ -23,6 +23,8 @@
 #include "pvg_lite.h"
 #include "vm.h"
 #include "install.h"
+#include "snapshot.h"
+#include <dispatch/dispatch.h>
 
 /* The machine lives in vm.c; these name its parts here. */
 #define m (*hv_vm_machine())
@@ -44,6 +46,34 @@ typedef struct RunArgs {
     const char *dump_path;
 } RunArgs;
 static RunArgs run_args;
+/* Instant resume testing: "save PATH" / "saveexit PATH" in HV_INPUT_FILE, --resume PATH. CPU 0 runs on cpu_thread
+   here, so that thread finishes a pause and waits for the saving thread to let it run on. */
+static dispatch_semaphore_t resume_go;
+static const char *snapshot_ident(void) {
+    static char id[256];
+    snprintf(id, sizeof id, "hengevm-mac-test %d cpus", hv_vm_ncpus());
+    return id;
+}
+static void save_now(const char *path, int then_exit) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (hv_vm_pause() != 0) {
+        fprintf(stderr, "hengevm: save: the machine stopped instead of pausing\n");
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    fprintf(stderr, "hengevm: save: paused in %.3f s\n", (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9);
+    char err[256];
+    int r = hv_snapshot_save(path, snapshot_ident(), err, sizeof err);
+    if (r) fprintf(stderr, "hengevm: save failed: %s\n", err);
+    if (then_exit && !r) {
+        fprintf(stderr, "hengevm: saved; exiting as if killed\n");
+        _exit(0);
+    }
+    if (hv_vm_continue() != 0) fprintf(stderr, "hengevm: save: cannot run on\n");
+    dispatch_semaphore_signal(resume_go);
+    fprintf(stderr, "hengevm: save: running on\n");
+}
 static uint64_t translate_va;
 
 /* Chained blocks run without returning to the dispatcher; this makes them leave
@@ -559,6 +589,9 @@ static void *input_thread(void *unused) {
                 fclose(bf);
             }
         }
+        else if (!strncmp(line, "save ", 5)) save_now(line + 5, 0);
+        else if (!strncmp(line, "saveexit ", 9)) save_now(line + 9, 1);
+        else if (!strncmp(line, "linkflap", 8)) hv_vm_link_flap();
         else if (!strncmp(line, "btn ", 4)) { /* "btn CODE 1|0": any evdev button code on the virtio mouse (testing) */
             unsigned code = 0;
             int down = 0;
@@ -679,12 +712,14 @@ static void *input_thread(void *unused) {
             }
             fprintf(stderr, "hengevm: find: %d places\n", n);
         }
-        else if (!strncmp(line, "grep ", 5)) { /* lines of text in guest RAM (the kernel's log) */
+        else if (!strncmp(line, "grep ", 5) || !strncmp(line, "grepall ", 8)) { /* lines of text in guest RAM (the kernel's
+                                                                                   log, launchd's); grep stops at 40 */
             HvVmapple *bd = hv_vm_board();
-            const char *word = line + 5;
+            int all = line[4] == 'a';
+            const char *word = line + (all ? 8 : 5);
             size_t wn = strlen(word);
             uint64_t hits = 0;
-            for (uint64_t i = 0; i + wn < bd->ram_size && hits < 40; i++) {
+            for (uint64_t i = 0; i + wn < bd->ram_size && (all || hits < 40); i++) {
                 if (bd->ram[i] != (uint8_t)word[0] || memcmp(bd->ram + i, word, wn)) continue;
                 uint64_t from = i;
                 while (from > 0 && i - from < 200 && bd->ram[from - 1] >= 32 && bd->ram[from - 1] < 127) from--;
@@ -695,6 +730,26 @@ static void *input_thread(void *unused) {
                 i = to;
             }
             fprintf(stderr, "hengevm: grep: %llu lines\n", (unsigned long long)hits);
+        }
+        else if (!strncmp(line, "vdump ", 6)) { /* "vdump VA LEN FILE": guest memory at a VA as CPU 0 maps it now (EL1), up to 64 KB */
+            unsigned long long va = 0, len = 0;
+            char out[400];
+            if (sscanf(line + 6, "%llx %lli %399s", &va, &len, out) == 3 && len > 0 && len <= 65536) {
+                HvVmapple *bd = hv_vm_board();
+                FILE *vf = fopen(out, "wb");
+                unsigned long long done = 0;
+                while (vf && done < len) {
+                    HvWalk wv;
+                    hv_mmu_walk(hv_vm_cpu(0), va + done, HV_ACC_READ, 1, &wv);
+                    uint64_t off = wv.pa - 0x70000000ull, n = 0x4000 - ((va + done) & 0x3fff);
+                    if (n > len - done) n = len - done;
+                    if (wv.fsc || wv.pa < 0x70000000ull || off + n > bd->ram_size) break;
+                    fwrite(bd->ram + off, 1, n, vf);
+                    done += n;
+                }
+                if (vf) fclose(vf);
+                fprintf(stderr, "hengevm: vdump %llx: %llu bytes\n", va, done);
+            }
         }
         else if (!strncmp(line, "page ", 5)) { /* a 16 KB file: is it in guest RAM, and how does the copy there differ? */
             static uint8_t want[0x4000];
@@ -823,6 +878,10 @@ static void *cpu_thread(void *unused) {
     int r;
     for (;;) {
         r = hv_vm_run_cpu0();
+        if (r == HV_EXIT_HALT && atomic_load(&cpu.halted) == HV_HALT_SAVE && hv_vm_finish_pause() == 0) {
+            dispatch_semaphore_wait(resume_go, DISPATCH_TIME_FOREVER); /* saved: run on (or the process ends) */
+            continue;
+        }
         if (r != HV_EXIT_HALT || cpu.halted || cpu.pc != a->brk || --a->brk_hits == 0) break;
         m.stop_pc = ~0ull; /* step past it: run one block, then re-arm */
         uint64_t at = cpu.pc;
@@ -932,7 +991,7 @@ static void install_progress(int step, double p, void *user) {
 int main(int argc, char **argv) {
     const char *rom = NULL, *disk_path = NULL, *aux_path = NULL;
     uint64_t seed = 0, ecid = 0, ram_mb = 4096, aux_offset = 16384;
-    const char *install_ipsw = NULL;
+    const char *install_ipsw = NULL, *resume_path = NULL;
     const char *share_folder = NULL;
     int log = 1, trace = 0, use_pvg = 1, no_chain = 0;
     const char *screenshot = NULL;
@@ -994,6 +1053,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--aux-offset")) aux_offset = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--install")) install_ipsw = argv[++i];
+        else if (!strcmp(argv[i], "--resume")) resume_path = argv[++i];
         else usage();
     }
     if (!rom || !disk_path || !aux_path) usage();
@@ -1013,6 +1073,13 @@ int main(int argc, char **argv) {
     if (hv_vm_create(&vc, err, sizeof err) != 0) {
         fprintf(stderr, "hengevm: %s\n", err);
         return 1;
+    }
+    resume_go = dispatch_semaphore_create(0);
+    if (resume_path) {
+        if (hv_snapshot_restore(resume_path, snapshot_ident(), err, sizeof err) != 0) {
+            fprintf(stderr, "hengevm: resume: %s\n", err);
+            return 1;
+        }
     }
     m.trace = trace;
     m.watch_va = watch;

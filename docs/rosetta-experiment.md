@@ -23,7 +23,7 @@ Hosts without `hw.optional.arm.FEAT_AFP` cannot enable Rosetta in this version.
 ## Isolation and maintenance
 
 The mainline pin is
-[`d5b8502c3c7da84462086935fa43a9c4f4f792bd`](https://github.com/Leviidev/Henge/commit/d5b8502c3c7da84462086935fa43a9c4f4f792bd).
+[`fb4307a5feceb3ec559cce011ffb69d7ed78a01c`](https://github.com/Leviidev/Henge/commit/fb4307a5feceb3ec559cce011ffb69d7ed78a01c).
 It is upstream main with the JIT startup and guest shutdown/restart fixes from
 PRs #46 and #50 already incorporated. Both engines use that exact lifecycle
 bridge, including JIT reuse.
@@ -39,6 +39,11 @@ missing framework or incompatible API is an error, with no fallback to the
 other engine. The app owns its JIT mapping and passes it to the selected engine.
 The unused engine adds package size but does not execute or allocate a VM.
 The shared app UI, JIT setup and import/export code remain common to both modes.
+
+Upstream Instant Resume is available through both engines. Saved-state identity
+includes the selected engine and pinned revision, so changing engines requires
+a cold boot. The Rosetta snapshot also preserves Apple integer flags,
+exception-saved flags and floating-point controls.
 
 When updating mainline, update the pin deliberately, retain the shared lifecycle
 bridge, rebuild both frameworks and check both modes. Changes to the function

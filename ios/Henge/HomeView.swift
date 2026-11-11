@@ -180,7 +180,11 @@ private struct MacHero: View {
             .buttonStyle(.plain)
             if jitReady {
                 Button(action: start) {
-                    Label("Start", systemImage: "play.fill")
+                    if InstantResume.enabled && InstantResume.hasSave(for: mac) {
+                        Label("Resume", systemImage: "play.fill")
+                    } else {
+                        Label("Start", systemImage: "play.fill")
+                    }
                 }
                 .buttonStyle(DeskButtonStyle())
                 .padding(.top, 15)
@@ -213,7 +217,7 @@ private struct MacHero: View {
         }
         .aspectRatio(mac.aspect, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Desk.hairline, lineWidth: 0.5))
         .accessibilityHidden(true)
     }
 }

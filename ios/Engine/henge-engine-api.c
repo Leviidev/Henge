@@ -15,7 +15,8 @@ const HengeEngineAPI *henge_engine_get_api(void) {
     static const HengeEngineAPI api = {
         .abi = HENGE_ENGINE_ABI, .bytes = sizeof(HengeEngineAPI),
         .rosetta = HENGE_ENGINE_ROSETTA, .mainline_revision = HENGE_MAINLINE_REVISION,
-        .set_jit = set_jit, .henge_vm_boot = henge_vm_boot, .henge_vm_install = henge_vm_install,
+        .set_jit = set_jit, .henge_vm_boot = henge_vm_boot, .henge_vm_resume = henge_vm_resume,
+        .henge_vm_install = henge_vm_install,
 #define RESULT(type, name, params, args, fallback) .name = name,
         HENGE_ENGINE_RESULTS(RESULT)
 #undef RESULT

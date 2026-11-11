@@ -1,5 +1,6 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
+#include "sysreg.h"
 
 #include <errno.h>
 #include <mach/mach.h>
@@ -198,6 +199,9 @@ static uint8_t *alloc_no_footprint(uint64_t size) {
 /* A mapped file's page is slow to touch the first time and as fast as any other
    afterwards, so a background thread gets there before the guest does. Adding
    zero dirties the page without changing it, whatever the guest has written. */
+/* An Apple register block's bytes (64 KB), for saving the machine. */
+uint8_t *hv_vmapple_avp_regs(void *avp) { return avp ? ((AvpRegs *)avp)->regs : NULL; }
+
 struct PrefaultArgs {
     uint8_t *ram;
     uint64_t size;
@@ -344,6 +348,7 @@ int hv_vmapple_load_rom(HvVmapple *b, const char *path) {
 }
 
 void hv_vmapple_reset_cpu(HvVmapple *b) {
+    b->m->cntvoff = hv_counter();
     for (int i = 0; i < b->ncpus; i++) {
         HvCpu *c = &b->cpu[i];
         hv_cpu_reset_index(c, b->m, (uint32_t)i);

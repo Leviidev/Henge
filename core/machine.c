@@ -628,6 +628,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->m = m;
     cpu->rosetta_mode = m->rosetta;
     cpu->index = index;
+    cpu->cntvoff = m->cntvoff;
     cpu->pc_state = &m->percpu[index];
     m->cpus[index] = cpu;
     if (m->ncpus <= (int)index) m->ncpus = (int)index + 1;

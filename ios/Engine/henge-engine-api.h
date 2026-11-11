@@ -5,12 +5,17 @@
 #include "henge-vm.h"
 #include "henge-ios-jit.h"
 
-#define HENGE_ENGINE_ABI 4
+#define HENGE_ENGINE_ABI 5
 
 #define HENGE_ENGINE_RESULTS(X) \
     X(int, henge_install_step, (void), (), -1) \
     X(double, henge_install_progress, (void), (), 0) \
     X(int, henge_make_aux, (const char *path), (path), -1) \
+    X(int, henge_vm_suspend, (const char *path, const char *ident, char *err, size_t errlen), (path, ident, err, errlen), -1) \
+    X(int, henge_vm_pause, (char *err, size_t errlen), (err, errlen), -1) \
+    X(int, henge_vm_save, (const char *path, const char *ident, char *err, size_t errlen), (path, ident, err, errlen), -1) \
+    X(int, henge_vm_continue, (void), (), -1) \
+    X(int, henge_vm_saved_ok, (const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at), (path, ident, bytes, saved_at), -1) \
     X(int, henge_vm_state, (void), (), 0) \
     X(uint64_t, henge_vm_generation, (void), (), 0) \
     X(int, henge_vm_can_start, (void), (), 0) \
@@ -53,6 +58,7 @@ typedef struct HengeEngineAPI {
     const char *mainline_revision;
     void (*set_jit)(const HengeDualMapping *mapping);
     __typeof__(&henge_vm_boot) henge_vm_boot;
+    __typeof__(&henge_vm_resume) henge_vm_resume;
     __typeof__(&henge_vm_install) henge_vm_install;
 #define RESULT(type, name, params, args, fallback) type (*name) params;
     HENGE_ENGINE_RESULTS(RESULT)

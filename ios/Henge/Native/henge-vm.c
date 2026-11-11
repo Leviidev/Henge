@@ -66,7 +66,7 @@ static const HengeEngineAPI *load_engine(void) {
                 const HengeEngineAPI *api = get_api ? get_api() : NULL;
                 int valid = api && api->abi == HENGE_ENGINE_ABI && api->bytes == sizeof *api &&
                     api->rosetta == selected_rosetta && api->mainline_revision && api->set_jit &&
-                    api->henge_vm_boot && api->henge_vm_install;
+                    api->henge_vm_boot && api->henge_vm_resume && api->henge_vm_install;
 #define RESULT(type, name, params, args, fallback) if (valid && !api->name) valid = 0;
                 HENGE_ENGINE_RESULTS(RESULT)
 #undef RESULT
@@ -121,6 +121,12 @@ int henge_vm_install(const char *rom, const char *disk, const char *aux, uint64_
                      const char *workdir, uint64_t ram_mb, int cpus, char *err, size_t errlen) {
     const HengeEngineAPI *api = prepare_engine(err, errlen);
     return api ? api->henge_vm_install(rom, disk, aux, ecid, ipsw, workdir, ram_mb, cpus, err, errlen) : -1;
+}
+
+int henge_vm_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
+                    int cpus, const char *path, const char *ident, char *err, size_t errlen) {
+    const HengeEngineAPI *api = prepare_engine(err, errlen);
+    return api ? api->henge_vm_resume(rom, disk, aux, ecid, seed, ram_mb, cpus, path, ident, err, errlen) : -1;
 }
 
 #define RESULT(type, name, params, args, fallback) \

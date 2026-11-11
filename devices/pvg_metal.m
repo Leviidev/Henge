@@ -99,6 +99,9 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     /* Each plane's sampled guest bytes when last copied: only the planes the guest changed are copied, so a CPU
        write to one plane (a decoder refilling luma) does not wipe what the GPU drew into another (chroma, alpha). */
     uint64_t plane_hash[4];
+    /* For a host IOSurface shared by several mappings (see planar): the same four hashes, kept once for all of
+       them, since they describe what the one host surface holds. */
+    NSMutableData *shared_hashes;
     /* A heap: private memory, a buffer over all of it. */
     id<MTLBuffer> heap_whole;
     /* A heap's or a private texture's copy in guest memory, and which side has the newest bytes. */
@@ -136,6 +139,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
        process) has to be what another reads (WindowServer). */
     NSMutableDictionary<NSString *, id> *planar;
     NSMutableDictionary<NSString *, NSNumber *> *planar_uses; /* mappings using each: the entry goes with the last one */
+    NSMutableDictionary<NSString *, NSMutableData *> *planar_hashes; /* and what its planes held when last copied */
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
@@ -546,6 +550,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         NSError *err = nil;
         id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
         if (!state) [self complain:[NSString stringWithFormat:@"compute pipeline: %@", err.localizedDescription]];
+        else objc_setAssociatedObject(state, "hvname", [NSString stringWithFormat:@"compute %@", [[descriptor computeFunction] name]], OBJC_ASSOCIATION_RETAIN);
         return state;
     }
     if (tag == 3) { /* sampler: {tag, size, ref, bits, lod min, lod max, ...} */
@@ -764,9 +769,15 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
         uint16_t bpe;
         if (compact) {
             const uint8_t *cp = desc + 0x40 + i * 0x40;
-            uint32_t v[6];
+            uint32_t v[6], base;
             memcpy(v, cp + 0x0c, sizeof v); /* offset, size, width << 8, height << 8, row, bytes per element */
             off = v[0], size = v[1], w = v[2] >> 8, h = v[3] >> 8, row = v[4], bpe = (uint16_t)v[5];
+            /* +0x08: where the plane's first visible pixel is. A video decoder's buffers carry extended pixels
+               around the picture (Sonoma's 10-bit HEVC: 96 columns and 71 rows before it), and the guest's
+               GPU reads the plane from there; from the allocation's start, every converted frame came out
+               moved right and down with a green band at the top and left (the menu bar and left strip). */
+            memcpy(&base, cp + 0x08, 4);
+            if (base > off && base - off < size) size -= base - off, off = base;
         } else
         memcpy(&off, pl + 8, 8), memcpy(&size, pl + 0x18, 8), memcpy(&w, pl + 0x20, 8), memcpy(&h, pl + 0x28, 8), memcpy(&row, pl + 0x30, 8), memcpy(&bpe, pl + 0x38, 2);
         [info addObject:@{(__bridge id)kIOSurfacePlaneWidth: @(w), (__bridge id)kIOSurfacePlaneHeight: @(h), (__bridge id)kIOSurfacePlaneBytesPerRow: @(row),
@@ -819,12 +830,6 @@ static uint64_t plane_bytes(HvObject *s, uint32_t i) {
     return row * s->plane_h[i];
 }
 
-/* Every plane's hash as the guest has it now, for a host surface already holding those pixels. */
-static void note_plane_hashes(HvObject *s) {
-    for (uint32_t i = 0; i < s->plane_count && i < 4; i++)
-        s->plane_hash[i] = hash_bytes(s->mapped + s->first + s->plane_from[i], plane_bytes(s, i));
-}
-
 /* Guest pixels into its IOSurface, when they changed. */
 static void sync_iosurface(HvObject *s) {
     if (!s->iosurface) return;
@@ -832,10 +837,11 @@ static void sync_iosurface(HvObject *s) {
     BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
     uint64_t hashes[4] = {0};
     uint32_t changed = 0;
+    uint64_t *have = s->shared_hashes ? (uint64_t *)s->shared_hashes.mutableBytes : s->plane_hash;
     if (by_plane) {
         for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
             hashes[i] = hash_bytes(from + s->plane_from[i], plane_bytes(s, i));
-            if (hashes[i] != s->plane_hash[i]) changed |= 1u << i;
+            if (hashes[i] != have[i]) changed |= 1u << i;
         }
         if (!changed) return;
     } else {
@@ -872,7 +878,7 @@ static void sync_iosurface(HvObject *s) {
            requested. Copy each changed video plane through its actual host layout. */
         for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
             if (!(changed & 1u << i)) continue;
-            s->plane_hash[i] = hashes[i];
+            have[i] = hashes[i];
             uint8_t *dst = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
             size_t dst_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
             size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
@@ -914,6 +920,11 @@ static void sync_iosurface(HvObject *s) {
        macOS 14's driver writes a compact one: u32 allocation at 0x10, width and height << 8 at 0x14 and 0x18, u32 row
        at 0x1c, bytes per pixel at 0x20 (BGRA 1920x1080: 007ec000 00078080 00043880 00001e00 00000004); one plane. */
     BOOL compact = hv_pvg_lite_old_driver(lite) != 0;
+    if (getenv("HV_PVG_DESC_DUMP")) {
+        fprintf(stderr, "surface-desc %llu:", mapping);
+        for (int i = 0; i < 0x200; i += 4) fprintf(stderr, "%s%08x", i % 32 ? " " : "\n  ", *(const uint32_t *)(desc + i));
+        fprintf(stderr, "\n");
+    }
     uint32_t compact_planes = 1;
     if (compact) memcpy(&compact_planes, desc + 0x24, 4);
     uint8_t planes = compact ? (uint8_t)MIN(MAX(compact_planes, 1u), 4u) : desc[0x3e];
@@ -960,8 +971,10 @@ static void sync_iosurface(HvObject *s) {
         surface->alloc = alloc;
         IOSurfaceRef made = make_iosurface(surface, desc, alloc, compact);
         /* The same guest memory, format and size under another mapping id (another process): the same host
-           IOSurface, or what that process drew is not what this one sees. Its pixels are already there (or
-           drawn over since), so they are not copied again now. */
+           IOSurface, or what that process drew is not what this one sees. Whether its pixels are there is in
+           the hashes it shares: a video decoder's process writes frames with the CPU and never uses the GPU, so
+           nothing had copied them, and the first process to draw with one (the wallpaper's lock-screen image
+           during Setup) read an empty frame: solid green. */
         NSString *pk = [NSString stringWithFormat:@"%x/%08x/%llux%llu/%llu", pages[0] & ~1u, surface->fourcc,
                         (unsigned long long)sw, (unsigned long long)sh, (unsigned long long)alloc];
         id shared = planar[pk];
@@ -969,7 +982,7 @@ static void sync_iosurface(HvObject *s) {
             CFRelease(made);
             surface->iosurface = (IOSurfaceRef)CFRetain((__bridge CFTypeRef)shared);
             surface->content_hash = guest_hash(surface);
-            note_plane_hashes(surface);
+            surface->shared_hashes = planar_hashes[pk];
             surface->planar_key = pk;
             planar_uses[pk] = @(planar_uses[pk].unsignedIntValue + 1);
             static int told;
@@ -977,9 +990,11 @@ static void sync_iosurface(HvObject *s) {
         } else {
             surface->iosurface = made;
             if (made) {
-                if (planar.count >= 512) [planar removeAllObjects], [planar_uses removeAllObjects]; /* old ones only lose their sharing */
+                if (planar.count >= 512) [planar removeAllObjects], [planar_uses removeAllObjects], [planar_hashes removeAllObjects]; /* old ones only lose their sharing */
                 planar[pk] = (__bridge id)made;
                 planar_uses[pk] = @1;
+                surface->shared_hashes = [NSMutableData dataWithLength:sizeof surface->plane_hash];
+                planar_hashes[pk] = surface->shared_hashes;
                 surface->planar_key = pk;
             }
             if (!surface->iosurface) {
@@ -1022,6 +1037,11 @@ static void sync_iosurface(HvObject *s) {
     }
     HvObject *surface = [self currentSurface:h.mapping];
     o->on_mapping = h.mapping;
+    if (hv_pvg_trace_on()) {
+        fprintf(stderr, "trace: mapped texture ref %u tag %#x size %u mapping %llu:", h.ref, h.tag, h.size, h.mapping);
+        for (int i = 0; i < 64; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(h.d + i));
+        fprintf(stderr, "\n");
+    }
     MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
     if (!surface) surface = [self newSurface:h.mapping];
     if (!surface) return;
@@ -1792,6 +1812,7 @@ typedef struct {
         id state = [self get:U32(0) task:task];
         if (state) [e setComputePipelineState:state];
         pipeline_set = state != nil;
+        if (tracing) fprintf(stderr, "trace:  pipeline %u %s\n", U32(0), [objc_getAssociatedObject(state, "hvname") UTF8String]);
         break;
     }
     case 203: {
@@ -1805,10 +1826,21 @@ typedef struct {
             buffers[i] = strong[i];
             offsets[i] = (NSUInteger)U64(12 + i * 12);
         }
+        if (tracing) for (uint32_t i = 0; i < count; i++) {
+            id<MTLBuffer> x = strong[i];
+            fprintf(stderr, "trace:  cbuf %u ref %u off %lu len %lu:", index + i, U32(8 + i * 12), (unsigned long)offsets[i], (unsigned long)x.length);
+            if (x && x.storageMode != MTLStorageModePrivate && offsets[i] < x.length)
+                for (NSUInteger k = 0; k < 96 && offsets[i] + k + 4 <= x.length; k += 4)
+                    fprintf(stderr, " %08x", *(uint32_t *)((uint8_t *)x.contents + offsets[i] + k));
+            fprintf(stderr, "\n");
+        }
         [e setBuffers:buffers offsets:offsets withRange:NSMakeRange(index, count)];
         break;
     }
-    case 207: [e setBufferOffset:(NSUInteger)U64(4) atIndex:U32(0)]; break;
+    case 207:
+        if (tracing) fprintf(stderr, "trace:  cbuf %u offset now %llu\n", U32(0), (unsigned long long)U64(4));
+        [e setBufferOffset:(NSUInteger)U64(4) atIndex:U32(0)];
+        break;
     case 206: {
         uint32_t index = U32(0), count = U32(4);
         if (count > 128) break;
@@ -1817,6 +1849,12 @@ typedef struct {
         for (uint32_t i = 0; i < count; i++) {
             strong[i] = [self get:U32(8 + i * 4) task:task];
             items[i] = strong[i];
+        }
+        if (tracing) for (uint32_t i = 0; i < count; i++) {
+            id<MTLTexture> x = strong[i];
+            HvObject *xo = [self object:U32(8 + i * 4) task:task];
+            fprintf(stderr, "trace:  ctex %u ref %u %lux%lu fmt %lu type %u surface %s\n", index + i, U32(8 + i * 4), (unsigned long)x.width,
+                    (unsigned long)x.height, (unsigned long)x.pixelFormat, xo ? xo->entry[0] & 0xff : 0, xo && xo->surface ? "yes" : "no");
         }
         [e setTextures:items withRange:NSMakeRange(index, count)];
         break;
@@ -1837,6 +1875,8 @@ typedef struct {
     case 200: case 202: {
         MTLSize a, b;
         memcpy(&a, r.p, sizeof a), memcpy(&b, r.p + sizeof a, sizeof b);
+        if (tracing) fprintf(stderr, "trace:  dispatch %u %lux%lux%lu by %lux%lux%lu\n", tag, (unsigned long)a.width, (unsigned long)a.height,
+                             (unsigned long)a.depth, (unsigned long)b.width, (unsigned long)b.height, (unsigned long)b.depth);
         if (tag == 200) [e dispatchThreadgroups:a threadsPerThreadgroup:b];
         else [e dispatchThreads:a threadsPerThreadgroup:b];
         break;
@@ -2351,7 +2391,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 }
 
 - (void)showOnLayer:(uint64_t)mapping {
-    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
@@ -2553,7 +2593,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         return;
     }
     late = NO;
-    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_old_driver(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]); /* not met yet: a resumed machine's screen */
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     last_capture = now;
     [last_cb waitUntilCompleted]; /* the CPU copies the pixels here, so the GPU must be done with them */
@@ -2637,6 +2677,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->surfaces = [NSMutableDictionary new];
         r->planar = [NSMutableDictionary new];
         r->planar_uses = [NSMutableDictionary new];
+        r->planar_hashes = [NSMutableDictionary new];
         r->complaints = [NSMutableSet new];
         r->shot = getenv("HV_PVG_SHOT");
         cp_start(r);
@@ -2816,6 +2857,7 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
                 else {
                     [r->planar removeObjectForKey:pk];
                     [r->planar_uses removeObjectForKey:pk];
+                    [r->planar_hashes removeObjectForKey:pk];
                 }
             }
         }
@@ -2870,4 +2912,105 @@ int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *w, uint3
     if (!r->frame) return -1;
     *pixels = r->frame, *w = r->frame_w, *h = r->frame_h;
     return 0;
+}
+
+@interface HvReplay (Resume)
+- (void)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb;
+@end
+
+/* Instant resume: the CPUs are stopped. Finish what the guest handed over, then copy what only the GPU holds (it drew
+   into private memory and the guest has not asked for it back) into guest memory, where a replay made after a restore
+   reads it from. A texture in a heap goes with its heap's bytes, as the heap is what is made again from guest memory. */
+void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+    if (!m) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    @autoreleasepool {
+        dispatch_sync(r->worker, ^{});
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+        dispatch_sync(r->worker, ^{
+            id<MTLCommandBuffer> cb = nil;
+            id<MTLBlitCommandEncoder> blit = nil;
+            unsigned copied = 0;
+            for (NSNumber *task in r->tasks) {
+                NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
+                for (NSNumber *ref in objs) {
+                    HvObject *o = objs[ref];
+                    if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
+                    if (o->parent && o->parent->heap_whole) continue;
+                    if (!cb) cb = [r->queue commandBuffer];
+                    [r page:o toGuest:YES task:task.unsignedIntValue blit:&blit commandBuffer:cb];
+                    o->guest_stale = NO;
+                    copied++;
+                }
+            }
+            [blit endEncoding];
+            if (cb) {
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            fprintf(stderr, "hengevm: pvg-metal: quiesced, %u GPU-only objects copied to guest memory\n", copied);
+        });
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+    }
+}
+
+typedef struct DisplayState {
+    uint64_t on_screen;
+    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+    int32_t hot_x, hot_y;
+} DisplayState;
+
+size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
+    HvReplay *r = (__bridge HvReplay *)m;
+    __block size_t need = 0;
+    dispatch_sync(r->worker, ^{
+        os_unfair_lock_lock(&r->screen_lock);
+        size_t bits = r->cursor ? (size_t)r->cursor_stride * r->cursor_h : 0;
+        need = sizeof(DisplayState) + bits;
+        if (out && cap >= need) {
+            DisplayState d = {.on_screen = r->on_screen, .cursor_w = bits ? r->cursor_w : 0, .cursor_h = bits ? r->cursor_h : 0,
+                              .cursor_stride = bits ? r->cursor_stride : 0, .cursor_shown = r->cursor_shown,
+                              .hot_x = r->cursor_hot_x, .hot_y = r->cursor_hot_y};
+            memcpy(out, &d, sizeof d);
+            if (bits) memcpy((uint8_t *)out + sizeof d, r->cursor, bits);
+        }
+        os_unfair_lock_unlock(&r->screen_lock);
+    });
+    return need;
+}
+
+void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len) {
+    if (!m || len < sizeof(DisplayState)) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    DisplayState d;
+    memcpy(&d, in, sizeof d);
+    size_t bits = (size_t)d.cursor_stride * d.cursor_h;
+    if (len < sizeof d + bits || d.cursor_w > 512 || d.cursor_h > 512 || (bits && d.cursor_stride < d.cursor_w * 4)) bits = 0;
+    uint8_t *copy = bits ? malloc(bits) : NULL;
+    if (copy) memcpy(copy, (const uint8_t *)in + sizeof d, bits);
+    dispatch_sync(r->worker, ^{
+        @autoreleasepool {
+            id<MTLTexture> glyph = nil;
+            if (copy) {
+                MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:d.cursor_w height:d.cursor_h mipmapped:NO];
+                ct.storageMode = MTLStorageModeShared;
+                glyph = [r->device newTextureWithDescriptor:ct];
+                [glyph replaceRegion:MTLRegionMake2D(0, 0, d.cursor_w, d.cursor_h) mipmapLevel:0 withBytes:copy bytesPerRow:d.cursor_stride];
+            }
+            os_unfair_lock_lock(&r->screen_lock);
+            if (copy) {
+                free(r->cursor);
+                r->cursor = copy, r->cursor_w = d.cursor_w, r->cursor_h = d.cursor_h, r->cursor_stride = d.cursor_stride;
+                r->cursor_hot_x = d.hot_x, r->cursor_hot_y = d.hot_y;
+                r->cursor_tex = glyph;
+            }
+            r->cursor_shown = d.cursor_shown != 0;
+            os_unfair_lock_unlock(&r->screen_lock);
+            r->on_screen = d.on_screen;
+            if (d.on_screen) [r present:d.on_screen];
+            [r drawCursor];
+        }
+    });
+    fprintf(stderr, "hengevm: pvg-metal: screen %llu and a %ux%u pointer restored\n", (unsigned long long)d.on_screen, d.cursor_w, d.cursor_h);
 }
