@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/acl.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -248,10 +249,19 @@ int hg_guest_payload_verify_directory(const char *directory, const HGGuestPayloa
     }
 }
 
+static BOOL stage_no_acl(int fd) {
+    errno=0;acl_t acl=acl_get_fd_np(fd,ACL_TYPE_EXTENDED);
+    if(!acl)return errno==ENOENT;
+    acl_entry_t entry;BOOL good=!acl_valid(acl);errno=0;
+    BOOL empty=good && acl_get_entry(acl,ACL_FIRST_ENTRY,&entry)==-1 && errno==EINVAL;
+    acl_free(acl);return empty;
+}
+
 static BOOL staged_members_match(int directory, NSDictionary<NSString *, NSData *> *members) {
     struct stat info;
     if (fstat(directory, &info) || !S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
-        (info.st_mode & 07777) != 0755) return NO;
+        (info.st_mode & 07777) != 0755 || info.st_flags || !stage_no_acl(directory)) return NO;
+    dev_t device=info.st_dev;
     int copy = dup(directory);
     DIR *stream = copy < 0 ? NULL : fdopendir(copy);
     if (!stream) { if (copy >= 0) close(copy); return NO; }
@@ -271,7 +281,13 @@ static BOOL staged_members_match(int directory, NSDictionary<NSString *, NSData 
         mode_t wanted = [executables() containsObject:name] ? 0755 : 0644;
         if (fstatat(directory, name.UTF8String, &info, AT_SYMLINK_NOFOLLOW) ||
             !S_ISREG(info.st_mode) || info.st_nlink != 1 || info.st_uid != geteuid() ||
-            (info.st_mode & 07777) != wanted) return NO;
+            (info.st_mode & 07777) != wanted || info.st_dev!=device || info.st_flags) return NO;
+        int fd=openat(directory,name.UTF8String,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+        struct stat opened;
+        BOOL accepted=fd>=0 && !fstat(fd,&opened) && opened.st_dev==info.st_dev &&
+            opened.st_ino==info.st_ino && stage_no_acl(fd);
+        if(fd>=0)close(fd);
+        if(!accepted)return NO;
         NSData *bytes = read_member(directory, name.UTF8String, HGMaxArchive);
         if (!bytes || ![bytes isEqualToData:members[name]]) return NO;
     }
@@ -310,7 +326,7 @@ int hg_guest_payload_stage_directory(const char *resources,
         struct stat parentInfo, stageInfo;
         memset(&stageInfo, 0, sizeof(stageInfo));
         if (parent < 0 || fstat(parent, &parentInfo) || !S_ISDIR(parentInfo.st_mode) ||
-            parentInfo.st_uid != geteuid() || (parentInfo.st_mode & 0022)) goto done;
+            parentInfo.st_uid != geteuid() || (parentInfo.st_mode & 0022) || parentInfo.st_flags || !stage_no_acl(parent)) goto done;
         {
             int source = resources ? open(resources, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
             if (source < 0 || !identity) { if (source >= 0) close(source); failure = @"resource-directory"; goto done; }

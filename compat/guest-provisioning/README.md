@@ -787,3 +787,37 @@ That host control also stubs peer identity; physical iPad rollback is unqualifie
 Production forward exchange, app restart routing, activation/health commit and
 fresh-guest acceptance remain incomplete. No live guest or checkpoint is changed
 by these authored-image controls.
+
+### Fixed-path guest payload delivery
+
+`HGGuestPayloadDelivery` verifies the build-bound archive before creating any
+paths, then stages its versioned closed inventory beneath the fixed
+`Library/Application Support/Henge/Compatibility` path. Each component is opened
+relative to a retained descriptor, matched by inode/device, and required to be
+caller-owned, ordinarily permissioned, globally readable/searchable and free of
+extended ACLs/flags. Symlinks and cross-device boundaries are refused. Newly
+created directories become 0755 and are synchronized with their parents; existing
+metadata and conflicting versions are preserved. The complete namespace is
+revalidated after staging and final durability barriers. Staging/reuse now also
+refuses ACLs/flags on its parent, version directory and payload members, and
+requires members to remain on the expected filesystem.
+
+The caller MUST already own/qualify a writable private-copy Data-volume root,
+exclusive image lease, compatible System identity and detach transaction. This
+lower layer establishes no mount/image authority and must never receive the
+original/active guest root. Delivery does not select a current version, activate
+injection, alter application bundles or authorize image publication. Its report
+explicitly records no activation and no mount authority established by delivery.
+No production root-helper command invokes it yet.
+
+Twenty-five native payload/parser/staging/delivery groups pass, including every
+path-component symlink, invalid archive before tree creation, unsafe permissions,
+ACLs, preserved conflicts, unchanged unrelated data and exact version reuse.
+The host controls run as the host user; they are not root-ownership qualification.
+A real authored 4 GiB role-neutral COW Data volume received the independently
+built complete payload at this fixed path. Roles were restored across new APFS
+checkpoints, the payload reverified after a read-only remount, filesystem check
+passed, all owned attachments disappeared, the copy was discarded and the
+original source's full SHA-256 remained unchanged. This host hdiutil control
+releases the copy lease around attachment; it does not qualify retained-lease
+mounting on iPad. The iOS System/Data panic guard remains in place.

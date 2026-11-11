@@ -30,7 +30,9 @@ class NativeGuestPayloadTests(unittest.TestCase):
         source = folder / 'control.c'
         source.write_text('''
 #include "HGGuestPayload.h"
+#include "HGGuestPayloadDelivery.h"
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -42,13 +44,15 @@ int main(int argc, char **argv) {
     char *report = NULL;
     int status;
     if (argc >= 8) {
-        if (argc == 9) {
+        if (argc == 9 && !strcmp(argv[8],"write-limit")) {
             signal(SIGXFSZ, SIG_IGN);
             struct rlimit limit = {10, 10};
             if (setrlimit(RLIMIT_FSIZE, &limit)) return 70;
         }
         int parent = open(argv[7], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        status = hg_guest_payload_stage_directory(argv[1], &id, parent, &report);
+        status = argc==9 && !strcmp(argv[8],"deliver") ?
+            hg_guest_payload_deliver_data_root(argv[1],&id,parent,&report) :
+            hg_guest_payload_stage_directory(argv[1], &id, parent, &report);
         if (parent >= 0) close(parent);
     } else status = hg_guest_payload_verify_directory(argv[1], &id, &report);
     if (report) puts(report);
@@ -58,7 +62,7 @@ int main(int argc, char **argv) {
         cls.control = folder / 'control'
         native = ROOT / 'compat/guest-provisioning'
         subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', '-fobjc-arc',
-                        '-I', str(native), str(source), str(native / 'HGGuestPayload.m'),
+                        '-I', str(native), str(source), str(native / 'HGGuestPayload.m'), str(native / 'HGGuestPayloadDelivery.m'),
                         '-framework', 'Foundation', '-lz', '-o', str(cls.control)], check=True)
 
     def setUp(self):
@@ -118,6 +122,78 @@ int main(int argc, char **argv) {
         self.assertEqual(report['payload_verified'], expected == 0)
         self.assertFalse(report['guest_disk_accessed'])
         return report
+
+    def run_delivery(self, root, expected=0):
+        vlc=vlc_target()
+        r=subprocess.run([str(self.control),str(self.folder),self.descriptor_sha,self.recipe,
+                          self.manifest['payload_id'],vlc['reference_core_sha256'],vlc['reference_lock_sha256'],
+                          str(root),'deliver'],capture_output=True,timeout=5)
+        self.assertEqual(r.returncode,expected,r.stderr)
+        report=json.loads(r.stdout)
+        self.assertEqual(report['payload_delivered'],expected==0)
+        self.assertFalse(report['activation_performed']);self.assertFalse(report['mount_authority_established'])
+        return report
+
+    def test_data_root_delivery_uses_fixed_readable_version_tree_and_preserves_unrelated_data(self):
+        root=self.folder/'data';root.mkdir(mode=0o700)
+        keep=root/'unrelated';keep.write_bytes(b'preserve user data')
+        report=self.run_delivery(root)
+        parent=root/'Library/Application Support/Henge/Compatibility'
+        version=parent/self.manifest['payload_id']
+        self.assertEqual(set(p.name for p in version.iterdir()),set(FILES)|{'manifest.json'})
+        for name,data in self.data.items():self.assertEqual((version/name).read_bytes(),data)
+        for p in (root/'Library',root/'Library/Application Support',parent.parent,parent,version):
+            self.assertEqual(p.stat().st_mode & 0o777,0o755)
+        self.assertEqual(keep.read_bytes(),b'preserve user data')
+        self.assertFalse((parent/'Current').exists())
+        self.assertTrue(self.run_delivery(root)['already_present'])
+
+    def test_invalid_payload_delivery_creates_no_guest_tree(self):
+        root=self.folder/'data';root.mkdir(mode=0o700)
+        archive=self.folder/'henge-guest-payload.tar.gz';archive.write_bytes(archive.read_bytes()+b'corrupt')
+        report=self.run_delivery(root,65)
+        self.assertFalse(report['data_tree_may_have_changed'])
+        self.assertEqual(list(root.iterdir()),[])
+
+    def test_delivery_refuses_symlinks_at_every_guest_path_component(self):
+        components=['Library','Application Support','Henge','Compatibility']
+        outside=self.folder/'outside';outside.mkdir()
+        for index in range(len(components)):
+            root=self.folder/('data-'+str(index));root.mkdir(mode=0o700);parent=root
+            for component in components[:index]:parent=parent/component;parent.mkdir(mode=0o755)
+            link=parent/components[index];link.symlink_to(outside,target_is_directory=True)
+            self.run_delivery(root,65)
+            self.assertTrue(link.is_symlink());self.assertEqual(list(outside.iterdir()),[])
+
+    def test_delivery_preserves_unsafe_existing_directory_metadata_and_acl(self):
+        root=self.folder/'data';root.mkdir(mode=0o777);root.chmod(0o777)
+        self.run_delivery(root,65);self.assertEqual(root.stat().st_mode & 0o777,0o777)
+        root.chmod(0o700);library=root/'Library';library.mkdir(mode=0o755)
+        for mode in (0o777,0o700):
+            library.chmod(mode);self.run_delivery(root,65)
+            self.assertEqual(library.stat().st_mode & 0o777,mode);self.assertEqual(list(library.iterdir()),[])
+        library.chmod(0o755)
+        subprocess.run(['chmod','+a','everyone allow read',str(library)],check=True)
+        self.run_delivery(root,65);self.assertEqual(list(library.iterdir()),[])
+        subprocess.run(['chmod','-N',str(library)],check=True)
+        self.assertTrue(self.run_delivery(root)['payload_delivered'])
+
+    def test_delivery_conflict_preserves_existing_version(self):
+        root=self.folder/'data';root.mkdir(mode=0o700);self.run_delivery(root)
+        version=root/'Library/Application Support/Henge/Compatibility'/self.manifest['payload_id']
+        member=version/FILES[0];member.write_bytes(b'existing changed library')
+        report=self.run_delivery(root,65)
+        self.assertEqual(report['error'],'existing-payload-conflict')
+        self.assertEqual(member.read_bytes(),b'existing changed library')
+        self.assertFalse(any(p.name.startswith('.henge-stage-') for p in version.parent.iterdir()))
+
+    def test_reuse_refuses_acl_write_access_on_payload_and_members(self):
+        parent=self.stage_parent();self.run_stage(parent);version=parent/self.manifest['payload_id']
+        for target in (parent,version,version/FILES[0]):
+            subprocess.run(['chmod','+a','everyone allow write',str(target)],check=True)
+            self.run_stage(parent,65)
+            subprocess.run(['chmod','-N',str(target)],check=True)
+        self.assertTrue(self.run_stage(parent)['already_present'])
 
     def test_valid_complete_unit(self):
         self.assertEqual(self.run_control(0)['members'], len(FILES) + 1)
