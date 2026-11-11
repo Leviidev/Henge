@@ -9,6 +9,7 @@ typedef struct {
     char name[64];
     struct stat created_identity;
     int created;
+    int mutation_failed;      /* A failed write is discard-only, never mountable. */
 } HGGuestClone;
 #define HG_GUEST_CLONE_INIT { .disk = { .fd = -1 }, .directory_fd = -1 }
 

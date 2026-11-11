@@ -445,3 +445,37 @@ catalogs and reports the plan without executing it. The real authored original
 and role-neutral copy produced four restoration edits. A separate control used
 the real post-write catalog with modeled neutral roles to verify restoration of
 new checkpoints; that control is not a filesystem-write or recovery proof.
+
+### Journaled private-copy role writes
+
+`HGGuestRoleWrite` obtains fresh source/copy catalogs and computes the plan
+internally. It accepts only the independently owned private clone inode under
+the retained source lease, with no attached media. Each candidate block must
+match its checksum, type, OID/XID, UUIDs, flags and expected role. The only changed
+bytes are the role and recalculated Fletcher64 checksum.
+
+Before touching image blocks it creates an exclusive mode-0600 journal in the
+private workspace, recording clone identity/geometry and each offset with both
+full block versions. Journal memory/storage is bounded to 32 MiB. It synchronizes
+the journal and directory, reads back the complete journal, and rechecks image
+stability and media exclusion. Each original block is checked again immediately
+before writing. Image writes are synchronized and read back; source stability
+and private inode identity must still hold on completion.
+
+Any failure once journal creation succeeds permanently taints that in-memory
+clone handle. Further role writes refuse it; the safe action is to discard the
+copy. Never mount/publish a tainted copy or replay old full blocks over newer
+filesystem metadata. Journals are deliberately retained on success and failure:
+the enclosing transaction must implement identity-bound restart cleanup and
+remove only its own records after the copy has been discarded or committed.
+There is no journal replay, restart recovery or publication API yet.
+
+Six native sanitizer-backed test groups cover exact journal contents, byte-exact
+role roundtrip, busy media before/after journaling, journal sync/corruption,
+partial/torn writes, image sync and readback failures. Inventory is stubbed in
+these fault controls. A separate authored 4 GiB image control with the production
+IOMedia scanner passed four-block neutralization/restoration, byte-exact full
+image comparison, owned discard and unchanged source identity without mounting.
+This does not yet qualify mounted writes/new checkpoints or iPad execution. The
+primitive is packaged in the helper but has no production command; activation,
+restart recovery, replacement rollback and the iOS mount gate remain unfinished.
