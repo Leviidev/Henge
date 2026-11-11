@@ -1,10 +1,12 @@
 #import <Foundation/Foundation.h>
 #include "HGGuestPayload.h"
 #include <CommonCrypto/CommonDigest.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -165,7 +167,8 @@ static NSDictionary *object(NSData *data) {
     return [result isKindOfClass:NSDictionary.class] ? result : nil;
 }
 
-static NSDictionary *validate(int directory, const HGGuestPayloadIdentity *idn, NSString **failure) {
+static NSDictionary *validate(int directory, const HGGuestPayloadIdentity *idn, NSString **failure,
+                              NSDictionary **verifiedMembers) {
 #define REQUIRE(condition, message) do { if (!(condition)) { *failure = (message); return nil; } } while (0)
     NSString *descriptorSHA = idn->descriptor_sha256 ? @(idn->descriptor_sha256) : @"";
     NSString *recipe = idn->compiler_recipe ? @(idn->compiler_recipe) : @"";
@@ -220,6 +223,7 @@ static NSDictionary *validate(int directory, const HGGuestPayloadIdentity *idn, 
             [sha(data) isEqual:record[@"sha256"]] && number(record[@"bytes"], data.length) &&
             number(record[@"mode"], [executables() containsObject:name] ? 0755 : 0644), @"member-identity");
     }
+    if (verifiedMembers) *verifiedMembers = members;
     return @{@"payload_id": payloadID, @"compiler_recipe": recipe, @"members": @(members.count)};
 #undef REQUIRE
 }
@@ -231,7 +235,7 @@ int hg_guest_payload_verify_directory(const char *directory, const HGGuestPayloa
         NSDictionary *validated = nil;
         int fd = directory ? open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
         if (fd >= 0) {
-            if (identity) validated = validate(fd, identity, &failure);
+            if (identity) validated = validate(fd, identity, &failure, NULL);
             close(fd);
         }
         NSMutableDictionary *result = [@{@"schema": @1, @"operation": @"verify-payload-v1",
@@ -241,6 +245,142 @@ int hg_guest_payload_verify_directory(const char *directory, const HGGuestPayloa
         NSData *json = [NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
         if (report && json) *report = strndup(json.bytes, json.length);
         return validated ? 0 : 65;
+    }
+}
+
+static BOOL staged_members_match(int directory, NSDictionary<NSString *, NSData *> *members) {
+    struct stat info;
+    if (fstat(directory, &info) || !S_ISDIR(info.st_mode) || info.st_uid != geteuid() ||
+        (info.st_mode & 07777) != 0755) return NO;
+    int copy = dup(directory);
+    DIR *stream = copy < 0 ? NULL : fdopendir(copy);
+    if (!stream) { if (copy >= 0) close(copy); return NO; }
+    NSMutableSet *names = [NSMutableSet set];
+    struct dirent *entry;
+    errno = 0;
+    while ((entry = readdir(stream))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        NSString *name = [[NSString alloc] initWithUTF8String:entry->d_name];
+        if (!name || !members[name]) { closedir(stream); return NO; }
+        [names addObject:name];
+    }
+    int failed = errno;
+    closedir(stream);
+    if (failed || ![names isEqualToSet:[NSSet setWithArray:members.allKeys]]) return NO;
+    for (NSString *name in members) {
+        mode_t wanted = [executables() containsObject:name] ? 0755 : 0644;
+        if (fstatat(directory, name.UTF8String, &info, AT_SYMLINK_NOFOLLOW) ||
+            !S_ISREG(info.st_mode) || info.st_nlink != 1 || info.st_uid != geteuid() ||
+            (info.st_mode & 07777) != wanted) return NO;
+        NSData *bytes = read_member(directory, name.UTF8String, HGMaxArchive);
+        if (!bytes || ![bytes isEqualToData:members[name]]) return NO;
+    }
+    return YES;
+}
+
+static BOOL write_staged_member(int directory, NSString *name, NSData *bytes) {
+    int fd = openat(directory, name.UTF8String,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return NO;
+    size_t offset = 0;
+    BOOL valid = YES;
+    while (offset < bytes.length) {
+        ssize_t n = write(fd, (const char *)bytes.bytes + offset, bytes.length - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { valid = NO; break; }
+        offset += (size_t)n;
+    }
+    mode_t mode = [executables() containsObject:name] ? 0755 : 0644;
+    if (valid && (fchmod(fd, mode) || fsync(fd))) valid = NO;
+    if (close(fd)) valid = NO;
+    return valid;
+}
+
+int hg_guest_payload_stage_directory(const char *resources,
+                                     const HGGuestPayloadIdentity *identity,
+                                     int parent_fd, char **report) {
+    if (report) *report = NULL;
+    @autoreleasepool {
+        NSString *failure = @"stage-parent";
+        NSDictionary *members = nil, *validated = nil;
+        BOOL published = NO, reused = NO, cleanupComplete = YES, success = NO;
+        char staging[64] = {0};
+        int stage = -1;
+        int parent = fcntl(parent_fd, F_DUPFD_CLOEXEC, 3);
+        struct stat parentInfo, stageInfo;
+        memset(&stageInfo, 0, sizeof(stageInfo));
+        if (parent < 0 || fstat(parent, &parentInfo) || !S_ISDIR(parentInfo.st_mode) ||
+            parentInfo.st_uid != geteuid() || (parentInfo.st_mode & 0022)) goto done;
+        {
+            int source = resources ? open(resources, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
+            if (source < 0 || !identity) { if (source >= 0) close(source); failure = @"resource-directory"; goto done; }
+            validated = validate(source, identity, &failure, &members);
+            close(source);
+            if (!validated) goto done;
+        }
+        {
+            int existing = openat(parent, identity->payload_id, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            if (existing >= 0) {
+                reused = staged_members_match(existing, members);
+                close(existing);
+                if (!reused) { failure = @"existing-payload-conflict"; goto done; }
+                published = YES;
+                if (fsync(parent)) { failure = @"stage-parent-sync"; goto done; }
+                success = YES;
+                goto done;
+            }
+            if (errno != ENOENT) { failure = @"existing-payload-conflict"; goto done; }
+        }
+        for (unsigned int attempt = 0; attempt < 8; attempt++) {
+            uint64_t random;
+            arc4random_buf(&random, sizeof(random));
+            snprintf(staging, sizeof(staging), ".henge-stage-%016llx", (unsigned long long)random);
+            if (!mkdirat(parent, staging, 0700)) break;
+            if (errno != EEXIST || attempt == 7) { staging[0] = 0; failure = @"stage-create"; goto done; }
+        }
+        stage = openat(parent, staging, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (stage < 0 || fstat(stage, &stageInfo)) { failure = @"stage-open"; goto done; }
+        for (NSString *name in [[members allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
+            if (!write_staged_member(stage, name, members[name])) { failure = @"stage-write"; goto done; }
+        }
+        if (fchmod(stage, 0755) || !staged_members_match(stage, members) || fsync(stage)) {
+            failure = @"stage-readback-or-sync"; goto done;
+        }
+        {
+            struct stat named;
+            if (fstatat(parent, staging, &named, AT_SYMLINK_NOFOLLOW) ||
+                named.st_dev != stageInfo.st_dev || named.st_ino != stageInfo.st_ino) {
+                failure = @"stage-identity-changed"; goto done;
+            }
+        }
+        if (renameatx_np(parent, staging, parent, identity->payload_id, RENAME_EXCL)) {
+            failure = @"stage-publish-conflict"; goto done;
+        }
+        published = YES;
+        staging[0] = 0;
+        if (fsync(parent)) { failure = @"stage-parent-sync"; goto done; }
+        success = YES;
+    done:
+        if (staging[0]) {
+            struct stat named;
+            if (stage >= 0 && !fstatat(parent, staging, &named, AT_SYMLINK_NOFOLLOW) &&
+                named.st_dev == stageInfo.st_dev && named.st_ino == stageInfo.st_ino) {
+                for (NSString *name in members) {
+                    if (unlinkat(stage, name.UTF8String, 0) && errno != ENOENT) cleanupComplete = NO;
+                }
+                if (unlinkat(parent, staging, AT_REMOVEDIR)) cleanupComplete = NO;
+            } else cleanupComplete = NO;
+        }
+        if (stage >= 0) close(stage);
+        if (parent >= 0) close(parent);
+        NSMutableDictionary *result = [@{@"schema": @1, @"operation": @"stage-payload-v1",
+            @"payload_staged": @(success), @"published": @(published), @"already_present": @(reused),
+            @"cleanup_complete": @(cleanupComplete), @"activation_performed": @NO} mutableCopy];
+        if (validated) [result addEntriesFromDictionary:validated];
+        if (!success) result[@"error"] = failure;
+        NSData *json = [NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
+        if (report && json) *report = strndup(json.bytes, json.length);
+        return success ? 0 : 65;
     }
 }
 

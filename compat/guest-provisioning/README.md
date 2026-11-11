@@ -287,3 +287,30 @@ crossing refusal. The developer control's `--system-version` flag exercises moun
 and OS identification, but has not been run on the device. It remains subject to
 the unresolved physical mount gate above; do not run it before collecting logs
 and understanding that failure.
+
+### Verified payload staging
+
+`hg_guest_payload_stage_directory` validates the signed-build-bound descriptor,
+archive and complete file inventory once, retains those verified member bytes,
+and stages under an already opened trusted parent directory. The parent must be
+owned by the effective user and not writable by group/other. Creation uses a
+private randomized directory and exclusive no-follow file opens, fixed archive
+member names, exact modes, file sync, byte-for-byte readback and directory sync.
+Only then does an exclusive atomic rename publish the payload-ID-named version;
+it never replaces an existing version. Parent sync completes publication.
+
+An existing version is reused only after complete inventory/content/mode/owner
+verification, including rejection of symlinks and multiply linked files. A
+conflicting version is preserved and reported. Failure cleans only this call's
+owned temporary directory; an unexpected cleanup obstacle is reported rather
+than recursively deleting unknown data. Stages left by a terminated earlier
+process are never mistaken for a published payload and are not silently removed.
+The report distinguishes publication, durable success, reuse and cleanup status.
+
+Nineteen native parser/staging fixture groups pass, including partial-write fault
+injection, conflicting files, unsafe destinations, interrupted stages and exact
+reuse. arm64 iPadOS compilation passes. These tests use host directories and do
+not qualify writes to guest APFS mounts. No production helper command invokes
+staging yet. This API does not activate code or choose guest paths, and it does
+not grant disk-lease/mount authority. Writable mounting, guest path policy,
+activation/rollback, VLC integration and end-to-end acceptance remain unfinished.

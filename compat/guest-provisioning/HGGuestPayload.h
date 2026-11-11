@@ -16,4 +16,11 @@ int hg_guest_payload_verify_directory(const char *directory,
                                       char **report);
 int hg_guest_payload_verify_executable(const HGGuestPayloadIdentity *identity,
                                        char **report);
+/* Stage a verified payload as a versioned, payload-ID-named directory under an
+ * already opened trusted parent. Publishes with exclusive atomic rename after
+ * readback verification and sync. Never replaces an existing version or activates
+ * code. The caller owns guest lease/mount policy; this API grants neither. */
+int hg_guest_payload_stage_directory(const char *resources,
+                                     const HGGuestPayloadIdentity *identity,
+                                     int parent_fd, char **report);
 #endif
