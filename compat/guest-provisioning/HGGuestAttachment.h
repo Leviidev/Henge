@@ -9,12 +9,14 @@ typedef struct {
     uint64_t registry_id;
     dev_t directory_device;
     ino_t directory_inode;
+    pid_t pending_child;
 } HGGuestReadonlyMount;
 
 typedef struct {
     const HGGuestDisk *disk; /* Caller retains the exclusive lease until close. */
     char physical_bsd[64];
     uint64_t physical_registry_id;
+    pid_t pending_child;
     HGGuestReadonlyMount system_mount;
     HGGuestReadonlyMount data_mount;
 } HGGuestAttachment;
@@ -24,6 +26,9 @@ typedef struct {
  * qualification path. No guest files are written by this transaction.
  * On success caller owns attachment and frees group JSON. On failure cleanup is
  * attempted before return; attachment-cleanup-required means devices remain.
+ * attachment-command-still-running means an unreaped child remains; retain
+ * transaction state and retry close only after it exits. Production supervision
+ * must preserve ownership for this state rather than start the VM.
  * Always call close before releasing the disk lease, including after failure. */
 int hg_guest_attachment_open(const HGGuestDisk *disk, HGGuestAttachment *attachment,
                              char **group_json, const char **error);

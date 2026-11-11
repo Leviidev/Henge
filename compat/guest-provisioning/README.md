@@ -248,7 +248,7 @@ temporary directories before ejection. Unknown mount identity or flags stop
 cleanup rather than unmounting an unrelated filesystem. The caller must call
 close after mount failure as well as success.
 
-Ten native mocked-boundary controls pass, including successful dual mounts,
+Twelve native mocked-boundary controls pass, including successful dual mounts,
 second-mount failure cleanup, and refusal to unmount unexpected/writable mounts.
 arm64 iPadOS compilation passes. The first physical mount test on the authored
 System/Data fixture did not return within 50 seconds; SSH subsequently refused
@@ -258,3 +258,14 @@ not a successful mount qualification. Do not invoke this mount path in productio
 startup until the device failure is understood and resolved. No production helper
 operation currently calls it; the explicit developer control flag is
 `--mount-readonly`. No existing guest disk was used in this test.
+
+Review after that failure found an unbounded blocking `waitpid` after SIGKILL in
+the tool runner. It now polls for at most one additional second after the normal
+three-second timeout, retaining any unreaped child PID. A pending attach/mount/eject
+child returns `attachment-command-still-running`; close will not query filesystems,
+unmount or eject while that child remains active. A later close can reap it and
+clean up once it exits. Native controls cover an unkillable attach child, an
+unkillable mount child and a child that exits later. This bounds child waiting;
+it does not prove kernel operations cannot hang or explain the physical failure.
+Production integration still needs supervision that preserves transaction
+ownership for unfinished children and must not boot a VM while cleanup is pending.

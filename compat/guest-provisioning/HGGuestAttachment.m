@@ -15,8 +15,17 @@
 
 /* Fixed executable, fixed environment, no inherited descriptors except stdio.
  * Output is deliberately ignored: only fresh IOKit ancestry grants ownership. */
-static int run_tool(const char *executable, char *const arguments[])
+static BOOL child_finished(pid_t *child)
 {
+    if (!*child) return YES;
+    pid_t result = waitpid(*child, NULL, WNOHANG);
+    if (result == *child || (result < 0 && errno == ECHILD)) { *child = 0; return YES; }
+    return NO;
+}
+
+static int run_tool(const char *executable, char *const arguments[], pid_t *pending)
+{
+    if (*pending) return -1;
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attributes;
     if (posix_spawn_file_actions_init(&actions)) return -1;
@@ -34,20 +43,32 @@ static int run_tool(const char *executable, char *const arguments[])
     posix_spawnattr_destroy(&attributes);
     posix_spawn_file_actions_destroy(&actions);
     if (code) return -1;
+    *pending = child;
     for (unsigned int i = 0; i < 150; i++) {
         int status = 0;
         pid_t result = waitpid(child, &status, WNOHANG);
-        if (result == child) return WIFEXITED(status) && !WEXITSTATUS(status) ? 0 : -1;
-        if (result < 0 && errno != EINTR) return -1;
+        if (result == child) {
+            *pending = 0;
+            return WIFEXITED(status) && !WEXITSTATUS(status) ? 0 : -1;
+        }
+        if (result < 0 && errno == ECHILD) { *pending = 0; return -1; }
         struct timespec delay = {0, 20000000};
         nanosleep(&delay, NULL);
     }
     kill(child, SIGKILL);
-    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    // A child stuck inside a kernel filesystem operation may not terminate even
+    // after SIGKILL. Never turn the timeout into an unbounded blocking reap.
+    for (unsigned int i = 0; i < 50; i++) {
+        if (child_finished(pending)) return -1;
+        struct timespec delay = {0, 20000000};
+        nanosleep(&delay, NULL);
+    }
     return -1;
 }
 
-static int run_hdik(char *const arguments[]) { return run_tool("/usr/sbin/hdik", arguments); }
+static int run_hdik(char *const arguments[], pid_t *pending) {
+    return run_tool("/usr/sbin/hdik", arguments, pending);
+}
 
 static NSArray *inventory(const HGGuestDisk *disk, const char **error)
 {
@@ -118,7 +139,8 @@ static int open_mount(NSDictionary *row, HGGuestReadonlyMount *mount)
     char device[80];
     snprintf(device, sizeof(device), "/dev/%s", mount->bsd);
     char *arguments[] = {"mount_apfs", "-o", "rdonly,nobrowse,noexec,nosuid", device, mount->path, NULL};
-    int result = run_tool("/sbin/mount_apfs", arguments);
+    int result = run_tool("/sbin/mount_apfs", arguments, &mount->pending_child);
+    if (mount->pending_child) return -1;
     struct statfs fs;
     return !result && !statfs(mount->path, &fs) && mount_matches(mount, &fs) ? 0 : -1;
 }
@@ -146,7 +168,9 @@ int hg_guest_attachment_mount_readonly(HGGuestAttachment *attachment, const char
         }
         if (open_mount(group[@"system"], &attachment->system_mount) ||
             open_mount(group[@"data"], &attachment->data_mount)) {
-            *error = "readonly-mount-failed"; return -1;
+            *error = attachment->system_mount.pending_child || attachment->data_mount.pending_child ?
+                     "attachment-command-still-running" : "readonly-mount-failed";
+            return -1;
         }
         if (!hg_guest_disk_unchanged(attachment->disk)) { *error = "image-identity-changed"; return -1; }
         *error = NULL;
@@ -159,6 +183,11 @@ int hg_guest_attachment_close(HGGuestAttachment *attachment, const char **error)
     if (!attachment || !error || !attachment->disk) return -1;
     @autoreleasepool {
         for (unsigned int attempt = 0; attempt < 5; attempt++) {
+            if (!child_finished(&attachment->pending_child) ||
+                !child_finished(&attachment->system_mount.pending_child) ||
+                !child_finished(&attachment->data_mount.pending_child)) {
+                *error = "attachment-command-still-running"; return -1;
+            }
             NSArray *rows = inventory(attachment->disk, error);
             if (!rows) { *error = "attachment-cleanup-required"; return -1; }
             if (!rows.count) {
@@ -179,9 +208,12 @@ int hg_guest_attachment_close(HGGuestAttachment *attachment, const char **error)
             char device[80];
             snprintf(device, sizeof(device), "/dev/%s", [owned[@"bsd_name"] UTF8String]);
             char *arguments[] = {"hdik", "-e", device, NULL};
-            (void)run_hdik(arguments);
+            (void)run_hdik(arguments, &attachment->pending_child);
             struct timespec delay = {0, 100000000};
             nanosleep(&delay, NULL);
+        }
+        if (!child_finished(&attachment->pending_child)) {
+            *error = "attachment-command-still-running"; return -1;
         }
         NSArray *rows = inventory(attachment->disk, error);
         if (rows && !rows.count) {
@@ -211,7 +243,8 @@ int hg_guest_attachment_open(const HGGuestDisk *disk, HGGuestAttachment *attachm
         }
         attachment->disk = disk;
         char *arguments[] = {"hdik", "-nomount", "-drivekey", "write-protected=true", path, NULL};
-        int launched = run_hdik(arguments);
+        int launched = run_hdik(arguments, &attachment->pending_child);
+        if (attachment->pending_child) { *error = "attachment-command-still-running"; return -1; }
         BOOL pathUnchanged = !lstat(path, &current) && S_ISREG(current.st_mode) &&
             current.st_dev == disk->identity.st_dev && current.st_ino == disk->identity.st_ino;
         NSArray *rows = inventory(disk, error);

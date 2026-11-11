@@ -42,6 +42,7 @@ static int spawn_control(pid_t *pid, const char *path,
   strlcpy(mountPaths[index],argv[4],PATH_MAX);
   if(index && [scenario isEqual:@"mount-data-fail"])statusCode=1;
   else mounted[index]=1;
+  if([scenario isEqual:@"mount-unkillable"])timedWait=1;
   return 0;
  }
  if(strcmp(path,"/usr/sbin/hdik"))abort();
@@ -53,7 +54,8 @@ static int spawn_control(pid_t *pid, const char *path,
  } else {
   if(strcmp(argv[1],"-nomount") || strcmp(argv[2],"-drivekey") || strcmp(argv[3],"write-protected=true"))abort();
   attached=1;
-  if([scenario isEqual:@"timeout"])timedWait=1;
+  if([scenario isEqual:@"timeout"] || [scenario isEqual:@"unkillable"] ||
+     [scenario isEqual:@"late-exit"])timedWait=1;
   if([scenario isEqual:@"partial"])statusCode=1;
  }
  return 0;
@@ -63,7 +65,9 @@ static pid_t wait_control(pid_t pid,int *status,int options) {
  if(status)*status=statusCode<<8;return pid;
 }
 static int kill_control(pid_t pid,int signal) {
- if(pid!=123 || signal!=SIGKILL)abort();kills++;return 0;
+ if(pid!=123 || signal!=SIGKILL)abort();kills++;
+ if([scenario isEqual:@"timeout"])timedWait=0;
+ return 0;
 }
 static int sleep_control(const struct timespec *delay,struct timespec *remain) {
  (void)delay;(void)remain;return 0;
@@ -123,6 +127,7 @@ int main(int argc,char **argv){@autoreleasepool{
  HGGuestAttachment a={0};char *group=NULL;const char *error=NULL,*cleanup=NULL;
  int opened=hg_guest_attachment_open(&disk,&a,&group,&error);
  if(!opened && [scenario hasPrefix:@"mount-"])opened=hg_guest_attachment_mount_readonly(&a,&error);
+ if([scenario isEqual:@"late-exit"])timedWait=0;
  if([scenario isEqual:@"double-open"]) {
   char *second=NULL;const char *secondError=NULL;
   if(!hg_guest_attachment_open(&disk,&a,&second,&secondError) ||
@@ -207,6 +212,26 @@ int main(int argc,char **argv){@autoreleasepool{
         self.assertFalse(r['opened'])
         self.assertFalse(r['attached'])
         self.assertEqual(r['kills'], 1)
+        self.assertEqual(r['ejects'], 1)
+
+    def test_unkillable_child_reports_pending_without_racing_cleanup(self):
+        for scenario in ('unkillable', 'mount-unkillable'):
+            with self.subTest(scenario=scenario):
+                r = self.run_control(scenario)
+                self.assertFalse(r['opened'])
+                self.assertFalse(r['closed'])
+                self.assertTrue(r['attached'])
+                self.assertEqual(r['error'], 'attachment-command-still-running')
+                self.assertEqual(r['cleanup'], 'attachment-command-still-running')
+                self.assertEqual(r['kills'], 1)
+                self.assertEqual(r['ejects'], 0)
+                self.assertEqual(r['unmounts'], 0)
+
+    def test_child_that_exits_later_can_be_reaped_before_cleanup(self):
+        r = self.run_control('late-exit')
+        self.assertFalse(r['opened'])
+        self.assertTrue(r['closed'])
+        self.assertFalse(r['attached'])
         self.assertEqual(r['ejects'], 1)
 
     def test_busy_ejection_retries_and_persistent_failure(self):
