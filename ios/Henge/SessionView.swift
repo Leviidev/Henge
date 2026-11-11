@@ -643,6 +643,18 @@ struct SessionView: View {
         }
         HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
         var rc: Int32 = -1
+        // A saved RAM snapshot already contains the guest's live disk state.
+        // Do not inspect or provision its backing image before attempting resume.
+        let resumeAvailable = InstantResume.enabled && InstantResume.saved(for: mac, ramMB: ram, cpus: cpus) != nil
+        if !resumeAvailable, FileManager.default.isExecutableFile(atPath: Bundle.main.bundlePath + "/henge-root-helper") {
+            guard let report = henge_root_helper_inspect_disk(mac.disk.path) else {
+                error = "Henge could not verify this Mac's disk is available for a safe first start."
+                HengeLog.log("guest-setup", "cold boot stopped: read-only disk ownership or media check failed")
+                return
+            }
+            defer { free(report) }
+            HengeLog.log("guest-setup", String(cString: report))
+        }
         if InstantResume.enabled, let at = InstantResume.saved(for: mac, ramMB: ram, cpus: cpus) {
             HengeLog.log("resume", "picking up the Mac saved \(Int(Date().timeIntervalSince(at))) s ago")
             let t0 = Date()
