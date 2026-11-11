@@ -11,7 +11,13 @@ program='''#include <pthread.h>
 HvLifecycleGate hv_app_lifecycle=HV_LIFECYCLE_INITIALIZER,hv_cpu_lifecycle=HV_LIFECYCLE_INITIALIZER;
 pthread_mutex_t hv_lifecycle_state_mu=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int parked,returned,exited,kicker_stopped;static int m,ncpus=2,secondary_started[2],kicker_started;
-static pthread_t secondary_threads[2],kicker;static struct{void*root_blk,*aux_blk;}board;
+static pthread_t secondary_threads[2],kicker;
+static struct {_Atomic int halted;}cpus[2];
+static pthread_mutex_t pause_mu=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pause_cv=PTHREAD_COND_INITIALIZER;
+static int run_ended,pause_state;
+#define HV_HALT_SAVE 4
+static int hv_vm_finish_pause(void){return -1;}static struct{void*root_blk,*aux_blk;}board;
 #define HV_HALT_HOST 3
 static void hv_vm_cpu_qos(void){}
 static int hv_vm_run_cpu0(void){while(!atomic_load(&parked))usleep(1000);return 71;}

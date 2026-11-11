@@ -738,7 +738,8 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
     /* Preserve upstream's explicit native-Mac relabel diagnostic. Normal iOS
        loading still prefers validated conversions before metadata fallback. */
     const char *forcedRelabel = getenv("HV_PVG_RELABEL");
-    int forcedRelabelStage = forcedRelabel && atoi(forcedRelabel) >= 1 && atoi(forcedRelabel) <= 2 ? atoi(forcedRelabel) : 0;
+    int forcedRelabelStage = forcedRelabel && atoi(forcedRelabel) >= 1 && atoi(forcedRelabel) <= 3 ? atoi(forcedRelabel) : 0;
+    int loaded_at = -1;
     BOOL forceNativeRelabel = NO;
 #if !TARGET_OS_IPHONE
     forceNativeRelabel = forcedRelabelStage && !getenv("HV_PVG_NO_RELABEL");
@@ -761,10 +762,13 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
                 convertedRoute.UTF8String, libraryID.UTF8String, selectedProfileRecipe.UTF8String?:"unknown");
 #endif
     if (!library && !getenv("HV_PVG_NO_RELABEL")) {
-        int first = forcedRelabelStage ?: 1;
-        for (int stage = first; stage <= 2 && !library; stage++) {
+        int first = forcedRelabelStage ?: 2;
+        int last = forcedRelabelStage == 3 ? 3 : 2;
+        for (int stage = first; stage <= last && !library; stage++) {
             NSMutableData *candidate = [lib mutableCopy];
-            if (hv_metallib_relabel(candidate.mutableBytes, candidate.length, stage) <= 0) continue;
+            const char *why = NULL;
+            if (hv_metallib_relabel(candidate.mutableBytes, candidate.length, stage, &why) <= 0) continue;
+            if (why) [self complain:[NSString stringWithFormat:@"library: relabel stage %d partial: %s", stage, why]];
             dispatch_data_t data = dispatch_data_create(candidate.bytes, candidate.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             NSError *retryError = nil;
             library = [device newLibraryWithData:data error:&retryError];
@@ -772,6 +776,7 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
             if (library) agxSelected = hv_agx_library(candidate, libraryID, [NSString stringWithFormat:@"metadata-relabel-stage-%d", stage]);
 #endif
             if (library) {
+                loaded_at = stage;
                 if (!getenv("HV_PVG_RELABEL_QUIET"))
                     [self complain:[NSString stringWithFormat:@"library: metadata relabel stage %d accepted; pipeline compatibility remains separate", stage]];
             } else err = retryError ?: err;
@@ -781,9 +786,14 @@ static void capture_pipeline_descriptor(NSData *bytes, NSDictionary *functions, 
         [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
         return nil;
     }
-    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
-        const char *tf = getenv("HV_PVG_TRACE_FILE");
-        if (tf && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) {
+    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac. Also, unless
+           HV_SHADER_DUMP=0, the first 48 that had to be relabelled (Documents/shaders, as sent): what an OS that
+           refuses them was sent, for relabelling to be checked against on a Mac. */
+        static int relabelled_kept = 0;
+        const char *tf = getenv("HV_PVG_TRACE_FILE"), *sd = getenv("HV_SHADER_DUMP");
+        int keep = sd ? atoi(sd) != 0 : loaded_at > 0 && relabelled_kept < 48;
+        if (keep && !sd) relabelled_kept++;
+        if (tf && keep) {
             NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
             [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
             NSString *name = [NSString stringWithFormat:@"%@-%llx.metallib", library.functionNames.firstObject ?: @"lib", (unsigned long long)at];
@@ -1511,6 +1521,11 @@ static void sync_iosurface(HvObject *s, id<MTLDevice> device) {
        macOS 14's driver writes a compact one: u32 allocation at 0x10, width and height << 8 at 0x14 and 0x18, u32 row
        at 0x1c, bytes per pixel at 0x20 (BGRA 1920x1080: 007ec000 00078080 00043880 00001e00 00000004); one plane. */
     BOOL compact = hv_pvg_lite_compact_surfaces(lite) != 0;
+    if (getenv("HV_PVG_DESC_DUMP")) {
+        fprintf(stderr, "surface-desc %llu:", mapping);
+        for (int i = 0; i < 0x200; i += 4) fprintf(stderr, "%s%08x", i % 32 ? " " : "\n  ", *(const uint32_t *)(desc + i));
+        fprintf(stderr, "\n");
+    }
     uint32_t compact_planes = 1;
     if (compact) memcpy(&compact_planes, desc + 0x24, 4);
     uint8_t planes = compact ? (uint8_t)MIN(MAX(compact_planes, 1u), 4u) : desc[0x3e];
@@ -1666,6 +1681,11 @@ static void probe_yuv_texture(HvReplay *replay, id<MTLDevice> device, id<MTLComm
     o->on_mapping = h.mapping;
     NSNumber *key = @(h.mapping);
     HvObject *surface = canonical_surface([self currentSurface:h.mapping]);
+    if (hv_pvg_trace_on()) {
+        fprintf(stderr, "trace: mapped texture ref %u tag %#x size %u mapping %llu:", h.ref, h.tag, h.size, h.mapping);
+        for (int i = 0; i < 64; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(h.d + i));
+        fprintf(stderr, "\n");
+    }
     MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
     if (!surface) { [self makePrivateMappedTexture:o descriptor:t mapping:h.mapping]; return; }
     t.storageMode = MTLStorageModeShared;
@@ -2543,10 +2563,21 @@ typedef struct {
             buffers[i] = strong[i];
             offsets[i] = (NSUInteger)U64(12 + i * 12);
         }
+        if (tracing) for (uint32_t i = 0; i < count; i++) {
+            id<MTLBuffer> x = strong[i];
+            fprintf(stderr, "trace:  cbuf %u ref %u off %lu len %lu:", index + i, U32(8 + i * 12), (unsigned long)offsets[i], (unsigned long)x.length);
+            if (x && x.storageMode != MTLStorageModePrivate && offsets[i] < x.length)
+                for (NSUInteger k = 0; k < 96 && offsets[i] + k + 4 <= x.length; k += 4)
+                    fprintf(stderr, " %08x", *(uint32_t *)((uint8_t *)x.contents + offsets[i] + k));
+            fprintf(stderr, "\n");
+        }
         [e setBuffers:buffers offsets:offsets withRange:NSMakeRange(index, count)];
         break;
     }
-    case 207: [e setBufferOffset:(NSUInteger)U64(4) atIndex:U32(0)]; break;
+    case 207:
+        if (tracing) fprintf(stderr, "trace:  cbuf %u offset now %llu\n", U32(0), (unsigned long long)U64(4));
+        [e setBufferOffset:(NSUInteger)U64(4) atIndex:U32(0)];
+        break;
     case 206: {
         uint32_t index = U32(0), count = U32(4);
         if (count > 128) break;
@@ -3233,7 +3264,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 }
 
 - (void)showOnLayer:(uint64_t)mapping {
-    HvObject *surface = hv_pvg_lite_compact_surfaces(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_compact_surfaces(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]);
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
@@ -3483,7 +3514,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         return;
     }
     late = NO;
-    HvObject *surface = hv_pvg_lite_compact_surfaces(lite) ? [self currentSurface:mapping] : surfaces[@(mapping)];
+    HvObject *surface = hv_pvg_lite_compact_surfaces(lite) ? [self currentSurface:mapping] : (surfaces[@(mapping)] ?: [self newSurface:mapping]);
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     last_capture = now;
     [last_cb waitUntilCompleted]; /* the CPU copies the pixels here, so the GPU must be done with them */
@@ -3995,4 +4026,105 @@ int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *w, uint3
     if (!r->frame) return -1;
     *pixels = r->frame, *w = r->frame_w, *h = r->frame_h;
     return 0;
+}
+
+@interface HvReplay (Resume)
+- (void)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb;
+@end
+
+/* Instant resume: the CPUs are stopped. Finish what the guest handed over, then copy what only the GPU holds (it drew
+   into private memory and the guest has not asked for it back) into guest memory, where a replay made after a restore
+   reads it from. A texture in a heap goes with its heap's bytes, as the heap is what is made again from guest memory. */
+void hv_pvg_metal_quiesce(HvPvgMetal *m) {
+    if (!m) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    @autoreleasepool {
+        dispatch_sync(r->worker, ^{});
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+        dispatch_sync(r->worker, ^{
+            id<MTLCommandBuffer> cb = nil;
+            id<MTLBlitCommandEncoder> blit = nil;
+            unsigned copied = 0;
+            for (NSNumber *task in r->tasks) {
+                NSMutableDictionary<NSNumber *, HvObject *> *objs = r->tasks[task];
+                for (NSNumber *ref in objs) {
+                    HvObject *o = objs[ref];
+                    if (!o->guest_backed || !o->host_valid || !o->guest_stale) continue;
+                    if (o->parent && o->parent->heap_whole) continue;
+                    if (!cb) cb = [r->queue commandBuffer];
+                    [r page:o toGuest:YES task:task.unsignedIntValue blit:&blit commandBuffer:cb];
+                    o->guest_stale = NO;
+                    copied++;
+                }
+            }
+            [blit endEncoding];
+            if (cb) {
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+            fprintf(stderr, "hengevm: pvg-metal: quiesced, %u GPU-only objects copied to guest memory\n", copied);
+        });
+        dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
+    }
+}
+
+typedef struct DisplayState {
+    uint64_t on_screen;
+    uint32_t cursor_w, cursor_h, cursor_stride, cursor_shown;
+    int32_t hot_x, hot_y;
+} DisplayState;
+
+size_t hv_pvg_metal_display_state(HvPvgMetal *m, void *out, size_t cap) {
+    HvReplay *r = (__bridge HvReplay *)m;
+    __block size_t need = 0;
+    dispatch_sync(r->worker, ^{
+        os_unfair_lock_lock(&r->screen_lock);
+        size_t bits = r->cursor ? (size_t)r->cursor_stride * r->cursor_h : 0;
+        need = sizeof(DisplayState) + bits;
+        if (out && cap >= need) {
+            DisplayState d = {.on_screen = r->on_screen, .cursor_w = bits ? r->cursor_w : 0, .cursor_h = bits ? r->cursor_h : 0,
+                              .cursor_stride = bits ? r->cursor_stride : 0, .cursor_shown = r->cursor_shown,
+                              .hot_x = r->cursor_hot_x, .hot_y = r->cursor_hot_y};
+            memcpy(out, &d, sizeof d);
+            if (bits) memcpy((uint8_t *)out + sizeof d, r->cursor, bits);
+        }
+        os_unfair_lock_unlock(&r->screen_lock);
+    });
+    return need;
+}
+
+void hv_pvg_metal_set_display_state(HvPvgMetal *m, const void *in, size_t len) {
+    if (!m || len < sizeof(DisplayState)) return;
+    HvReplay *r = (__bridge HvReplay *)m;
+    DisplayState d;
+    memcpy(&d, in, sizeof d);
+    size_t bits = (size_t)d.cursor_stride * d.cursor_h;
+    if (len < sizeof d + bits || d.cursor_w > 512 || d.cursor_h > 512 || (bits && d.cursor_stride < d.cursor_w * 4)) bits = 0;
+    uint8_t *copy = bits ? malloc(bits) : NULL;
+    if (copy) memcpy(copy, (const uint8_t *)in + sizeof d, bits);
+    dispatch_sync(r->worker, ^{
+        @autoreleasepool {
+            id<MTLTexture> glyph = nil;
+            if (copy) {
+                MTLTextureDescriptor *ct = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                              width:d.cursor_w height:d.cursor_h mipmapped:NO];
+                ct.storageMode = MTLStorageModeShared;
+                glyph = [r->device newTextureWithDescriptor:ct];
+                [glyph replaceRegion:MTLRegionMake2D(0, 0, d.cursor_w, d.cursor_h) mipmapLevel:0 withBytes:copy bytesPerRow:d.cursor_stride];
+            }
+            os_unfair_lock_lock(&r->screen_lock);
+            if (copy) {
+                free(r->cursor);
+                r->cursor = copy, r->cursor_w = d.cursor_w, r->cursor_h = d.cursor_h, r->cursor_stride = d.cursor_stride;
+                r->cursor_hot_x = d.hot_x, r->cursor_hot_y = d.hot_y;
+                r->cursor_tex = glyph;
+            }
+            r->cursor_shown = d.cursor_shown != 0;
+            os_unfair_lock_unlock(&r->screen_lock);
+            r->on_screen = d.on_screen;
+            if (d.on_screen) [r present:d.on_screen];
+            [r drawCursor];
+        }
+    });
+    fprintf(stderr, "hengevm: pvg-metal: screen %llu and a %ux%u pointer restored\n", (unsigned long long)d.on_screen, d.cursor_w, d.cursor_h);
 }
