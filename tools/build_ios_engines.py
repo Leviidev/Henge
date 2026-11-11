@@ -78,7 +78,7 @@ def main():
     for rosetta, name, source in [(0, 'HengeMainlineEngine', pristine), (1, 'HengeRosettaEngine', ROOT)]:
         objects = dest / 'objects' / name
         run('make', '-C', source, '-j8', f'IB={objects}', f'IOS_DEPS={deps}',
-            f'IOS_CC={shlex.join(cc)}', f'ROSETTA_4K_CACHE={rosetta}', 'ios-lib')
+            f'IOS_CC={shlex.join(cc)}', f'ROSETTA_4K_CACHE={rosetta}', objects / 'libhengevm.a')
         flags = ['-std=c11', '-O2', '-fvisibility=hidden', '-Wall', '-Wextra',
                  f'-DHENGE_ENGINE_ROSETTA={rosetta}', f'-DHENGE_ROSETTA_4K_CACHE={rosetta}',
                  f'-DHENGE_MAINLINE_REVISION="{revision}"']

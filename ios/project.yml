@@ -67,6 +67,11 @@ targets:
           - "$(SRCROOT)/deps/lib"
         OTHER_LDFLAGS:
           - "$(inherited)"
+          # The Mac app loader is independent of the selected VM engine.
+          - "-lhengetl"
+          - "-lz"
+          - "-lbz2"
+          - "-lcompression"
           # On-device pairing for Built-in StikJIT (from Husk's src/rppairing-ios).
           - "-lhusk_rppairing"
           - "-framework"
@@ -87,7 +92,7 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make build/henge-agent.gz
+          make build/henge-agent.gz build/ios/libhengetl.a build/tl-samples.dmg
           python3 tools/build_ios_engines.py --sdk "$PLATFORM_NAME"
         basedOnDependencyAnalysis: false
     postBuildScripts:
@@ -111,6 +116,8 @@ targets:
         script: |
           set -e
           cp "$SRCROOT/../build/henge-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-agent.gz"
+          rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
+          cp -X "$SRCROOT/../build/tl-samples.dmg" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
         basedOnDependencyAnalysis: false
       - name: Embed StikJIT
         # As in Husk: the helper links StikJIT; it lives in the app's Frameworks

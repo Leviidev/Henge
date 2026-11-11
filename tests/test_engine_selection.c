@@ -5,11 +5,13 @@
 #include <assert.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 HengeDualMapping *henge_ios_jit_get_mapping(void) { return NULL; }
+extern _Atomic int henge_tl_ran;
 
 static int loaded(int rosetta) {
     int count = 0;
@@ -43,6 +45,16 @@ int main(int argc, char **argv) {
     setenv("HV_SOFTWARE_TSO", rosetta ? "0" : "1", 1);
     assert(!strcmp(henge_engine_revision(), revision));
     assert(loaded(rosetta) == 1 && loaded(!rosetta) == 0);
+    /* The translation layer may remap the app's JIT region. Neither selected
+       engine may boot, restore or install after that region has been used. */
+    atomic_store(&henge_tl_ran, 1);
+    assert(henge_vm_boot(NULL, NULL, NULL, 0, 0, 0, 1, error, sizeof error) == -1);
+    assert(strstr(error, "A Mac app ran"));
+    assert(henge_vm_resume(NULL, NULL, NULL, 0, 0, 0, 1, NULL, NULL, error, sizeof error) == -1);
+    assert(strstr(error, "A Mac app ran"));
+    assert(henge_vm_install(NULL, NULL, NULL, 0, NULL, NULL, 0, 1, error, sizeof error) == -1);
+    assert(strstr(error, "A Mac app ran"));
+    atomic_store(&henge_tl_ran, 0);
     assert(atoi(getenv("HV_ROSETTA")) == rosetta);
     assert(atoi(getenv("HV_SOFTWARE_TSO")) == rosetta);
     assert(!dlsym(RTLD_DEFAULT, "hv_vm_create"));

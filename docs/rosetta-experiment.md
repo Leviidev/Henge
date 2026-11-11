@@ -23,7 +23,7 @@ Hosts without `hw.optional.arm.FEAT_AFP` cannot enable Rosetta in this version.
 ## Isolation and maintenance
 
 The mainline pin is
-[`fb4307a5feceb3ec559cce011ffb69d7ed78a01c`](https://github.com/Leviidev/Henge/commit/fb4307a5feceb3ec559cce011ffb69d7ed78a01c).
+[`074b253eb97880c94ac6d2e1c6bac34e90fb8625`](https://github.com/Leviidev/Henge/commit/074b253eb97880c94ac6d2e1c6bac34e90fb8625).
 It is upstream main with the JIT startup and guest shutdown/restart fixes from
 PRs #46 and #50 already incorporated. Both engines use that exact lifecycle
 bridge, including JIT reuse.

@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage("henge.rosetta") private var intelApps = false
     @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
     @AppStorage(InstantResume.key) private var instantResume = false
+    @AppStorage(MacAppsFeature.key) private var macApps = false
 
     /// The second footer paragraph: how you click, given the selected input mode.
     private var inputDescription: String {
@@ -150,6 +151,12 @@ struct SettingsView: View {
                 Section("Instant Resume") {
                     Toggle("Resume where you left off", isOn: $instantResume)
                     Text("When you leave Henge, the running Mac is saved to storage, and opening it again picks up where it was in a few seconds, even after iOS closes Henge. The save is about the size of the Mac's memory in use, compressed. The Mac pauses while Henge is in the background, so its sound stops. Experimental.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section("Mac Apps") {
+                    Toggle("Mac apps without macOS", isOn: $macApps)
+                    Text("Bring in a .dmg or an .app (the + button on Home) and run it inside Henge through its own translation layer, without starting a Mac. Programs without windows run today; apps with windows don't yet. Experimental.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)

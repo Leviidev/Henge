@@ -18,6 +18,8 @@ static const HengeEngineAPI *engine;
 static void *engine_handle;
 static _Atomic int selected_rosetta, requested_rosetta;
 static int configured, attempted;
+/* The app owns this guard; each engine keeps its native bridge private. */
+_Atomic int henge_tl_ran;
 static char engine_path[PATH_MAX], engine_error[1024];
 
 int henge_rosetta_available(void) {
@@ -95,6 +97,10 @@ const char *henge_engine_revision(void) {
 }
 
 static const HengeEngineAPI *prepare_engine(char *err, size_t errlen) {
+    if (atomic_load(&henge_tl_ran)) {
+        snprintf(err, errlen, "A Mac app ran in this launch. Quit Henge (swipe it away) and open it again to start a Mac.");
+        return NULL;
+    }
     if (requested_rosetta != selected_rosetta) {
         snprintf(err, errlen, "The Rosetta setting has changed. Quit Henge and reopen it before starting or installing a Mac.");
         return NULL;

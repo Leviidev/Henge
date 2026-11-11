@@ -10,6 +10,8 @@ struct HomeView: View {
     @Binding var tab: RootView.Tab
     @State private var picking = false
     @State private var chosen: UUID?
+    @State private var showMacApps = false
+    @AppStorage(MacAppsFeature.key) private var macApps = false
 
     /// The Mac on show: the one picked, or the one used last.
     private var mac: VirtualMac? {
@@ -46,6 +48,7 @@ struct HomeView: View {
                     Menu {
                         Button("Install macOS…") { tab = .install }
                         Button("Bring in a Mac from a computer…") { picking = true }
+                        if macApps { Button("Mac Apps…") { showMacApps = true } }
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -55,6 +58,7 @@ struct HomeView: View {
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 if case let .success(url) = result { machines.importFolder(url) }
             }
+            .sheet(isPresented: $showMacApps) { MacAppsView() }
         }
     }
 
