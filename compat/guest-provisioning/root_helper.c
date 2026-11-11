@@ -1,7 +1,10 @@
-/* Read-only identity, payload and inherited-image inspection. No caller paths. */
+/* Identity/payload inspection and discard-only private-workspace recovery.
+ * No caller paths, mounting, journal replay or source image writes. */
 #include "HGGuestPayload.h"
 #include "HGGuestDisk.h"
 #include "HGGuestMedia.h"
+#include "HGGuestWorkspace.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +26,7 @@ static const HGGuestPayloadIdentity payload_identity = {
 int main(int argc, char **argv)
 {
     if (argc != 2 || (strcmp(argv[1], "probe-v1") && strcmp(argv[1], "verify-payload-v1") &&
-                     strcmp(argv[1], "inspect-image-v1"))) {
+                     strcmp(argv[1], "inspect-image-v1") && strcmp(argv[1], "recover-workspaces-v1"))) {
         fputs("unsupported helper operation\n", stderr);
         return 64;
     }
@@ -35,6 +38,37 @@ int main(int argc, char **argv)
         return verified;
     }
     int root = getuid() == 0 && geteuid() == 0 && getgid() == 0 && getegid() == 0;
+    if (!strcmp(argv[1], "recover-workspaces-v1")) {
+        if (verified) {
+            if (report) puts(report);
+            free(report);return verified;
+        }
+        free(report);
+        HGGuestWorkspaceSweep sweep={0};const char *error="root-required";
+        int status=-1,present=0;
+        if (root) {
+            /* Fixed root-owned namespace. Neither argv, environment, payload
+             * descriptor nor app preferences can select a cleanup path. This
+             * command does not create it; preparation will do that separately. */
+            int fd=open("/var/db/henge-guest-provisioning-v1",
+                        O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+            if (fd>=0) {
+                present=1;status=hg_guest_workspace_sweep(fd,&sweep,&error);close(fd);
+            } else if (errno==ENOENT) {
+                status=0;sweep.cleanup_complete=1;error=NULL;
+            } else error="workspace-parent-open";
+        }
+        printf("{\"schema\":1,\"operation\":\"recover-workspaces-v1\",\"root\":%s,"
+               "\"uid\":%u,\"euid\":%u,\"gid\":%u,\"egid\":%u,\"payload_verified\":true,"
+               "\"workspace_parent_present\":%s,\"namespace_bounded\":%s,"
+               "\"enumerated\":%u,\"candidates\":%u,\"recovered\":%u,\"busy\":%u,"
+               "\"retained\":%u,\"changed\":%u,\"ignored\":%u,\"cleanup_complete\":%s,"
+               "\"original_guest_disk_accessed\":false,\"volume_mounted\":false,\"error\":\"%s\"}\n",
+               root?"true":"false",getuid(),geteuid(),getgid(),getegid(),present?"true":"false",
+               status?"false":"true",sweep.enumerated,sweep.candidates,sweep.recovered,sweep.busy,
+               sweep.retained,sweep.changed,sweep.ignored,sweep.cleanup_complete?"true":"false",error?error:"");
+        return !root?77:status?65:0;
+    }
     if (!strcmp(argv[1], "inspect-image-v1")) {
         if (verified) {
             if (report) puts(report);

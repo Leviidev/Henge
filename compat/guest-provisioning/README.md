@@ -1,7 +1,7 @@
 # On-device guest provisioning
 
 This directory is an incomplete step toward automatic Sonoma compatibility
-installation. No production code currently mounts or modifies a guest disk.
+installation. No production code currently mounts or modifies an original guest disk.
 
 The TrollStore package builds and signs `henge-root-helper` from `root_helper.c`
 and adds `com.apple.private.security.no-sandbox` and
@@ -22,6 +22,10 @@ supplies a fixed environment, bounds output to 4095 bytes and kills/reaps a
 helper that does not complete within three seconds. Valid root identity and a
 verified bundled payload are required for a successful capability report. A failed or absent probe
 does not prevent normal VM use.
+
+After a successful startup probe, the app also requests the discard-only private
+workspace sweep described below. That operation uses a fixed root-owned
+namespace and never opens the original guest image.
 
 `python3 -m unittest discover -s tools/compat -p test_root_helper.py -v`
 exercises the native launcher with **test-only persona stubs**. It covers protocol
@@ -535,8 +539,8 @@ parses/replays those blocks, mounts the image, opens the source or publishes a
 disk. Source inode protection also refuses a source moved into the workspace.
 Unreceipted/invalid directories are preserved. Creation failure before a durable
 receipt can leave a small metadata-only directory, but no heavy artifacts may
-exist at that point. Cleanup of such incomplete bootstrap directories and
-production startup enumeration are not implemented yet.
+exist at that point. The startup sweep below reports incomplete bootstrap
+directories as retained; it never guesses that invalid ownership data is ours.
 
 Nineteen native sanitizer-backed cross-process controls cover abrupt exit,
 neutralized and torn copies, partial journals, orphan journals, source inode
@@ -546,5 +550,33 @@ The inventory boundary is stubbed there. A separate control using the production
 scanner created and neutralized an authored 4 GiB copy, exited without cleanup,
 then recovered it and its journal from another process. The original full source
 SHA-256 remained unchanged and no mounting/replay occurred. These are host
-controls, not device/root-helper startup or publication qualification. The module
-is compiled into the packaged helper but has no production command.
+controls, not device/root-helper startup or publication qualification.
+
+### Bounded startup recovery integration
+
+`hg_guest_workspace_sweep` inventories at most 256 parent entries before any
+cleanup. It reopens only exact workspace names with the same inode observed in
+that inventory, then invokes the discard-only recovery API. Live workspaces,
+invalid receipts, unknown entries and changed names remain untouched and are
+reported separately. A successful bounded sweep does not imply complete cleanup:
+`cleanup_complete` is false whenever anything was busy, retained, changed or
+ignored. An oversized inventory fails before deleting anything. The final parent
+directory sync is required before success.
+
+The root helper exposes `recover-workspaces-v1` after verifying its bound payload
+and root identity. It accepts no path or inherited image descriptor and uses only
+`/var/db/henge-guest-provisioning-v1`. Recovery does not create that namespace;
+absence is a successful empty sweep. A present directory must meet the same
+private root-ownership and no-ACL contract. The app invokes this command on its
+utility queue after the startup probe. Ordinary packages omit the helper.
+Retained data is logged; no force-cleanup, mounting or original disk access is
+performed. Native transport checks bounded integral counters, counter totals,
+cleanup status and explicit original-disk/mount refusals in the report.
+
+Twenty-six sanitizer-backed workspace test groups include multiple abandoned
+copies, live-workspace coexistence, unknown/bootstrap/symlink preservation,
+inventory bounds and pending media. Eleven root-helper process groups include
+recovery protocol/count failures, fixed command/no inherited image FD and
+unbound-payload refusal. Persona stubs do not prove device root access. Full app
+packaging and physical root-helper startup remain separate qualification gates;
+automatic guest installation, activation and publication are still incomplete.

@@ -33,4 +33,16 @@ int hg_guest_workspace_open(int private_parent_fd,const char *name,
 int hg_guest_workspace_discard(HGGuestWorkspace *workspace,const char **error);
 /* Releases descriptors/leases without deleting files. */
 void hg_guest_workspace_close(HGGuestWorkspace *workspace);
+
+typedef struct {
+    uint32_t enumerated, candidates, recovered, busy, retained, changed, ignored;
+    int cleanup_complete;
+} HGGuestWorkspaceSweep;
+/* Startup enumeration of the same trusted private parent. Preflights a maximum
+ * of 256 entries BEFORE cleanup, then reopens only exact workspace names with
+ * matching listed inode. Live/invalid/unknown entries are retained and reported.
+ * Success means a bounded sweep completed, not that every workspace was deleted;
+ * inspect cleanup_complete. The caller's parent descriptor is untouched. */
+int hg_guest_workspace_sweep(int private_parent_fd,HGGuestWorkspaceSweep *report,
+                             const char **error);
 #endif

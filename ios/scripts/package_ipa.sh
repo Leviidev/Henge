@@ -47,8 +47,9 @@ ENT="$STAGE/entitlements.plist"
 # HENGE_ENTITLEMENTS picks another file, as for xcodebuild (Henge/Henge.personal.entitlements for a free team).
 cp "$IOS/${HENGE_ENTITLEMENTS:-Henge/Henge.entitlements}" "$ENT"
 if [ "$TROLLSTORE" = true ]; then
-    # App-context persona qualification. This helper currently accepts only a
-    # read-only capability probe; guest mutation is intentionally unavailable.
+    # App-context persona qualification. The helper exposes verified probes,
+    # read-only inspection and discard-only private-copy recovery. Original
+    # guest mutation and mounting remain unavailable.
     # Entitlement names are literal dictionary keys, not plutil dotted key paths.
     python3 - "$ENT" <<'PY'
 import plistlib

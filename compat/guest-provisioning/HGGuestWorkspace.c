@@ -268,3 +268,61 @@ remove_directory:
     if (fsync(w->parent_fd)) { *error="workspace-parent-sync";return -1; }
     hg_guest_workspace_close(w);*error=NULL;return 0;
 }
+
+int hg_guest_workspace_sweep(int parent,HGGuestWorkspaceSweep *report,const char **error) {
+    if (!report || !error) return -1;
+    memset(report,0,sizeof(*report));*error="workspace-parent";
+    struct stat original,current;
+    if (!private_directory(parent,&original)) return -1;
+    typedef struct { char name[27];struct stat identity; } Candidate;
+    Candidate *items=calloc(256,sizeof(*items));
+    if (!items) { *error="workspace-sweep-allocation";return -1; }
+    int fd=openat(parent,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    DIR *dir=fd>=0?fdopendir(fd):NULL;int result=-1;
+    if (!dir) { if(fd>=0)close(fd);*error="workspace-enumeration";goto done; }
+    struct dirent *de;errno=0;
+    while ((de=readdir(dir))) {
+        if (!strcmp(de->d_name,".") || !strcmp(de->d_name,"..")) continue;
+        /* Do not partially clean a parent whose complete inventory is too big. */
+        if (report->enumerated==256) { *error="workspace-sweep-bound";goto done; }
+        report->enumerated++;
+        if (workspace_name(de->d_name)) {
+            Candidate *c=&items[report->candidates++];
+            memcpy(c->name,de->d_name,27);
+            if (fstatat(parent,c->name,&c->identity,AT_SYMLINK_NOFOLLOW)) {
+                *error="workspace-sweep-changed";goto done;
+            }
+        } else report->ignored++;
+        errno=0;
+    }
+    if (errno) { *error="workspace-enumeration";goto done; }
+    closedir(dir);dir=NULL;
+    if (!private_directory(parent,&current) || !inode(&original,&current)) goto done;
+    for (uint32_t i=0;i<report->candidates;i++) {
+        Candidate *c=&items[i];HGGuestWorkspace w=HG_GUEST_WORKSPACE_INIT;
+        if (fstatat(parent,c->name,&current,AT_SYMLINK_NOFOLLOW) || !inode(&c->identity,&current)) {
+            report->changed++;continue;
+        }
+        const char *failure=NULL;
+        if (hg_guest_workspace_open(parent,c->name,&w,&failure)) {
+            if (failure && !strcmp(failure,"workspace-in-use")) report->busy++;
+            else report->retained++;
+            continue;
+        }
+        if (!inode(&c->identity,&w.directory_identity)) report->changed++;
+        else if (hg_guest_workspace_discard(&w,&failure)) report->retained++;
+        else report->recovered++;
+        hg_guest_workspace_close(&w);
+    }
+    /* Also makes parent removals durable if one discard encountered a transient
+     * final sync failure. A failed sweep never claims durable completion. */
+    if (!private_directory(parent,&current) || !inode(&original,&current)) {
+        *error="workspace-parent";goto done;
+    }
+    if (fsync(parent)) { *error="workspace-parent-sync";goto done; }
+    report->cleanup_complete=!(report->busy || report->retained || report->changed || report->ignored);
+    *error=NULL;result=0;
+done:
+    if (dir) closedir(dir);
+    free(items);return result;
+}

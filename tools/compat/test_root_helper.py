@@ -32,6 +32,7 @@ class RootHelperTests(unittest.TestCase):
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <string.h>
 #include "HengeRootHelper.h"
 /* Only this control executable supplies fake persona functions. */
 int posix_spawnattr_set_persona_np(const posix_spawnattr_t *a, uid_t u, uint32_t f)
@@ -44,7 +45,8 @@ int main(int argc, char **argv) {
     if (getenv("HENGE_CONTROL_INHERITED_FD")) {
         int fd = open("/dev/null", O_RDONLY); dup2(fd, 96); close(fd);
     }
-    char *p = argc == 2 ? henge_root_helper_inspect_disk(argv[1]) : henge_root_helper_probe();
+    char *p = argc == 2 && !strcmp(argv[1],"--recover") ? henge_root_helper_recover_workspaces() :
+              argc == 2 ? henge_root_helper_inspect_disk(argv[1]) : henge_root_helper_probe();
     if (!p) return 1; puts(p); free(p); return 0; }
 ''')
         cls.runner = macos / 'Control'
@@ -60,6 +62,7 @@ int main(int argc, char **argv) {
                         '-fobjc-arc', str(ROOT / 'compat/guest-provisioning/HGGuestPayload.m'),
                         str(ROOT / 'compat/guest-provisioning/HGGuestDisk.c'),
                         str(ROOT / 'compat/guest-provisioning/HGGuestMedia.m'),
+                        str(ROOT / 'compat/guest-provisioning/HGGuestWorkspace.c'),
                         '-framework', 'Foundation', '-lz',
                         '-o', str(cls.real_helper)], check=True)
 
@@ -77,7 +80,7 @@ int main(int argc, char **argv) {
                               env={**os.environ, **environment})
 
     def test_helper_rejects_every_other_operation(self):
-        for args in ([], ['mount'], ['probe-v1', '/some/disk']):
+        for args in ([], ['mount'], ['probe-v1', '/some/disk'], ['recover-workspaces-v1', '/some/path']):
             result = subprocess.run([str(self.real_helper), *args], capture_output=True)
             self.assertEqual(result.returncode, 64)
             self.assertFalse(result.stdout)
@@ -92,7 +95,7 @@ int main(int argc, char **argv) {
         self.assertFalse(report['guest_disk_accessed'])
 
     def test_unbound_helper_never_accepts_payload_resources(self):
-        for operation in ('verify-payload-v1', 'inspect-image-v1'):
+        for operation in ('verify-payload-v1', 'inspect-image-v1', 'recover-workspaces-v1'):
             result = subprocess.run([str(self.real_helper), operation], capture_output=True)
             self.assertEqual(result.returncode, 65)
             report = json.loads(result.stdout)
@@ -123,6 +126,31 @@ int main(int argc, char **argv) {
         start = time.monotonic()
         self.assertEqual(self.run_probe(HENGE_CONTROL_DENY_PERSONA='1').returncode, 1)
         self.assertLess(time.monotonic() - start, 1)
+
+    def test_recovery_protocol_counters_and_fixed_operation(self):
+        valid = dict(schema=1, operation='recover-workspaces-v1', root=True,
+                     uid=0, euid=0, gid=0, egid=0, payload_verified=True,
+                     workspace_parent_present=False, namespace_bounded=True,
+                     enumerated=0, candidates=0, recovered=0, busy=0, retained=0,
+                     changed=0, ignored=0, cleanup_complete=True,
+                     original_guest_disk_accessed=False, volume_mounted=False)
+        clean = dict(valid, workspace_parent_present=True, enumerated=2, candidates=2, recovered=2)
+        pending = dict(clean, recovered=1, retained=1, cleanup_complete=False)
+        cases = [(valid, True), (clean, True), (pending, True),
+                 (dict(pending, cleanup_complete=True), False),
+                 (dict(clean, workspace_parent_present=False), False),
+                 (dict(clean, candidates=1), False), (dict(clean, recovered=1), False),
+                 (dict(valid, busy=False), False), (dict(valid, changed='0'), False),
+                 (dict(valid, enumerated=257), False), (dict(valid, ignored=0.5), False),
+                 (dict(valid, namespace_bounded=False), False),
+                 (dict(valid, original_guest_disk_accessed=True), False),
+                 (dict(valid, volume_mounted=True), False)]
+        prefix = 'if(argc!=2 || strcmp(argv[1],"recover-workspaces-v1") || fcntl(3,F_GETFD)!=-1)return 66;'
+        for report, accepted in cases:
+            with self.subTest(report=report):
+                self.fixture(prefix + 'puts(' + json.dumps(json.dumps(report)) + '); return 0;')
+                result = self.run_probe(image='--recover')
+                self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
 
     def test_parent_environment_and_descriptors_are_not_inherited(self):
         valid = json.dumps(dict(schema=1, operation='probe-v1', root=True, uid=0,

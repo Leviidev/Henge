@@ -9,6 +9,17 @@
 #include <unistd.h>
 
 int main(int argc,char **argv) {
+    if (argc==3 && !strcmp(argv[1],"sweep")) {
+        int parent=open(argv[2],O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+        HGGuestWorkspaceSweep report={0};const char *error=NULL;
+        int status=hg_guest_workspace_sweep(parent,&report,&error);
+        printf("{\"passed\":%s,\"error\":\"%s\",\"enumerated\":%u,\"candidates\":%u,"
+               "\"recovered\":%u,\"busy\":%u,\"retained\":%u,\"changed\":%u,\"ignored\":%u,\"cleanup_complete\":%s}\n",
+               status?"false":"true",error?error:"",report.enumerated,report.candidates,
+               report.recovered,report.busy,report.retained,report.changed,report.ignored,
+               report.cleanup_complete?"true":"false");
+        if(parent>=0)close(parent);return status?1:0;
+    }
     if (argc!=4) return 64;
     const char *error=NULL;
     HGGuestWorkspace workspace=HG_GUEST_WORKSPACE_INIT;

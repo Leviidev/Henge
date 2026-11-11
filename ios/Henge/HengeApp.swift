@@ -21,6 +21,14 @@ struct HengeApp: App {
                 }
                 defer { free(report) }
                 HengeLog.log("guest-setup", String(cString: report))
+                // Discard only abandoned unpublished helper copies. A live
+                // workspace or unknown data is retained, and no Mac is mounted.
+                guard let recovery = henge_root_helper_recover_workspaces() else {
+                    HengeLog.log("guest-setup", "private workspace recovery could not be verified")
+                    return
+                }
+                defer { free(recovery) }
+                HengeLog.log("guest-setup", String(cString: recovery))
             }
         }
         HengeLog.log("boot", "address space: \(henge_largest_reservation_gb()) GB can be reserved in one piece")

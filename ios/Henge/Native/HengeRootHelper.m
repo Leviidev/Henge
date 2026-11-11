@@ -6,10 +6,19 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+static long long bounded_count(NSDictionary *report,NSString *key)
+{
+    id value=report[key];
+    if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value)==CFBooleanGetTypeID()) return -1;
+    long long n=[value longLongValue];
+    return n>=0 && n<=256 && [value doubleValue]==(double)n?n:-1;
+}
 
 static double monotonic_now(void)
 {
@@ -110,7 +119,22 @@ static char *run_helper(const char *operation, int image)
             ![report[@"root"] isEqual:@YES] || ![report[@"uid"] isEqual:@0] ||
             ![report[@"euid"] isEqual:@0] || ![report[@"gid"] isEqual:@0] ||
             ![report[@"egid"] isEqual:@0] || ![report[@"payload_verified"] isEqual:@YES]) return NULL;
-        if (image < 0) {
+        if (!strcmp(operation,"recover-workspaces-v1")) {
+            long long total=bounded_count(report,@"enumerated"),candidates=bounded_count(report,@"candidates"),
+                recovered=bounded_count(report,@"recovered"),busy=bounded_count(report,@"busy"),
+                retained=bounded_count(report,@"retained"),changed=bounded_count(report,@"changed"),
+                ignored=bounded_count(report,@"ignored");
+            BOOL complete=!(busy || retained || changed || ignored);
+            id present=report[@"workspace_parent_present"];
+            if (total<0 || candidates<0 || recovered<0 || busy<0 || retained<0 || changed<0 || ignored<0 ||
+                candidates+ignored!=total || recovered+busy+retained+changed!=candidates ||
+                ![report[@"namespace_bounded"] isEqual:@YES] ||
+                ![report[@"original_guest_disk_accessed"] isEqual:@NO] ||
+                ![report[@"volume_mounted"] isEqual:@NO] ||
+                (![present isEqual:@YES] && ![present isEqual:@NO]) ||
+                ([present isEqual:@NO] && total) ||
+                ![report[@"cleanup_complete"] isEqual:@(complete)]) return NULL;
+        } else if (image < 0) {
             if (![report[@"guest_disk_accessed"] isEqual:@NO]) return NULL;
         } else if (![report[@"image_inspected"] isEqual:@YES] ||
                    ![report[@"exclusive_lease_verified"] isEqual:@YES] ||
@@ -126,6 +150,11 @@ static char *run_helper(const char *operation, int image)
 char *henge_root_helper_probe(void)
 {
     return run_helper("probe-v1", -1);
+}
+
+char *henge_root_helper_recover_workspaces(void)
+{
+    return run_helper("recover-workspaces-v1", -1);
 }
 
 char *henge_root_helper_inspect_disk(const char *path)

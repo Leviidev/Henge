@@ -94,6 +94,16 @@ static int test_sync(int fd) {
             self.assertFalse(self.workspace.exists())
         return d
 
+    def sweep(self, valid=True, mode=''):
+        r = subprocess.run([str(self.control), 'sweep', str(self.parent)],
+                           capture_output=True, text=True, timeout=10,
+                           env={**os.environ, 'HENGE_WORKSPACE_TEST': mode})
+        self.assertEqual(r.returncode, 0 if valid else 1, r.stderr + r.stdout)
+        d = json.loads(r.stdout)
+        self.assertEqual(d['passed'], valid)
+        self.assertEqual(self.original, self.fixture.path.read_bytes())
+        return d
+
     def test_cross_process_recovery_after_abrupt_exit(self):
         self.create()
         self.assertEqual(self.workspace.stat().st_mode & 0o777, 0o700)
@@ -274,6 +284,85 @@ static int test_sync(int fd) {
                 finally:
                     subprocess.run(['chmod', '-N', str(path)], check=True)
         self.recover()
+
+    def test_sweep_recovers_multiple_abandoned_workspaces(self):
+        self.create()
+        first = self.workspace
+        self.create('roles')
+        second = self.workspace
+        r = self.sweep()
+        self.assertEqual((r['enumerated'], r['candidates'], r['recovered']), (2, 2, 2))
+        self.assertTrue(r['cleanup_complete'])
+        self.assertFalse(first.exists() or second.exists())
+        self.assertTrue(self.sweep()['cleanup_complete'])
+
+    def test_sweep_skips_live_workspace_and_cleans_abandoned_copy(self):
+        self.create('roles')
+        abandoned = self.workspace
+        process = subprocess.Popen([str(self.control), 'hold', str(self.fixture.path), str(self.parent)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        live = self.parent / json.loads(process.stdout.readline())['workspace']
+        r = self.sweep()
+        self.assertEqual((r['recovered'], r['busy']), (1, 1))
+        self.assertFalse(r['cleanup_complete'])
+        self.assertFalse(abandoned.exists())
+        self.assertTrue(live.exists())
+        process.communicate('\n', timeout=10)
+        self.assertTrue(self.sweep()['cleanup_complete'])
+
+    def test_sweep_preserves_invalid_bootstrap_and_unknown_names(self):
+        self.create()
+        invalid = self.parent / ('henge-txn-' + '0' * 16)
+        invalid.mkdir(mode=0o700)
+        (invalid / 'owner').write_bytes(b'partial')
+        unknown = self.parent / 'unknown'
+        unknown.write_bytes(b'preserve')
+        r = self.sweep()
+        self.assertEqual((r['recovered'], r['retained'], r['ignored']), (1, 1, 1))
+        self.assertFalse(r['cleanup_complete'])
+        self.assertEqual((invalid / 'owner').read_bytes(), b'partial')
+        self.assertEqual(unknown.read_bytes(), b'preserve')
+
+    def test_sweep_preflights_count_bound_before_any_deletion(self):
+        self.create('roles')
+        extras = [self.parent / f'unknown-{i}' for i in range(256)]
+        for path in extras:
+            path.touch(mode=0o600)
+        self.assertEqual(self.sweep(False)['error'], 'workspace-sweep-bound')
+        self.assertTrue(self.clone.exists())
+        self.assertTrue(all(p.exists() for p in extras))
+        for path in extras:
+            path.unlink()
+        self.assertTrue(self.sweep()['cleanup_complete'])
+
+    def test_sweep_reports_retained_media_without_claiming_complete(self):
+        self.create('roles')
+        r = self.sweep(mode='busy')
+        self.assertEqual(r['retained'], 1)
+        self.assertFalse(r['cleanup_complete'])
+        self.assertTrue(self.clone.exists())
+        self.assertTrue(self.sweep()['cleanup_complete'])
+
+    def test_sweep_never_follows_workspace_symlinks(self):
+        self.create()
+        link = self.parent / ('henge-txn-' + '0' * 16)
+        link.symlink_to(self.fixture.path.parent, target_is_directory=True)
+        r = self.sweep()
+        self.assertEqual((r['recovered'], r['retained']), (1, 1))
+        self.assertTrue(link.is_symlink())
+
+    def test_sweep_rejects_untrusted_parent_before_enumeration(self):
+        self.create()
+        self.parent.chmod(0o755)
+        try:
+            r = self.sweep(False)
+            self.assertEqual(r['enumerated'], 0)
+            self.assertTrue(self.clone.exists())
+        finally:
+            self.parent.chmod(0o700)
+        self.assertTrue(self.sweep()['cleanup_complete'])
 
 
 if __name__ == '__main__':
