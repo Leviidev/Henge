@@ -272,3 +272,29 @@ establish integrity, not the authenticity of arbitrary external manifests; the
 signed app's resources are the trust anchor. Delivery to Sonoma, automatic normal
 application activation and VLC packaging remain incomplete, and this payload
 has not yet run in the iPad's guest.
+
+The complete TrollStore package at source commit `f032950ccfa6` also passed.
+Inspection of the finished IPA verified its embedded archive hash, length,
+manifest hash, closed member inventory and exact per-member hashes/modes, plus
+the app and root-helper signatures. The embedded payload matched the independent
+build identity `731feb3fc381b29943d177e2c24e7be4ec456e8d71c358e22067e701d187d20d`.
+No new package was installed on the unavailable iPad.
+
+### Automatic pinned VLC build reference
+
+The VLC builder no longer requires a manually supplied reference app. Its
+`--fetch` path acquires the pinned official arm64 3.0.24 image, checks its exact
+56,960,605-byte length and SHA-256 against `reference.lock.json`, mounts it
+read-only at a private mountpoint, verifies the Apple-anchored VideoLAN Developer
+ID requirement, app version, architecture and core hash, and copies it into a
+locked build cache. It verifies the copy and detaches before publishing it.
+Cache reuse and explicit read-only reference paths are also verified. The image
+hash matched [VideoLAN's published checksum](https://download.videolan.org/pub/videolan/vlc/3.0.24/macosx/vlc-3.0.24-arm64.dmg.sha256).
+
+Actual reference acquisition and cache reuse passed on the Mac; the temporary
+volume was detached. All nine patched plugins then built from the pinned source
+archives without `--vlc-app`. Six acquisition controls passed, including corrupt
+or oversized input rejection, no implicit fetch, failed-mount cleanup, reuse
+verification and retention of a staging directory after failed detach instead
+of recursively deleting a mounted filesystem. This removes a build-time manual
+input; it does not integrate VLC into the release payload or guest installation.

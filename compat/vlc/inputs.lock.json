@@ -23,7 +23,7 @@
     }
   },
   "requirements": {
-    "reference_vlc_app": "Official VLC3.0.24 arm64 supplied by operator; read-only use of libvlccore/Sparkle and unmodified bundle resources",
+    "reference_vlc_app": "Pinned official VLC3.0.24 arm64; automatic acquisition with --fetch, hash/length/Developer ID/core verification via reference.lock.json; explicit read-only --vlc-app remains supported",
     "minimum_macos": "14.0",
     "x265": "4.1 build215, assembly disabled",
     "ffmpeg": "8.1.2 minimal static AAC/MOV build",

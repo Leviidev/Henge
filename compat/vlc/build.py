@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the optional VLC3.0.24 arm64 compatibility plugins from pinned sources.
 
-Requires an operator-supplied official VLC.app, read only. Never installs plugins.
+Uses a pinned official VLC.app reference, read only. Never installs plugins.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tarfile
 import urllib.request
+from reference import obtain as obtain_reference, verify_app as verify_reference
 
 HERE=Path(__file__).resolve().parent
 
@@ -43,12 +44,15 @@ def unpack(archive,destination):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--vlc-app',type=Path,required=True);p.add_argument('--archives',type=Path,required=True)
+    p.add_argument('--vlc-app',type=Path);p.add_argument('--archives',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True);p.add_argument('--fetch',action='store_true')
     p.add_argument('--prepare-only',action='store_true');p.add_argument('--jobs',type=int,default=4)
-    a=p.parse_args();app=a.vlc_app.resolve();out=a.output.resolve();archives=a.archives.resolve()
+    a=p.parse_args();out=a.output.resolve();archives=a.archives.resolve()
     if out.exists():raise SystemExit('Output must be a new directory')
     if not 1<=a.jobs<=16:raise SystemExit('jobs must be1..16')
+    app=a.vlc_app.resolve() if a.vlc_app else obtain_reference(archives,a.fetch)
+    reference_lock=json.loads((HERE/'reference.lock.json').read_text())
+    verify_reference(app,reference_lock)
     info=plistlib.loads((app/'Contents/Info.plist').read_bytes())
     if info.get('CFBundleShortVersionString')!='3.0.24' or info.get('CFBundleIdentifier')!='org.videolan.vlc':raise SystemExit('Official VLC3.0.24 reference required')
     if subprocess.check_output(['lipo','-archs',str(app/'Contents/MacOS/VLC')],text=True).strip()!='arm64':raise SystemExit('Thin arm64 VLC reference required')
@@ -70,7 +74,7 @@ def main():
     provenance=json.loads((HERE/'source-provenance.json').read_text())
     for name,ident in provenance['changed_sources'].items():
         if sha(vlc/name)!=ident['after_sha256']:raise ValueError(f'Patched source mismatch: {name}')
-    receipt={'source_lock':lock,'patched_sources':provenance,'reference_app_version':'3.0.24','reference_core_sha256':sha(app/'Contents/MacOS/lib/libvlccore.dylib'),'xcode':subprocess.check_output(['xcodebuild','-version'],text=True).strip(),'minimum_macos':'14.0','state':'prepared; not installed'}
+    receipt={'source_lock':lock,'patched_sources':provenance,'reference_app_version':'3.0.24','reference_core_sha256':sha(app/'Contents/MacOS/lib/libvlccore.dylib'),'reference_provenance':{'mode':'explicit-readonly'if a.vlc_app else'pinned-automatic','lock_sha256':sha(HERE/'reference.lock.json'),'official_signature_verified':True},'xcode':subprocess.check_output(['xcodebuild','-version'],text=True).strip(),'minimum_macos':'14.0','state':'prepared; not installed'}
     (out/'build-receipt.json').write_text(json.dumps(receipt,indent=2))
     if a.prepare_only:return
     prefix=f'-ffile-prefix-map={out}=.'

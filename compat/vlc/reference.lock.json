@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "filename": "vlc-3.0.24-arm64.dmg",
+  "url": "https://download.videolan.org/pub/videolan/vlc/3.0.24/macosx/vlc-3.0.24-arm64.dmg",
+  "checksum_url": "https://download.videolan.org/pub/videolan/vlc/3.0.24/macosx/vlc-3.0.24-arm64.dmg.sha256",
+  "sha256": "64a89d93cdd30b0e97131743e246373db82d6826ea882d265d46d74b136da2b7",
+  "bytes": 56960605,
+  "bundle_identifier": "org.videolan.vlc",
+  "version": "3.0.24",
+  "architecture": "arm64",
+  "team_identifier": "75GAHG3SZQ",
+  "core_sha256": "720eaa8b2664314f6d027a3934c76020affaecbdfda7e0d335d25658c730241c"
+}
