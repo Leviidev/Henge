@@ -580,3 +580,55 @@ recovery protocol/count failures, fixed command/no inherited image FD and
 unbound-payload refusal. Persona stubs do not prove device root access. Full app
 packaging and physical root-helper startup remain separate qualification gates;
 automatic guest installation, activation and publication are still incomplete.
+
+### Explicit write authority and immutable publication intent
+
+`HGGuestWriteAuthority` requires a caller-opened `O_RDWR` witness for the exact
+leased source inode. It never upgrades a read-only input or opens the source for
+writing. The trusted transport must attest the caller UID; a request-supplied UID
+is not acceptable. Both source and its parent must belong to that principal.
+The transport must also establish the app's namespace rights; UNIX ownership
+does not attest sandbox permission. The intended TrollStore app is signed with
+no-sandbox, but its actual caller identity/rights still need a qualified bridge.
+The parent must permit owner write/search, exclude group/other write, and have no
+extended ACL or special flags. The single-link source must also have ordinary
+flags and no ACL. A world-writable victim file alone cannot grant root rename
+authority over another owner's directory. The existing source lease, independent
+close-on-exec witness/parent descriptors and exact parent/name binding are
+revalidated; later contents, permissions, ACL or namespace changes invalidate
+the authority. Borrowed descriptors and their offsets are preserved.
+
+`HGGuestPublicationIntent` writes a fixed, exclusive, mode-0600 `publication`
+record before any metadata handoff or exchange. Creation requires that write
+authority, a revalidated private workspace/source receipt, unchanged leased
+source/copy, complete role restoration and empty media on both images. The
+record binds workspace/target-parent/original/copy inode identities, source/copy
+names, original metadata and a trusted build payload ID. It is synchronized with
+its directory, read back and reopened read-only. Source disk contents are never
+written by this API. The record itself does not prove activation or authorize
+publication.
+
+Restart inspection reopens the verified workspace and immutable record. Given an
+opened target-parent descriptor, it classifies the two retained directory entries
+as original-active or copy-active, rejecting unknown inode pairs. It accepts no
+source path from the record. This classification is evidence of rename position
+only, not content integrity, media exclusion, permission to exchange/delete or
+successful guest boot. Generic workspace recovery refuses the `publication`
+entry, preserving both files even for an incomplete/corrupt record. Closing an
+intent never deletes it or either image.
+
+Eleven native sanitizer groups cover explicit witness/principal binding,
+namespace permissions, aliases, ACLs, late changes and borrowed FD preservation.
+Eight intent groups cover process-exit reopen, authored-fixture atomic
+exchange/swap-back classification, unknown pairs, unrestored/tainted copies,
+busy media, sync/readback failure and generic cleanup preservation. Principal
+identity is test-supplied there, not proof of kernel caller attestation.
+
+A separate production-scanner host control used a COW copy of the authored
+4 GiB fixture, reopened its intent in separate processes before/after an explicit
+test-only atomic exchange and swap-back, and verified the original full SHA-256.
+Generic cleanup preserved both files. The intent API itself performs no exchange.
+There is still no production publication command, attested write-bearing app
+transport, ownership handoff/exchange supervisor, restart rollback, health/commit
+policy or snapshot invalidation integration. These must be implemented and
+qualified before any original guest disk mutation is enabled.

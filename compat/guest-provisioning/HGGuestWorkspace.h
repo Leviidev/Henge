@@ -33,6 +33,9 @@ int hg_guest_workspace_open(int private_parent_fd,const char *name,
 int hg_guest_workspace_discard(HGGuestWorkspace *workspace,const char **error);
 /* Releases descriptors/leases without deleting files. */
 void hg_guest_workspace_close(HGGuestWorkspace *workspace);
+/* Revalidate the private named directory and protected source receipt while
+ * retaining the existing lease. Does not open or inspect the source image. */
+int hg_guest_workspace_unchanged(const HGGuestWorkspace *workspace);
 
 typedef struct {
     uint32_t enumerated, candidates, recovered, busy, retained, changed, ignored;

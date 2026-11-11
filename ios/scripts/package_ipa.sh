@@ -115,6 +115,8 @@ PY
         "$IOS/../compat/guest-provisioning/HGGuestRoles.c" \
         "$IOS/../compat/guest-provisioning/HGGuestRoleWrite.c" \
         "$IOS/../compat/guest-provisioning/HGGuestWorkspace.c" \
+        "$IOS/../compat/guest-provisioning/HGGuestWriteAuthority.c" \
+        "$IOS/../compat/guest-provisioning/HGGuestPublicationIntent.c" \
         "$IOS/../compat/guest-provisioning/HGGuestAttachment.m" \
         "$IOS/../compat/guest-provisioning/HGGuestMedia.m" -framework Foundation -lz \
         -o "$SAPP/henge-root-helper"

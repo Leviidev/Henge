@@ -88,6 +88,16 @@ static int read_receipt(HGGuestWorkspace *w,struct stat *identity) {
 done:
     close(fd);return good?0:-1;
 }
+int hg_guest_workspace_unchanged(const HGGuestWorkspace *w) {
+    if(!w || w->parent_fd<0 || w->directory_fd<0 || w->cleared || w->removed || !named_directory(w))return 0;
+    HGGuestWorkspace view=*w;struct stat receipt_identity;
+    if(read_receipt(&view,&receipt_identity))return 0;
+    return inode(&view.source_identity.identity,&w->source_identity.identity) &&
+        view.source_identity.identity.st_size==w->source_identity.identity.st_size &&
+        view.source_identity.first_apfs_lba==w->source_identity.first_apfs_lba &&
+        view.source_identity.last_apfs_lba==w->source_identity.last_apfs_lba &&
+        !memcmp(view.source_identity.disk_uuid,w->source_identity.disk_uuid,16);
+}
 void hg_guest_workspace_close(HGGuestWorkspace *w) {
     if (!w) return;
     if (w->directory_fd>=0) close(w->directory_fd);
