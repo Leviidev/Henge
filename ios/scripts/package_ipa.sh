@@ -46,13 +46,23 @@ cp -R "$APP" "$STAGE/Payload/"
 ENT="$STAGE/entitlements.plist"
 # HENGE_ENTITLEMENTS picks another file, as for xcodebuild (Henge/Henge.personal.entitlements for a free team).
 cp "$IOS/${HENGE_ENTITLEMENTS:-Henge/Henge.entitlements}" "$ENT"
-BANNED_KEYS=("com.apple.private.cs.debugger" "dynamic-codesigning" "com.apple.private.skip-library-validation")
-if [ "$TROLLSTORE" = true ]; then for k in "${BANNED_KEYS[@]}"; do plutil -remove "$k" "$ENT" 2>/dev/null || true; done; fi
 if [ "$TROLLSTORE" = true ]; then
     # App-context persona qualification. This helper currently accepts only a
     # read-only capability probe; guest mutation is intentionally unavailable.
-    plutil -insert com.apple.private.security.no-sandbox -bool true "$ENT"
-    plutil -insert com.apple.private.persona-mgmt -bool true "$ENT"
+    # Entitlement names are literal dictionary keys, not plutil dotted key paths.
+    python3 - "$ENT" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+entitlements = plistlib.loads(path.read_bytes())
+for key in ('com.apple.private.cs.debugger', 'dynamic-codesigning',
+            'com.apple.private.skip-library-validation'):
+    entitlements.pop(key, None)
+entitlements['com.apple.private.security.no-sandbox'] = True
+entitlements['com.apple.private.persona-mgmt'] = True
+path.write_bytes(plistlib.dumps(entitlements))
+PY
 fi
 SAPP="$STAGE/Payload/Henge.app"
 xattr -rc "$SAPP"
@@ -71,8 +81,12 @@ if [ "$TROLLSTORE" = true ]; then
         -Wall -Wextra -Werror -O2 "$IOS/../compat/guest-provisioning/root_helper.c" \
         -o "$SAPP/henge-root-helper"
     HELPER_ENT="$STAGE/helper-entitlements.plist"
-    plutil -create xml1 "$HELPER_ENT"
-    plutil -insert com.apple.private.security.no-sandbox -bool true "$HELPER_ENT"
+    python3 - "$HELPER_ENT" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+Path(sys.argv[1]).write_bytes(plistlib.dumps({'com.apple.private.security.no-sandbox': True}))
+PY
     sign --entitlements "$HELPER_ENT" "$SAPP/henge-root-helper"
 fi
 for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
