@@ -100,3 +100,25 @@ once, includes the required public LLVM Linker component and binds both dynamic
 source files into its recipe and packaging receipt. CI controls explicitly link
 against that combined archive. Guest transport and automatic activation remain
 unimplemented; merely packaging the backend does not complete the no-setup goal.
+
+
+A fresh pinned-source helper build of the combined provider then completed for
+both native macOS and iOS. Its archive-linked dynamic controls passed all 768
+values and four rejections; the ordinary provider regression controls also
+passed all 256 values. The packaging guard tests now include a stale dynamic
+source case (15 tool tests passed).
+
+- Combined provider recipe:
+  `1af087fb3802f1f4d64314158cb7f8be8504d5cbe49b836f2d4e1cd262dae85f`.
+- Combined iOS provider archive SHA-256:
+  `1cb352633a5a034d91beca5d4f3713e8598c9ff3fecc7dc47788a46155d013dd`.
+- Full Xcode application/TrollStore package built from `24570ef17eca`:
+  10,480,708 bytes, SHA-256
+  `e040f34e0d0cf3d7662ea9a28855fbed0e515de50997db30a2ddca36390c6fd4`.
+  The expected recipe and LLVM license were present; no Apple boot ROM was
+  included. This package was not deployed or guest-qualified on the iPad.
+
+The backend being present in the provider archive does not prove retention or
+execution of its currently unused entrypoint in the final app. Guest transport
+must call it on the ordinary provider's shared serial queue, bind request/output
+identities to the embedded recipe, and pass final-binary device controls.
