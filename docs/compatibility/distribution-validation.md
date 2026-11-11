@@ -344,3 +344,22 @@ GUI plugin: its About dialog uses `__DATE__` and `__TIME__`. The build now sets
 timestamp. Clang uses that source date for these macros. This keeps the UUIDs
 needed by dyld while removing wall-clock dependence from that metadata. The
 final complete-archive comparison is recorded separately once available.
+
+The final TrollStore package built at `88a96ddade8b` passed. Its embedded guest
+archive is **byte-for-byte identical** to an independent full source build,
+including all nine VLC plugins, both compatibility libraries, licenses,
+manifest and build receipt. This is equality of the guest archive; the outer
+IPA intentionally records its own build date. The payload identity is
+`eda2d1377ffb25a6e639dff01273588524f33f3afd05159ffc21c771b84cdc0e`.
+Finished-package inspection verified the archive descriptor and hashes, closed
+flat inventory, file sizes/modes, all 11 guest dylib signatures, app/helper
+signatures and the expected TrollStore entitlement set without banned keys.
+All nine embedded plugins match the executable content of the candidate that
+passed the six native export regressions after pinning the source date.
+
+The final `.tipa` is 15,171,858 bytes with SHA-256
+`a9f8360772e33269dee9b03a8ee4b868ba8621f20b3daba9ede96e825ccb855f`.
+It has not been installed on the unavailable iPad. Root-helper privileges,
+actual Sonoma Data-volume installation, ordinary app activation, device GUI
+playback, new upstream snapshot behavior and fresh-guest acceptance remain
+unqualified. The source-only PR contains none of these signed artifacts.
