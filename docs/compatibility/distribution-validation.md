@@ -253,3 +253,22 @@ environment/descriptor isolation and timeout reaping. The native controls use
 test-only persona stubs: they do not establish actual root permission. The iPad
 was unavailable during these checks, so this new helper has not been installed
 or run there. This is a capability check, not automatic guest provisioning.
+
+### Source-built passive guest payload
+
+The package builder now compiles the production dynamic-library adapter and CGL
+discovery dylib for arm64 macOS 14, after verifying the embedded provider's recipe
+and source receipt. It bundles these, their manifest and Henge's GPL-2.0 license
+as a flat, normalized archive, with an app-signed descriptor binding archive and
+manifest hashes. Guest code remains opaque to iOS package signers. It does not
+start or include the legacy Mac compiler service. Production output excludes the
+native-only endpoint override, and both dylib signatures pass strict verification.
+
+Two independent builds produced identical payload identities and dylib hashes.
+Seven integrity controls passed, covering bytes/size/mode changes, missing or
+extra inventory, symlinks/directories, source inventory, recipe/target changes,
+unexpected manifest install paths and normalized archive contents. These checks
+establish integrity, not the authenticity of arbitrary external manifests; the
+signed app's resources are the trust anchor. Delivery to Sonoma, automatic normal
+application activation and VLC packaging remain incomplete, and this payload
+has not yet run in the iPad's guest.

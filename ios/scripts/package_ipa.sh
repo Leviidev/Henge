@@ -76,6 +76,9 @@ if [ -n "$(find "$STAGE" -iname 'AVPBooter*' -o -iname 'AVPSEPBooter*')" ]; then
   exit 1
 fi
 sign() { codesign --force --sign - --timestamp=none "$@"; }
+python3 "$IOS/../tools/compat/build_guest_payload.py" --output "$STAGE/guest-build"
+cp "$STAGE/guest-build/henge-guest-payload.tar.gz" "$SAPP/"
+cp "$STAGE/guest-build/henge-guest-payload.json" "$SAPP/"
 if [ "$TROLLSTORE" = true ]; then
     xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 \
         -Wall -Wextra -Werror -O2 "$IOS/../compat/guest-provisioning/root_helper.c" \

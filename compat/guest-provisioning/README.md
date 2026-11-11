@@ -36,3 +36,30 @@ selection, encrypted volumes, source-built payload delivery, rollback and guest
 activation remain unimplemented. VM disk ownership locking excludes cooperating
 concurrent writers; it does not make editing a disk behind suspended guest RAM
 safe. Provisioning must not mutate a paused VM's backing image.
+
+## Source-built guest payload
+
+`tools/compat/build_guest_payload.py --output NEW_DIRECTORY` first checks the
+embedded compiler archive and its source receipt, then compiles the production
+dynamic-library adapter and CGL discovery library for arm64 macOS 14. It does
+not build the legacy Mac compiler service or enable native-only test overrides.
+The adapter uses private guest-network compiler discovery without a supplied
+configuration, token or endpoint. The CGL component retains its existing
+process-local activation requirement; bundling it does not solve global discovery.
+
+Packaging runs this build automatically and embeds `henge-guest-payload.tar.gz`
+plus a descriptor binding archive hash/size, manifest hash, payload identity and
+compiler recipe. Guest Mach-O files stay inside the archive so an iOS package
+signer cannot rewrite their signatures. The flat archive contains only the two
+ad-hoc-signed dylibs, Henge's GPL-2.0 license and the manifest. Timestamps and
+archive ownership are normalized, and content identity excludes build-directory
+paths and wall-clock time. The manifest includes source hashes, exact file hashes,
+sizes, permissions, target architecture and minimum macOS version.
+
+The app signature authenticates the embedded descriptor and archive. The Python
+manifest verifier only checks integrity and closed inventories; a self-consistent
+external manifest does not authorize installing files. An installer must bind its
+input to these resources in the signed app, reject unexpected paths and validate
+everything before making any guest change. Payload installation, version
+activation, rollback and VLC delivery remain unfinished. Neither the helper nor
+the app currently extracts this archive onto the guest.

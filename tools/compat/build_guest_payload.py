@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Build the passive, source-only Sonoma payload. Never install or activate it."""
+import argparse
+import gzip
+import hashlib
+import io
+import json
+from pathlib import Path
+import re
+import stat
+import subprocess
+import tarfile
+
+from check_ondevice_provider import verify as verify_provider
+
+ROOT = Path(__file__).resolve().parents[2]
+LIBRARIES = ('libHengeDynamic.dylib', 'libHengeCGLDiscovery.dylib')
+FILES = (*LIBRARIES, 'LICENSE-Henge-GPL-2.0.txt')
+SOURCES = ('compat/dynamic-libraries/guest/runtime.m',
+           'compat/dynamic-libraries/guest/adapter.m',
+           'compat/dynamic-libraries/guest/transport.m',
+           'compat/opengl-discovery/registry_discovery.m', 'LICENSE')
+
+
+def digest(path):
+    with path.open('rb') as stream:
+        result = hashlib.sha256()
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            result.update(block)
+        return result.hexdigest()
+
+
+def identity(manifest):
+    body = {key: value for key, value in manifest.items() if key != 'payload_id'}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def archive_payload(folder, target):
+    """Stable flat tar/gzip, keeping guest code opaque to iOS package signers."""
+    with target.open('xb') as stream, gzip.GzipFile(filename='', fileobj=stream, mode='wb', mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode='w', format=tarfile.USTAR_FORMAT) as archive:
+            for name in sorted((*FILES, 'manifest.json')):
+                path = folder / name
+                data = path.read_bytes()
+                item = tarfile.TarInfo(name)
+                item.size = len(data)
+                item.mode = stat.S_IMODE(path.stat().st_mode)
+                item.uid = item.gid = item.mtime = 0
+                archive.addfile(item, io.BytesIO(data))
+
+
+def verify_payload(folder, expected_recipe):
+    """Check bundle integrity before embedding, not authenticity of external input.
+
+    The release app signature is the trust anchor for the embedded manifest.
+    A self-consistent manifest alone never authorizes installing outside files.
+    """
+    if folder.is_symlink() or not folder.is_dir():
+        raise ValueError('Payload must be a real directory')
+    names = set(FILES) | {'manifest.json'}
+    if {p.name for p in folder.iterdir()} != names:
+        raise ValueError('Unexpected or missing payload files')
+    for name in names:
+        item = folder / name
+        info = item.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024:
+            raise ValueError('Payload member must be a bounded regular file: ' + name)
+    manifest = json.loads((folder / 'manifest.json').read_text())
+    if ((folder / 'manifest.json').stat().st_size > 65536 or
+            stat.S_IMODE((folder / 'manifest.json').stat().st_mode) != 0o644):
+        raise ValueError('Invalid payload manifest size or mode')
+    if set(manifest) != {'schema', 'kind', 'architecture', 'minimum_macos',
+                         'compiler_recipe', 'sources', 'files', 'activation', 'payload_id'}:
+        raise ValueError('Unsupported payload manifest fields')
+    if (manifest['schema'] != 1 or manifest['kind'] != 'henge-sonoma-guest-compatibility' or
+            manifest['architecture'] != 'arm64' or manifest['minimum_macos'] != '14.0' or
+            manifest['compiler_recipe'] != expected_recipe or
+            manifest['activation'] != 'unimplemented' or manifest['payload_id'] != identity(manifest)):
+        raise ValueError('Payload identity, target or compiler recipe mismatch')
+    if set(manifest['files']) != set(FILES):
+        raise ValueError('Payload inventory mismatch')
+    if (set(manifest['sources']) != set(SOURCES) or
+            not all(isinstance(value, str) and re.fullmatch('[0-9a-f]{64}', value)
+                    for value in manifest['sources'].values())):
+        raise ValueError('Payload source inventory mismatch')
+    for name in FILES:
+        record = manifest['files'][name]
+        path = folder / name
+        if (set(record) != {'sha256', 'bytes', 'mode'} or
+                record['sha256'] != digest(path) or record['bytes'] != path.stat().st_size or
+                record['mode'] != (0o755 if name in LIBRARIES else 0o644) or
+                stat.S_IMODE(path.stat().st_mode) != record['mode']):
+            raise ValueError('Payload member identity mismatch: ' + name)
+    return manifest
+
+
+def build(root, output):
+    recipe = verify_provider(root)
+    output.mkdir(parents=True, exist_ok=False)
+    payload = output / 'payload'
+    payload.mkdir()
+    compiler = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--find', 'clang'], text=True).strip()
+    sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
+    guest = root / 'compat/dynamic-libraries/guest'
+    sources = [root / name for name in SOURCES]
+    discovery = root / 'compat/opengl-discovery/registry_discovery.m'
+    commands = []
+    for name, source, frameworks in (
+            (LIBRARIES[0], guest / 'runtime.m', ('Foundation', 'Metal')),
+            (LIBRARIES[1], discovery, ('Foundation', 'IOKit'))):
+        target = payload / name
+        command = [compiler, '-isysroot', sdk, '-arch', 'arm64', '-mmacosx-version-min=14.0',
+                   '-dynamiclib', '-O2', '-fobjc-arc', '-fblocks', '-Wall', '-Wextra',
+                   '-Wno-deprecated-declarations', '-ffile-prefix-map=' + str(root) + '=.',
+                   '-Wl,-no_uuid', '-DHG_RECIPE_ID="' + recipe + '"',
+                   '-install_name', '@rpath/' + name, str(source), '-o', str(target)]
+        command += [value for framework in frameworks for value in ('-framework', framework)]
+        commands.append(command)
+        subprocess.run(command, check=True)
+        subprocess.run(['codesign', '--force', '--sign', '-', '--timestamp=none', str(target)], check=True)
+        subprocess.run(['codesign', '--verify', '--strict', str(target)], check=True)
+        if subprocess.check_output(['lipo', '-archs', str(target)], text=True).strip() != 'arm64':
+            raise ValueError('Unexpected payload architecture')
+        if b'HENGE_EMBEDDED_TEST_ENDPOINT' in target.read_bytes():
+            raise ValueError('Native-only transport override leaked into production payload')
+        target.chmod(0o755)
+    license_file = payload / FILES[-1]
+    license_file.write_bytes((root / 'LICENSE').read_bytes())
+    license_file.chmod(0o644)
+    manifest = dict(schema=1, kind='henge-sonoma-guest-compatibility', architecture='arm64',
+                    minimum_macos='14.0', compiler_recipe=recipe, activation='unimplemented',
+                    sources={str(p.relative_to(root)): digest(p) for p in sources},
+                    files={name: dict(sha256=digest(payload / name), bytes=(payload / name).stat().st_size,
+                                      mode=stat.S_IMODE((payload / name).stat().st_mode)) for name in FILES})
+    manifest['payload_id'] = identity(manifest)
+    (payload / 'manifest.json').write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+    (payload / 'manifest.json').chmod(0o644)
+    verify_payload(payload, recipe)
+    archive = output / 'henge-guest-payload.tar.gz'
+    archive_payload(payload, archive)
+    descriptor = dict(schema=1, payload_id=manifest['payload_id'], compiler_recipe=recipe,
+                      archive_sha256=digest(archive), archive_bytes=archive.stat().st_size,
+                      manifest_sha256=digest(payload / 'manifest.json'), activation='unimplemented')
+    (output / 'henge-guest-payload.json').write_text(json.dumps(descriptor, indent=2) + '\n')
+    receipt = dict(schema=1, payload_id=manifest['payload_id'], compiler_sha256=digest(Path(compiler)),
+                   xcode=subprocess.check_output(['xcodebuild', '-version'], text=True).strip(),
+                   commands=commands, source_head=subprocess.check_output(
+                       ['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(),
+                   installed=False, activation_implemented=False)
+    (output / 'build-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', type=Path, default=ROOT)
+    parser.add_argument('--output', type=Path, required=True)
+    args = parser.parse_args()
+    print(build(args.root.resolve(), args.output.resolve())['payload_id'])
+
+
+if __name__ == '__main__':
+    main()
