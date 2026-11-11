@@ -58,6 +58,9 @@ def main():
     if subprocess.check_output(['lipo','-archs',str(app/'Contents/MacOS/VLC')],text=True).strip()!='arm64':raise SystemExit('Thin arm64 VLC reference required')
     out.mkdir(parents=True);archives.mkdir(parents=True,exist_ok=True);logs=out/'logs';logs.mkdir();sources=out/'sources';sources.mkdir()
     lock=json.loads((HERE/'inputs.lock.json').read_text());trees={}
+    # Clang honors this for __DATE__/__TIME__ in VLC's About dialog. Bind it to
+    # the pinned source snapshot instead of the wall clock of a release build.
+    os.environ['SOURCE_DATE_EPOCH']=str(lock['source_date_epoch'])
     for name,item in lock['archives'].items():
         path=archives/name
         if not path.exists():
@@ -74,7 +77,7 @@ def main():
     provenance=json.loads((HERE/'source-provenance.json').read_text())
     for name,ident in provenance['changed_sources'].items():
         if sha(vlc/name)!=ident['after_sha256']:raise ValueError(f'Patched source mismatch: {name}')
-    receipt={'source_lock':lock,'patched_sources':provenance,'reference_app_version':'3.0.24','reference_core_sha256':sha(app/'Contents/MacOS/lib/libvlccore.dylib'),'reference_provenance':{'mode':'explicit-readonly'if a.vlc_app else'pinned-automatic','lock_sha256':sha(HERE/'reference.lock.json'),'official_signature_verified':True},'xcode':subprocess.check_output(['xcodebuild','-version'],text=True).strip(),'minimum_macos':'14.0','state':'prepared; not installed'}
+    receipt={'source_lock':lock,'patched_sources':provenance,'source_date_epoch':lock['source_date_epoch'],'reference_app_version':'3.0.24','reference_core_sha256':sha(app/'Contents/MacOS/lib/libvlccore.dylib'),'reference_provenance':{'mode':'explicit-readonly'if a.vlc_app else'pinned-automatic','lock_sha256':sha(HERE/'reference.lock.json'),'official_signature_verified':True},'xcode':subprocess.check_output(['xcodebuild','-version'],text=True).strip(),'minimum_macos':'14.0','state':'prepared; not installed'}
     (out/'build-receipt.json').write_text(json.dumps(receipt,indent=2))
     if a.prepare_only:return
     prefix=f'-ffile-prefix-map={out}=.'

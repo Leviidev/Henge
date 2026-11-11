@@ -28,5 +28,6 @@
     "x265": "4.1 build215, assembly disabled",
     "ffmpeg": "8.1.2 minimal static AAC/MOV build",
     "libsamplerate": "0.1.9 with exact EOF patch"
-  }
+  },
+  "source_date_epoch": 1789642908
 }

@@ -330,3 +330,17 @@ to require all nine module names and reject loader errors. Those checks passed
 on the corrected combined build. The separate native load control also rejected
 the earlier known-bad UUID-less libraries. No GUI, installed app or guest disk
 is accessed by these build-time load controls.
+
+The corrected plugin unit also passed all six native default-chain export
+regressions: H.264, HEVC, BT.709, full-range/aspect-ratio variants and stereo AAC.
+Independent FFmpeg decoding checked exact audio sample counts, monotonic packet
+and decoded-frame timing, A/V start alignment, color/aspect metadata, audio SNR,
+SSIM/PSNR and absence of decode warnings. This is native headless export evidence;
+guest execution, GUI playback and physical audio remain separate gates.
+
+The independent complete archive comparison initially differed only in VLC's
+GUI plugin: its About dialog uses `__DATE__` and `__TIME__`. The build now sets
+`SOURCE_DATE_EPOCH=1789642908`, matching the pinned VLC source archive's root
+timestamp. Clang uses that source date for these macros. This keeps the UUIDs
+needed by dyld while removing wall-clock dependence from that metadata. The
+final complete-archive comparison is recorded separately once available.
