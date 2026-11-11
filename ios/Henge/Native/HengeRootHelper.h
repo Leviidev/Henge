@@ -12,4 +12,8 @@ char *henge_root_helper_inspect_disk(const char *path);
  * JSON; incomplete/retained cleanup is reported rather than force-cleaned.
  * Call off the UI thread. Does not open the original disk or mount a copy. */
 char *henge_root_helper_recover_workspaces(void);
+/* Read-only parent-app attestation diagnostic. No path/image FD is accepted,
+ * and a successful report is not transferable write authority. A future
+ * mutation operation must reattest its own live caller and target rights. */
+char *henge_root_helper_attest_caller(void);
 #endif

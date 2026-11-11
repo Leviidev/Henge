@@ -21,6 +21,12 @@ struct HengeApp: App {
                 }
                 defer { free(report) }
                 HengeLog.log("guest-setup", String(cString: report))
+                if let caller = henge_root_helper_attest_caller() {
+                    HengeLog.log("guest-setup", String(cString: caller))
+                    free(caller)
+                } else {
+                    HengeLog.log("guest-setup", "caller attestation unavailable; original disk writes remain disabled")
+                }
                 // Discard only abandoned unpublished helper copies. A live
                 // workspace or unknown data is retained, and no Mac is mounted.
                 guard let recovery = henge_root_helper_recover_workspaces() else {

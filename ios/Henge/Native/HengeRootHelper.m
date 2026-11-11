@@ -12,12 +12,16 @@
 #include <time.h>
 #include <unistd.h>
 
-static long long bounded_count(NSDictionary *report,NSString *key)
+static long long bounded_integer(NSDictionary *report,NSString *key,long long maximum)
 {
     id value=report[key];
     if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value)==CFBooleanGetTypeID()) return -1;
     long long n=[value longLongValue];
-    return n>=0 && n<=256 && [value doubleValue]==(double)n?n:-1;
+    return n>=0 && n<=maximum && [value doubleValue]==(double)n?n:-1;
+}
+static long long bounded_count(NSDictionary *report,NSString *key)
+{
+    return bounded_integer(report,key,256);
 }
 
 static double monotonic_now(void)
@@ -119,6 +123,12 @@ static char *run_helper(const char *operation, int image)
             ![report[@"root"] isEqual:@YES] || ![report[@"uid"] isEqual:@0] ||
             ![report[@"euid"] isEqual:@0] || ![report[@"gid"] isEqual:@0] ||
             ![report[@"egid"] isEqual:@0] || ![report[@"payload_verified"] isEqual:@YES]) return NULL;
+        if (!strcmp(operation,"attest-caller-v1") &&
+            (![report[@"caller_verified"] isEqual:@YES] ||
+             ![report[@"caller_no_sandbox_entitled"] isEqual:@YES] ||
+             ![report[@"caller_executable_verified"] isEqual:@YES] ||
+             bounded_integer(report,@"caller_uid",UINT32_MAX-1LL)<0 ||
+             bounded_integer(report,@"caller_pid",INT32_MAX)<=1)) return NULL;
         if (!strcmp(operation,"recover-workspaces-v1")) {
             long long total=bounded_count(report,@"enumerated"),candidates=bounded_count(report,@"candidates"),
                 recovered=bounded_count(report,@"recovered"),busy=bounded_count(report,@"busy"),
@@ -155,6 +165,10 @@ char *henge_root_helper_probe(void)
 char *henge_root_helper_recover_workspaces(void)
 {
     return run_helper("recover-workspaces-v1", -1);
+}
+char *henge_root_helper_attest_caller(void)
+{
+    return run_helper("attest-caller-v1", -1);
 }
 
 char *henge_root_helper_inspect_disk(const char *path)

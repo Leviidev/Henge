@@ -4,8 +4,11 @@
 #include "HGGuestDisk.h"
 #include "HGGuestMedia.h"
 #include "HGGuestWorkspace.h"
+#include "HGGuestPeer.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <sys/syslimits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,11 +25,21 @@ static const HGGuestPayloadIdentity payload_identity = {
     HG_PAYLOAD_DESCRIPTOR_SHA, HG_PAYLOAD_RECIPE, HG_PAYLOAD_ID,
     HG_PAYLOAD_VLC_CORE, HG_PAYLOAD_VLC_LOCK
 };
+static int expected_app_executable(void) {
+    char path[PATH_MAX],canonical[PATH_MAX];uint32_t n=sizeof(path);
+    if(_NSGetExecutablePath(path,&n) || !realpath(path,canonical))return -1;
+    char *slash=strrchr(canonical,'/');if(!slash)return -1;*slash=0;
+    int dir=open(canonical,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0)return -1;
+    int fd=openat(dir,"Henge",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);
+    close(dir);return fd;
+}
 
 int main(int argc, char **argv)
 {
     if (argc != 2 || (strcmp(argv[1], "probe-v1") && strcmp(argv[1], "verify-payload-v1") &&
-                     strcmp(argv[1], "inspect-image-v1") && strcmp(argv[1], "recover-workspaces-v1"))) {
+                     strcmp(argv[1], "inspect-image-v1") && strcmp(argv[1], "recover-workspaces-v1") &&
+                     strcmp(argv[1], "attest-caller-v1"))) {
         fputs("unsupported helper operation\n", stderr);
         return 64;
     }
@@ -38,6 +51,24 @@ int main(int argc, char **argv)
         return verified;
     }
     int root = getuid() == 0 && geteuid() == 0 && getgid() == 0 && getegid() == 0;
+    if(!strcmp(argv[1],"attest-caller-v1")) {
+        if(verified){if(report)puts(report);free(report);return verified;}
+        free(report);
+        HGGuestPeer peer={0};const char *error="root-required";int status=-1;
+        if(root) {
+            int executable=expected_app_executable();error="peer-executable-open";
+            if(executable>=0) {
+                status=hg_guest_peer_attest(executable,&peer,&error);close(executable);
+            }
+        }
+        printf("{\"schema\":1,\"operation\":\"attest-caller-v1\",\"root\":%s,"
+               "\"uid\":%u,\"euid\":%u,\"gid\":%u,\"egid\":%u,\"payload_verified\":true,"
+               "\"caller_verified\":%s,\"caller_no_sandbox_entitled\":%s,\"caller_executable_verified\":%s,"
+               "\"caller_uid\":%u,\"caller_pid\":%d,\"guest_disk_accessed\":false,\"error\":\"%s\"}\n",
+               root?"true":"false",getuid(),geteuid(),getgid(),getegid(),status?"false":"true",
+               status?"false":"true",status?"false":"true",peer.uid,peer.pid,error?error:"");
+        return !root?77:status?65:0;
+    }
     if (!strcmp(argv[1], "recover-workspaces-v1")) {
         if (verified) {
             if (report) puts(report);

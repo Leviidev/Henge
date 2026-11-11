@@ -45,7 +45,8 @@ int main(int argc, char **argv) {
     if (getenv("HENGE_CONTROL_INHERITED_FD")) {
         int fd = open("/dev/null", O_RDONLY); dup2(fd, 96); close(fd);
     }
-    char *p = argc == 2 && !strcmp(argv[1],"--recover") ? henge_root_helper_recover_workspaces() :
+    char *p = argc == 2 && !strcmp(argv[1],"--attest") ? henge_root_helper_attest_caller() :
+              argc == 2 && !strcmp(argv[1],"--recover") ? henge_root_helper_recover_workspaces() :
               argc == 2 ? henge_root_helper_inspect_disk(argv[1]) : henge_root_helper_probe();
     if (!p) return 1; puts(p); free(p); return 0; }
 ''')
@@ -63,6 +64,8 @@ int main(int argc, char **argv) {
                         str(ROOT / 'compat/guest-provisioning/HGGuestDisk.c'),
                         str(ROOT / 'compat/guest-provisioning/HGGuestMedia.m'),
                         str(ROOT / 'compat/guest-provisioning/HGGuestWorkspace.c'),
+                        str(ROOT / 'compat/guest-provisioning/HGGuestPeer.m'),
+                        str(ROOT / 'compat/guest-provisioning/HGGuestCodeIdentity.c'),
                         '-framework', 'Foundation', '-lz',
                         '-o', str(cls.real_helper)], check=True)
 
@@ -80,7 +83,8 @@ int main(int argc, char **argv) {
                               env={**os.environ, **environment})
 
     def test_helper_rejects_every_other_operation(self):
-        for args in ([], ['mount'], ['probe-v1', '/some/disk'], ['recover-workspaces-v1', '/some/path']):
+        for args in ([], ['mount'], ['probe-v1', '/some/disk'], ['recover-workspaces-v1', '/some/path'],
+                     ['attest-caller-v1', '4242']):
             result = subprocess.run([str(self.real_helper), *args], capture_output=True)
             self.assertEqual(result.returncode, 64)
             self.assertFalse(result.stdout)
@@ -95,7 +99,7 @@ int main(int argc, char **argv) {
         self.assertFalse(report['guest_disk_accessed'])
 
     def test_unbound_helper_never_accepts_payload_resources(self):
-        for operation in ('verify-payload-v1', 'inspect-image-v1', 'recover-workspaces-v1'):
+        for operation in ('verify-payload-v1', 'inspect-image-v1', 'recover-workspaces-v1', 'attest-caller-v1'):
             result = subprocess.run([str(self.real_helper), operation], capture_output=True)
             self.assertEqual(result.returncode, 65)
             report = json.loads(result.stdout)
@@ -150,6 +154,25 @@ int main(int argc, char **argv) {
             with self.subTest(report=report):
                 self.fixture(prefix + 'puts(' + json.dumps(json.dumps(report)) + '); return 0;')
                 result = self.run_probe(image='--recover')
+                self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
+
+    def test_caller_attestation_protocol_and_no_image_descriptor(self):
+        valid = dict(schema=1, operation='attest-caller-v1', root=True,
+                     uid=0, euid=0, gid=0, egid=0, payload_verified=True,
+                     caller_verified=True, caller_no_sandbox_entitled=True,
+                     caller_executable_verified=True, caller_uid=501, caller_pid=4242,
+                     guest_disk_accessed=False)
+        cases = [(valid, True), (dict(valid, caller_verified=False), False),
+                 (dict(valid, caller_no_sandbox_entitled=False), False),
+                 (dict(valid, caller_executable_verified=False), False),
+                 (dict(valid, caller_uid=True), False), (dict(valid, caller_uid=-1), False),
+                 (dict(valid, caller_pid=1), False), (dict(valid, caller_pid=2**31), False),
+                 (dict(valid, guest_disk_accessed=True), False)]
+        prefix = 'if(argc!=2 || strcmp(argv[1],"attest-caller-v1") || fcntl(3,F_GETFD)!=-1)return 66;'
+        for report, accepted in cases:
+            with self.subTest(report=report):
+                self.fixture(prefix + 'puts(' + json.dumps(json.dumps(report)) + '); return 0;')
+                result = self.run_probe(image='--attest')
                 self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
 
     def test_parent_environment_and_descriptors_are_not_inherited(self):

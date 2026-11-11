@@ -632,3 +632,46 @@ There is still no production publication command, attested write-bearing app
 transport, ownership handoff/exchange supervisor, restart rollback, health/commit
 policy or snapshot invalidation integration. These must be implemented and
 qualified before any original guest disk mutation is enabled.
+
+### Parent-app identity qualification
+
+`HGGuestPeer` qualifies the helper's actual live parent, never a PID/UID supplied
+in a request. It samples kernel credentials, process start time, executable path
+and CDHash before and after. Real/effective/saved UIDs must agree, the parent must
+remain live, and its main executable must match the held read-only file opened
+from the helper's own bundle. `HGGuestCodeIdentity` verifies the kernel CDHash
+against a bounded thin 64-bit executable's SHA-256 CodeDirectory and hashes every
+covered 4/16 KiB code page. File identity/timestamps are rechecked. Signature
+objects/ranges are bounded; reserved bytes inside the declared signature area
+are not executable code. External resource seals/dependencies are not attested
+by this primitive.
+
+The kernel entitlement blob must contain Boolean
+`com.apple.private.security.no-sandbox=true`; missing, false, integer/string,
+malformed or unavailable values fail. Credentials, start time, executable or
+CDHash changes also fail and clear the output. Debugged JIT parents are permitted
+by the same kernel signature-state profile as the iOS kernel entitlement query.
+Read-only codesign queries use the direct syscall, matching the existing Henge
+JIT guard, because a jailbreak libc wrapper may hide debugged state. ABI behavior
+is referenced against [Apple's iOS 17 XNU process/codesign implementation](https://github.com/apple-oss-distributions/xnu/blob/xnu-10002.1.13/bsd/kern/kern_proc.c)
+and [CodeDirectory layout](https://github.com/apple-oss-distributions/xnu/blob/xnu-10002.1.13/osfmk/kern/cs_blobs.h).
+
+The new `attest-caller-v1` root-helper diagnostic accepts no PID/path/image FD.
+It opens only sibling `Henge` from its canonical bundle and reports verified
+caller UID/PID without reading any guest disk. The app logs the result after its
+startup probe; failure does not block ordinary VM use. A successful diagnostic
+is not a transferable write capability. Each future mutation operation must
+reattest its own live parent and independently establish per-target sandbox
+policy, DAC/ACL rights and the explicit write witness.
+
+Nine sanitizer-backed signed-file groups verify real CodeDirectories/pages,
+covered-byte tampering, malformed ranges/profiles, unsupported input and FD
+preservation. Seven peer groups include process/entitlement boundary stubs for
+positive and failure cases, plus a real signed ordinary parent that passes the
+kernel UID/path/code checks and is refused for missing no-sandbox entitlement.
+Twelve root-helper process groups cover diagnostic protocol/type failures,
+unbound input and no inherited image descriptor. A Mac control signed with the
+private no-sandbox entitlement was killed at launch, so there is no positive host
+qualification of the actual iPad policy. Full positive app/root/device identity
+qualification, write-bearing transport, namespace policy and publication remain
+separate unfinished gates; original guest writes remain disabled.
