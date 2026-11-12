@@ -77,7 +77,7 @@ struct Trackpad: UIViewRepresentable {
         private static func ms(_ t: TimeInterval) -> UInt32 { UInt32(truncatingIfNeeded: Int(t * 1000)) }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-            let touches = touches.filter { $0.type != .indirectPointer }
+            let touches = touches.filter { $0.type == .direct }
             guard !touches.isEmpty else { return }
             if fingers.isEmpty {
                 started = Date()
@@ -112,7 +112,7 @@ struct Trackpad: UIViewRepresentable {
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
             var moved = false
             let ts = Self.ms(event?.timestamp ?? touches.first?.timestamp ?? 0)
-            for t in touches where t.type != .indirectPointer {
+            for t in touches where t.type == .direct {
                 guard let i = fingers.firstIndex(where: { $0.touch == t }) else { continue }
                 let now = t.location(in: self), before = t.previousLocation(in: self)
                 travelled += abs(now.x - before.x) + abs(now.y - before.y)
@@ -133,7 +133,7 @@ struct Trackpad: UIViewRepresentable {
         private func lift(_ touches: Set<UITouch>) {
             var lifted: [Int32] = []
             fingers.removeAll { finger in
-                guard touches.contains(finger.touch), finger.touch.type != .indirectPointer else { return false }
+                guard touches.contains(finger.touch), finger.touch.type == .direct else { return false }
                 freeIds.insert(finger.id)
                 lifted.append(finger.id)
                 return true

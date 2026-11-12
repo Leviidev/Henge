@@ -10,6 +10,8 @@ struct SessionView: View {
 
     @StateObject private var display = DisplayRouter()
     @State private var error: String?
+    @State private var graphicsState: Int32 = 0
+    @State private var graphicsDetail = ""
     @State private var state: Int32 = 0
     @State private var bootAttempt = 0
     @State private var cpusOn: Int32 = 0
@@ -139,6 +141,7 @@ struct SessionView: View {
                         .frame(width: min(layout.touch.width - 32, 360))
                         .position(x: layout.touch.midX, y: layout.fillsPhone ? layout.touch.midY : layout.pad.midY)
                 }
+                if state == 1 && graphicsState != 0 { graphicsCard(layout) }
                 if let error { errorCard(error, layout) }
                 KeyboardCatcher(active: $typing).frame(width: 0, height: 0)
             }
@@ -212,7 +215,7 @@ struct SessionView: View {
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
-    private var pointerNeeded: Bool { state == 2 || showDetails || confirmStop || error != nil }
+    private var pointerNeeded: Bool { state == 2 || showDetails || confirmStop || error != nil || graphicsState == 2 }
 
     // MARK: Layout
 
@@ -458,6 +461,33 @@ struct SessionView: View {
 
     // MARK: Status
 
+    private func graphicsCard(_ layout: Layout) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                if graphicsState == 1 { ProgressView() }
+                Text(graphicsState == 1 ? "Preparing graphics…" : "Graphics need attention")
+                    .font(.system(size: 17, weight: .semibold))
+            }
+            Text(graphicsState == 1
+                 ? "This Mac is waiting for graphics to be prepared. Henge will continue automatically."
+                 : "A required graphics operation could not be prepared. Pending work has been kept; it has not completed.")
+                .font(.system(size: 14)).foregroundStyle(Desk.dim)
+            if graphicsState == 2 {
+                HStack(spacing: 20) {
+                    Button("Details") { showDetails = true }
+                    Button("Shut Down…", role: .destructive) { confirmStop = true }
+                }
+                .font(.system(size: 15, weight: .semibold))
+            }
+        }
+        .padding(18)
+        .frame(width: min(layout.touch.width, 390) - 32, alignment: .leading)
+        .background(Desk.raised, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .position(x: layout.touch.midX,
+                  y: graphicsState == 1 ? layout.touch.minY + 100 : layout.touch.midY)
+        .allowsHitTesting(graphicsState == 2)
+    }
+
     private func errorCard(_ text: String, _ layout: Layout) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("This Mac could not start").font(.system(size: 17, weight: .semibold))
@@ -488,6 +518,11 @@ struct SessionView: View {
                     LabeledContent("Translated blocks", value: String(format: "%.1f M/s", blocksPerSecond / 1e6))
                     LabeledContent("Network frames", value: "\(framesOut) out, \(framesIn) in")
                     LabeledContent("Up", value: "\(Int(Date().timeIntervalSince(started))) s")
+                }
+                if graphicsState != 0 {
+                    Section(graphicsState == 1 ? "Preparing graphics" : "Graphics error") {
+                        Text(graphicsDetail).textSelection(.enabled)
+                    }
                 }
                 Section("Display") {
                     Toggle("Color matching", isOn: $matchScreenColors)
@@ -570,6 +605,8 @@ struct SessionView: View {
 
     private func run() async {
         error = nil
+        graphicsState = 0
+        graphicsDetail = ""
         state = 0
         userCode = false
         cpusOn = 0
@@ -641,6 +678,9 @@ struct SessionView: View {
                 try? await Task.sleep(nanoseconds: 100_000_000)
                 continue
             }
+            var graphicsBuffer = [CChar](repeating: 0, count: 2048)
+            graphicsState = henge_vm_render_status(&graphicsBuffer, UInt32(graphicsBuffer.count))
+            graphicsDetail = String(cString: graphicsBuffer)
             cpusOn = henge_vm_cpus_on()
             userCode = userCode || henge_vm_guest_el0() != 0
             let now = Date(), blocks = henge_vm_blocks()

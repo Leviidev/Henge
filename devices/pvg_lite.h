@@ -22,20 +22,36 @@ int hv_pvg_lite_frame(HvPvgLite *p, const uint8_t **pixels, uint32_t *width, uin
 typedef struct HvPvgMetal HvPvgMetal;
 HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite);
 void hv_pvg_metal_destroy(HvPvgMetal *m);
+/* Reserve before producer metadata mutation; false leaves the ring pending. */
+/* 0: no shader wait, 1: preparing/waiting, 2: terminal retained-work fault. */
+int hv_pvg_metal_render_status(HvPvgMetal *m,char *message,uint32_t length);
+int hv_pvg_lite_render_status(HvPvgLite *p,char *message,uint32_t length);
+int hv_pvg_metal_reserve(HvPvgMetal *m,uint32_t length);
+void hv_pvg_metal_drain(HvPvgMetal *m,void(*done)(void*,int cancelled),void *opaque);
+void hv_pvg_lite_drain(HvPvgLite *p,void(*done)(void*,int cancelled),void *opaque);
 void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t channel, uint32_t *command, uint32_t length);
 int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t width, uint32_t height);
 int hv_pvg_lite_snapshot(HvPvgLite *p, uint8_t *bgra, uint32_t width, uint32_t height);
 int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *width, uint32_t *height);
+/* Worker-local view of producer metadata, captured when a command is accepted.
+ * Guest-owned page mappings remain valid until its completion stamp. */
+typedef struct {uint32_t task,top,depth;uint64_t objects,generation;} HvPvgTaskView;
+int hv_pvg_lite_task_view(HvPvgLite *p,uint32_t task,HvPvgTaskView *view);
+void hv_pvg_lite_use_task_view(HvPvgLite *p,const HvPvgTaskView *view);
 int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t task, uint64_t offset, void *to, uint32_t length);
 uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset);
 uint8_t *hv_pvg_lite_page(HvPvgLite *p, uint32_t guest_page);
 void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t pa, uint64_t length);
 uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t task);
-/* The guest's GPU driver is an older one (macOS 14 seen): no object list command, compact surface descriptions. */
-int hv_pvg_lite_old_driver(HvPvgLite *p);
-/* A surface's descriptor (1 KB), or NULL if the mapper has none for it. */
+/* Changes on each create, even when the root/table addresses are reused. */
+uint64_t hv_pvg_lite_task_generation(HvPvgLite *p, uint32_t task);
+/* The mapper selected compact 512-byte descriptors instead of 1 KiB descriptors. */
+int hv_pvg_lite_compact_surfaces(HvPvgLite *p);
+/* A surface descriptor in the mapper's selected format, or NULL. */
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping);
-void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping);
+/* Mapper entries complete behind preceding accepted GPU work. */
+void hv_pvg_metal_mapper(HvPvgMetal *m,uint32_t operation,uint32_t mapping,uint64_t completed_index);
+void hv_pvg_lite_mapper_complete(HvPvgLite *p,uint64_t completed_index);
 void hv_pvg_metal_cursor_moved(HvPvgMetal *m);
 /* Frames go to this CAMetalLayer from now on, drawn by the GPU. Any thread. */
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer);

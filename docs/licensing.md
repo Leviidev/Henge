@@ -19,6 +19,7 @@ the App Store.
 | StikJIT (the Bitrise build applies `ci/stikjit-high-address.patch`) | MPL-2.0 | `ios/Henge/Resources/legal/` |
 | idevice | MIT | `ios/Henge/Resources/legal/` |
 | Pairing library's Rust crates | Listed per crate | `ios/Henge/Resources/legal/LICENSES-rppairing-crates.txt` |
+| Embedded LLVM AIR reader/writer (pinned `gzorin/floor_llvm`, with Henge embedding changes) | Apache-2.0 with LLVM Exceptions | `compat/ondevice-shaders/`, bundled `Resources/legal/LICENSE-LLVM.txt` |
 | libslirp, pcre2 | BSD | Prebuilt from Husk |
 | glib, libintl | LGPL-2.1-or-later | Prebuilt from Husk |
 
