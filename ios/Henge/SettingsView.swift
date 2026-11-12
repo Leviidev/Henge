@@ -19,6 +19,16 @@ struct SettingsView: View {
     @AppStorage(InstantResume.key) private var instantResume = false
     @AppStorage(MacAppsFeature.key) private var macApps = false
 
+    /// Conservative defaults for Golden Gate on an 8 GB iPad Air M3.
+    /// Only changes user preferences; never modifies the guest disk or NVRAM.
+    private func applyGoldenGateM3Preset() {
+        refreshRate = 30
+        fastFlush = true
+        wfiSpin = false
+        superblocks = false
+        codeCacheMB = 512
+    }
+
     /// The second footer paragraph: how you click, given the selected input mode.
     private var inputDescription: String {
         if inputMode == .touchscreen {
@@ -104,6 +114,13 @@ struct SettingsView: View {
                     .listRowBackground(Desk.card)
                 }
                 Section("Performance") {
+                    if Device.isPad {
+                        Button("Apply Golden Gate M3 speed preset") {
+                            applyGoldenGateM3Preset()
+                        }
+                        Text("For 8 GB iPads: 30 Hz, faster disk writes, no idle spinning or experimental superblocks, and a 512 MB JIT code cache. The Mac's RAM, CPUs, disk and identity are not changed. Restart the Mac; code cache changes require restarting Henge.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     Picker("Mac refresh rate", selection: $refreshRate) {
                         Text("30 Hz").tag(30)
                         Text("60 Hz").tag(60)
