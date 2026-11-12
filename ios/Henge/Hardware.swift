@@ -129,11 +129,34 @@ enum PointerLock {
             guard let root = window.rootViewController else { continue }
             let kind: AnyClass = type(of: root)
             if patched.insert(ObjectIdentifier(kind)).inserted {
-                let answer: @convention(block) (UIViewController) -> Bool = { _ in wanted }
+                let answer: @convention(block) (UIViewController) -> Bool = { vc in wanted && fillsScreen(vc.viewIfLoaded?.window) }
                 class_replaceMethod(kind, #selector(getter: UIViewController.prefersPointerLocked), imp_implementationWithBlock(answer), "B@:")
             }
             root.setNeedsUpdateOfPrefersPointerLocked()
+            if window.isKeyWindow {
+                let ask = on && fillsScreen(window)
+                if ask != lastAsked {
+                    lastAsked = ask
+                    HengeLog.log("input", "pointer lock \(ask ? "asked for" : "not asked for"): window \(Int(window.bounds.width))x\(Int(window.bounds.height)) of \(Int(window.screen.bounds.width))x\(Int(window.screen.bounds.height))")
+                }
+            }
         }
+    }
+    private static var lastAsked: Bool?
+
+    /// Only an app that fills the screen asks for the lock. In a Stage Manager window iPadOS can grant it and still
+    /// move its hidden pointer to the screen's edges, bringing out the stage strip and the dock at every move; there
+    /// the Mac's pointer follows the iPad's instead (AbsolutePointer).
+    static func fillsScreen(_ window: UIWindow?) -> Bool {
+        guard let window else { return false }
+        let mine = window.bounds.size, screen = window.screen.bounds.size
+        return abs(mine.width - screen.width) < 1 && abs(mine.height - screen.height) < 1
+    }
+
+    /// Whether iPadOS has the pointer locked to the Mac right now.
+    static var isLocked: Bool {
+        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .contains { $0.activationState == .foregroundActive && $0.pointerLockState?.isLocked == true }
     }
 
     /// iPadOS only locks the pointer to an app that fills the screen: in a window (Stage Manager, or iPadOS 26's windows)
@@ -142,7 +165,8 @@ enum PointerLock {
     static var refused: Bool {
         guard Device.isPad, wanted, GCMouse.current != nil else { return false }
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.filter { $0.activationState == .foregroundActive }
-        return !scenes.isEmpty && !scenes.contains { $0.pointerLockState?.isLocked == true }
+        let full = scenes.contains { $0.windows.contains { $0.isKeyWindow && fillsScreen($0) } }
+        return full && !scenes.contains { $0.pointerLockState?.isLocked == true }
     }
 }
 
@@ -225,7 +249,9 @@ final class HardwareMouse {
     }
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
+    /// While iPadOS won't lock the pointer, the Mac's pointer follows the iPad's (AbsolutePointer) instead.
     private func moved(_ dx: Float, _ dy: Float) {
+        guard !AbsolutePointer.inUse else { return }
         restX += dx * speed
         restY -= dy * speed
         let x = restX.rounded(), y = restY.rounded()
@@ -278,5 +304,31 @@ final class HardwareMouse {
         guard value.isFinite else { return 0 }
         let units = Int32(min(32, (22 * scale * abs(value).squareRoot()).rounded()))
         return value < 0 ? -units : units
+    }
+}
+
+/// In a window (Stage Manager, or iPadOS's windowed apps) iPadOS won't lock the pointer, so the iPad's pointer
+/// stays on screen and the Mac's has to follow it: over the Mac's screen, the pointer's place goes to the Mac's
+/// absolute pointer (a USB tablet), and the iPad's own is hidden there (Trackpad's pointer style). Clicks and
+/// scrolling still come from GameController.
+enum AbsolutePointer {
+    /// Where the Mac's screen is, in the session's coordinates (the window's); nil when it isn't on this
+    /// screen (an external display) or there is no session.
+    static var screen: CGRect?
+    private static var lastInUse: Bool?
+
+    static var inUse: Bool {
+        let now = Device.isPad && screen != nil && !PointerLock.isLocked
+        if now != lastInUse {
+            lastInUse = now
+            HengeLog.log("input", "absolute pointer: \(now ? "on (the pointer isn't locked)" : "off")")
+        }
+        return now
+    }
+
+    /// The iPad's pointer is at p: put the Mac's there too, if p is over the Mac's screen.
+    static func move(to p: CGPoint) {
+        guard inUse, let screen, screen.width > 0, screen.height > 0, screen.contains(p) else { return }
+        henge_vm_pointer_at(Double((p.x - screen.minX) / screen.width), Double((p.y - screen.minY) / screen.height))
     }
 }

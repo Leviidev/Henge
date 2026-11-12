@@ -426,6 +426,11 @@ void henge_vm_touch_button(int down) {
     hv_vm_touch_button(down);
     pthread_rwlock_unlock(&api_lock);
 }
+void henge_vm_pointer_at(double x, double y) {
+    if (!lock_running()) return;
+    hv_vm_pointer_at(x, y);
+    pthread_rwlock_unlock(&api_lock);
+}
 void henge_vm_set_display_layer(void *layer) {
     /* vm.c serializes this with unpublishing the old display before free.
        Main-thread layer detachment need not wait for disk/GPU teardown. */
