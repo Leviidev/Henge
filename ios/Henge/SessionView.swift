@@ -3,6 +3,8 @@ import GameController
 
 /// A running Mac. Upright, its screen sits above a trackpad; on its side the screen fills the device
 /// and is its own trackpad. Zoomed in, the screen fills the device either way and follows the pointer.
+/// On an iPhone Duo's inner display held upright, half folded or flat, the screen sits above the fold
+/// and a keyboard and trackpad below it, like a laptop (DuoPosture.swift, LaptopDeck.swift).
 /// A keyboard, trackpad or mouse attached to an iPad works throughout.
 struct SessionView: View {
     let mac: VirtualMac
@@ -47,6 +49,11 @@ struct SessionView: View {
     @State private var zoomFollowing: Task<Void, Never>?
     @State private var helperRunning = false
     @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
+    @State private var hinge = DuoHinge()
+    @State private var laptop = false       // the laptop layout (DuoPosture.swift)
+    @State private var innerDisplay = false // on the Duo's inner display, which keeps no status bar
+    @AppStorage(DuoLaptop.enabledKey) private var laptopEnabled = true
+    @AppStorage("henge.duo.fnRow") private var deckFnRow = true
     @Environment(\.scenePhase) private var scenePhase
 
 
@@ -56,9 +63,12 @@ struct SessionView: View {
             let full = CGSize(width: geo.size.width + insets.leading + insets.trailing,
                               height: geo.size.height + insets.top + insets.bottom)
             let landscape = full.width > full.height
-            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: mac.aspect)
+            let fold = DuoFold.read(geo, full: full, insets: insets)
+            let wantsLaptop = laptopEnabled && DuoLaptop.applies(hinge: hinge, fold: fold?.frame, upright: !landscape)
+            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: mac.aspect,
+                                fold: wantsLaptop ? fold?.frame : nil)
             ZStack(alignment: .topLeading) {
-                (landscape || zoomed ? Color.black : Desk.page)
+                (landscape || zoomed || layout.laptop ? Color.black : Desk.page)
                 // One view in every layout: it holds the layer the engine draws into.
                 BootDisplay(display: display, role: .device)
                     .opacity(display.isExternal ? 0 : 1)
@@ -95,7 +105,9 @@ struct SessionView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .allowsHitTesting(false)
                     }
-                    if !layout.fillsPhone {
+                    if layout.laptop {
+                        laptopControls(layout)
+                    } else if !layout.fillsPhone {
                         uprightControls(layout)
                     } else {
                         floatingControls(layout)
@@ -159,10 +171,21 @@ struct SessionView: View {
                 controlsHidden = false
                 showRevealHint = false
             }
-            .onAppear { shown = layout.shown }
+            .onAppear {
+                shown = layout.shown
+                innerDisplay = fold != nil
+                laptop = wantsLaptop
+                HengeLog.log("duo", "session \(Int(full.width))×\(Int(full.height)), " + (fold.map { "fold y \($0.frame.minY)–\($0.frame.maxY), \($0.isActive ? "active" : "inactive")\($0.inferred ? ", inferred" : "")" } ?? "no fold"))
+            }
             .onChange(of: layout.shown) { shown = $0 }
+            .onChange(of: fold != nil) { innerDisplay = $0 }
+            .onChange(of: fold) { now in
+                HengeLog.log("duo", now.map { "fold y \($0.frame.minY)–\($0.frame.maxY), \($0.isActive ? "active" : "inactive")\($0.inferred ? ", inferred" : "")" } ?? "no fold")
+            }
+            .onChange(of: wantsLaptop) { laptop = $0 }
         }
-        .statusBarHidden(zoomed || Device.isPad)
+        .readsDuoHinge($hinge)
+        .statusBarHidden(zoomed || Device.isPad || innerDisplay)
         .persistentSystemOverlays(.hidden)
         .sheet(isPresented: $showDetails) { details }
         .confirmationDialog("Shut down \(mac.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
@@ -175,6 +198,14 @@ struct SessionView: View {
             zoomFollowing = on ? Task { await followPointer() } : nil
         }
         .onChange(of: pointerNeeded) { PointerLock.set(!$0) }
+        .onChange(of: laptop) { on in
+            HengeLog.log("duo", "laptop layout \(on ? "on" : "off")")
+            // The keys under a finger may be gone: nothing stays down on the Mac.
+            typing = false
+            DeckKeys.shared.spend()
+            HardwareKeys.releaseAll()
+            HardwareMouse.shared.releaseButtons()
+        }
         .onChange(of: scenePhase) { phase in
             guard phase != .active else {
                 display.refresh()
@@ -225,15 +256,40 @@ struct SessionView: View {
         let pad: CGRect
         let insets: EdgeInsets
         var barY: CGFloat?    // where the controls go in the space beside the screen, if it has room for them
+        var laptop = false    // the Mac above the Duo's fold, the deck (pad) below it
+        var below: CGRect = .zero // from the fold down, which a zoomed Mac must not show through
 
         var shown: CGSize {
             CGSize(width: min(touch.width / max(screen.width, 1), 1), height: min(touch.height / max(screen.height, 1), 1))
         }
 
-        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat) {
+        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat, fold: CGRect? = nil) {
             self.insets = insets
             let big = full.height >= 600 // an iPad on its side, or a window on one
-            if zoomed {
+            if let fold {
+                // Folded like a laptop: the Mac above the fold (with the status bar gone it is as wide as the
+                // display, the Duo's 669×455.5 being about the Mac's 1920×1320), the deck below it.
+                let above = CGRect(x: 0, y: 0, width: full.width, height: fold.minY)
+                if zoomed {
+                    let height = above.height * 2, width = height * aspect
+                    let x = min(0, max(above.width - width, above.width / 2 - centre.x * width))
+                    let y = min(0, max(above.height - height, above.height / 2 - centre.y * height))
+                    screen = CGRect(x: x, y: y, width: width, height: height)
+                    touch = above
+                    fillsPhone = true
+                } else {
+                    let margin: CGFloat = 6
+                    let width = min(full.width - 16, (above.height - 2 * margin) * aspect), height = width / aspect
+                    screen = CGRect(x: (full.width - width) / 2, y: (above.height - height) / 2, width: width, height: height)
+                    touch = screen
+                    fillsPhone = false
+                }
+                toolsY = 0
+                let top = fold.maxY + 4
+                pad = CGRect(x: 8, y: top, width: full.width - 16, height: max(full.height - insets.bottom - top, 60))
+                laptop = true
+                below = CGRect(x: 0, y: fold.minY, width: full.width, height: full.height - fold.minY)
+            } else if zoomed {
                 // Upright, as tall as the device. On its side, bigger than it fits: a big screen needs less.
                 let height = landscape ? full.height * (big ? 1.5 : 2) : max(full.height - insets.bottom, full.width / aspect)
                 let width = height * aspect
@@ -281,6 +337,22 @@ struct SessionView: View {
                 pad = CGRect(x: 8, y: top, width: width, height: max(bottom - top, 60))
             }
         }
+    }
+
+    // MARK: Folded like a laptop
+
+    @ViewBuilder private func laptopControls(_ layout: Layout) -> some View {
+        Color.black
+            .frame(width: layout.below.width, height: layout.below.height)
+            .position(x: layout.below.midX, y: layout.below.midY)
+        LaptopDeck(zoomed: zoomed, hidden: controlsHidden,
+                   toggleZoom: { zoomed.toggle() },
+                   showDetails: { showDetails = true },
+                   hideControls: { hideControls() },
+                   shutDown: { stopTapped() })
+            .frame(width: layout.pad.width, height: layout.pad.height)
+            .position(x: layout.pad.midX, y: layout.pad.midY)
+        if zoomed { zoomMap(layout) }
     }
 
     // MARK: Upright
@@ -508,6 +580,15 @@ struct SessionView: View {
                     Slider(value: $scrollSpeed, in: 0.1...1.5)
                     Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed changes apply immediately.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
+                if innerDisplay {
+                    Section("Fold") {
+                        Toggle("Laptop layout when upright", isOn: $laptopEnabled)
+                        Toggle("Escape and F1–F12 on the keyboard", isOn: $deckFnRow)
+                        Text("With the inner display upright, half folded or flat, the Mac sits above the fold and a keyboard and trackpad below it. Closed or on its side, the layout is as before."
+                             + (hinge.degrees.map { String(format: " The hinge is at %.0f°.", $0) } ?? ""))
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                 }
                 Section("Sharing") {
                     LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
