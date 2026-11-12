@@ -7,13 +7,49 @@ enum Device {
     static let isPad = UIDevice.current.userInterfaceIdiom == .pad
     static let name = isPad ? "iPad" : "iPhone"
 
+    /// The screen Henge is on, in points. An iPhone's window is its whole screen, so the window says which one:
+    /// an iPhone Duo has two, and UIScreen.main can be the one Henge is not on (a Mac fitted on the inner screen
+    /// got the outer screen's shape, 1920×1320, and thin bars above and below).
+    static var screenSize: CGSize {
+        if !isPad {
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+                .filter { $0.session.role == .windowApplication }
+            if let scene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first {
+                return scene.coordinateSpace.bounds.size
+            }
+        }
+        return UIScreen.main.bounds.size
+    }
+
     /// A Mac's screen that fills this device on its side: 1920 wide, as tall as the shape asks. iPads and
     /// squarer phones (iPhone Duo, about 1.46:1) would get bars above and below at 16:9. Phones wider
     /// than 16:9 come out at 1920×1080, as before.
-    static var fittingScreen: (width: Int, height: Int) {
-        let size = UIScreen.main.bounds.size
+    static var fittingScreen: (width: Int, height: Int) { fitting(screenSize) }
+
+    /// The same for any space. Squarer than 4:3 (an iPhone Duo's inner screen beside its status strip) is as
+    /// tall as a Mac's screen goes here, 1440, and narrower than 1920 instead.
+    static func fitting(_ size: CGSize) -> (width: Int, height: Int) {
         let shape = max(size.width, size.height) / max(min(size.width, size.height), 1)
-        return (1920, min(max(Int((1920 / shape / 8).rounded()) * 8, 1080), 1440))
+        let height = min(max(Int((1920 / shape / 8).rounded()) * 8, 1080), 1440)
+        return (shape < 4.0 / 3 ? Int((CGFloat(height) * shape / 8).rounded()) * 8 : 1920, height)
+    }
+
+    /// An iPhone's large screen: an unfolded iPhone Duo (951 × 669 points). On its side it keeps its status
+    /// bar, as a column at the top right with the time, battery and Wi-Fi, where a phone's screen hides it.
+    static var largeScreen: Bool { !isPad && min(screenSize.width, screenSize.height) >= 600 }
+    /// What a Mac that does not fill a large screen leaves at the right: room for that column, and Henge's
+    /// controls under it. The column is 53 points wide, 21 from the edge, and ends 102 from the top.
+    static let sideStrip: CGFloat = 84
+    static let sideStripCentre: CGFloat = 47.5
+    static let sideStripTop: CGFloat = 114
+
+    /// The fit for one Mac: all of the screen, or what its side strip leaves.
+    static func fitting(for mac: VirtualMac) -> (width: Int, height: Int) {
+        var size = screenSize
+        if largeScreen, !(mac.fillScreen ?? true) {
+            if size.width >= size.height { size.width -= sideStrip } else { size.height -= sideStrip }
+        }
+        return fitting(size)
     }
 
     /// Preserve the iPad's shape while reducing the virtual GPU's pixel work.
