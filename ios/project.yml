@@ -70,6 +70,8 @@ targets:
           # The Mac app loader is independent of the selected VM engine.
           - "-lhengetl"
           - "-lz"
+          # Henge's AppKit is found by name at run time (objc_getClass): keep every Objective-C class it has.
+          - "-ObjC"
           - "-lbz2"
           - "-lcompression"
           # On-device pairing for Built-in StikJIT (from Husk's src/rppairing-ios).
@@ -84,6 +86,16 @@ targets:
           - "AVFAudio"
           - "-framework"
           - "CoreFoundation"
+          - "-framework"
+          - "QuartzCore"
+          - "-framework"
+          - "CoreText"
+          - "-framework"
+          - "ImageIO"
+          - "-framework"
+          - "CoreVideo"
+          - "-framework"
+          - "UniformTypeIdentifiers"
     dependencies:
       # Built-in StikJIT's debugger process. Embedded into PlugIns/.
       - target: HengeJITHelper

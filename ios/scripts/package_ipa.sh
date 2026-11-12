@@ -9,8 +9,8 @@ set -e
 IOS="$(cd "$(dirname "$0")/.." && pwd)"
 TROLLSTORE=false
 [ "$1" = "--trollstore" ] && TROLLSTORE=true
-OUT="${HENGE_IPA_OUTPUT:-$HOME/Desktop/Henge.ipa}"
-[ "$TROLLSTORE" = true ] && OUT="${HENGE_IPA_OUTPUT:-$HOME/Desktop/Henge.tipa}"
+OUT="${HENGE_IPA_OUTPUT:-${HENGE_IPA_OUT:-$HOME/Desktop/Henge.ipa}}"
+[ "$TROLLSTORE" = true ] && OUT="${HENGE_IPA_OUTPUT:-${HENGE_IPA_OUT:-$HOME/Desktop/Henge.tipa}}"
 [ -d "$IOS/deps/StikJIT.xcframework" ] || "$IOS/scripts/fetch_deps.sh"
 # The bundled samples are Mac programs and a disk image. Prepare them outside
 # Xcode's iOS build-script environment before the app copies them as resources.

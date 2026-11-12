@@ -40,6 +40,26 @@ typedef struct TlHost {
     int soft_missing;
     /* The program may not start other processes (fork, posix_spawn, exec fail with EPERM), as on iOS. */
     int no_processes;
+    /* 1 when the host library must not answer this symbol although it has it (a Mac test runner refusing what
+       iOS lacks); install_name is "" for lookups without one. Asked after shim_lookup. */
+    int (*host_lacks)(const char *install_name, const char *symbol);
+    /* iOS's kernel rules for the program: no new executable memory (mmap or mprotect with PROT_EXEC fail), no Mach
+       service registration (bootstrap_check_in/register refused). For Mac runners shaped like iOS. */
+    int ios_kernel_rules;
+    /* Processes as threads: a program starting another program of its own (posix_spawn, exec of a Mach-O that is not
+       a system tool) gets it loaded into this process, in a namespace of its own (its own copy of every library it
+       loads, so its own globals), its main run on a thread; pids, parent pids, waiting, killing, exit and the Mach
+       bootstrap names programs meet each other by are answered to match. What iOS needs for apps built from
+       several processes (Chrome's renderers, Steam's web helper). */
+    int processes_as_threads;
+    /* Called when such a process starts, with its namespace and executable (the host adopts its bundle). */
+    void (*process_started)(int ns, const char *path);
+    /* Address space the host holds for the program's large reservations (4 GB or more, no access yet: Chromium's
+       allocators), where the system has too little room for them to find on their own (iOS: 64 GB in all). The
+       loader places them in it, each at the alignment its size implies; NULL if none. */
+    void *high_room[4];
+    size_t high_room_bytes[4];
+    int high_rooms;
     /* Called for each image once it is fixed up, before its initializers run (app-specific adjustments). */
     void (*image_linked)(TlImage *image);
 } TlHost;
@@ -54,10 +74,16 @@ void tl_host_init_region(TlHost *host, void *rx, void *rw, size_t bytes);
    bundle's frameworks, fixes them up, registers them, and runs their
    initializers. NULL with a reason in err. */
 TlImage *tl_load(TlHost *host, const char *path, char *err, size_t errlen);
-/* Make NSBundle.mainBundle the guest app's bundle (the folder holding
-   Contents/MacOS/<executable>). The process then belongs to that app: Henge
-   hands it the process, as LiveContainer does. 0, or -1. */
+/* Make NSBundle.mainBundle the guest app's bundle (the folder holding Contents/MacOS/<executable>) for the
+   guest's own code; the host (and the system acting for it) keeps its own. 0, or -1. */
 int tl_adopt_main_bundle(const char *app_path);
+/* The adopted bundle for every caller, not just the app's code: for Mac test runners, where macOS's UIFoundation
+   picks its AppKit-style text code by the main bundle (iOS's is UIKit's whatever the bundle). Before adopting. */
+void tl_main_bundle_for_everyone(void);
+/* A process started inside the app (namespace ns) runs as the app at app_path (its main bundle for its own code). */
+void tl_adopt_ns_bundle(int ns, const char *app_path);
+/* The adopted bundle (an NSBundle *), or NULL: for host code acting for the app (Henge's AppKit). */
+void *tl_main_bundle(void);
 /* Calls the executable's main. */
 int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp);
 
@@ -68,6 +94,13 @@ int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp);
 void *tl_runtime_lookup(const char *symbol);
 /* Loads a library (and what it links) as dlopen does for the program. NULL with a reason in err. */
 TlImage *tl_load_library(const char *path, char *err, size_t errlen);
+/* While an image's imports are being bound: whether it links AppKit's classes directly (_OBJC_CLASS_$_NS... from
+   AppKit), as Objective-C apps do, rather than finding them by name, as Rust's objc2 does. Hosts route the
+   program's objc_getClass through their AppKit only for the second kind (Chromium breaks when its objc_getClass is
+   not libobjc's own). */
+int tl_binding_links_appkit_classes(void);
+/* The namespace of the code at addr (0: the program, or not loaded here). */
+int tl_ns_of_address(const void *addr);
 /* The guest image holding addr, or NULL. */
 TlImage *tl_image_containing(const void *addr);
 
