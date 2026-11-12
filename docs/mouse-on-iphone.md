@@ -53,7 +53,11 @@ all reach macOS with AssistiveTouch off.
 
 ## Other mice
 
-Any mouse or trackpad works through GameController once AssistiveTouch is on. While a Logitech mouse passes
+Any mouse or trackpad works through GameController once AssistiveTouch is on. If a mouse connects with
+AssistiveTouch off and no vendor channel opens within 8 s, Henge says to turn AssistiveTouch on. AssistiveTouch
+draws its own pointer on the phone. UIKit leaves a pointer interaction's drivers detached on iPhone, so Henge
+attaches them after UIKit's own update, as on iPad (`PhonePointer`), so that the trackpad's request to hide the
+pointer over the Mac is made at all. Whether iOS then hides AssistiveTouch's pointer is still untested. While a Logitech mouse passes
 through HID++, Henge ignores GameController's copy of it, so no click arrives twice. Another brand's mouse
 can get the same treatment if it carries a vendor channel; its services show up in the log as
 `[mouse-bt] ... services: [...]`.
