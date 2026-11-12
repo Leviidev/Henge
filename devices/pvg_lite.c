@@ -404,6 +404,10 @@ void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]) {
     out[0] = p->barriers, out[1] = p->barrier_drains, out[2] = p->barrier_retries, out[3] = p->barrier_timeouts;
 }
 
+uint64_t hv_pvg_lite_last_present_ns(HvPvgLite *p) {
+    return p && p->metal ? hv_pvg_metal_last_present_ns(p->metal) : 0;
+}
+
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
     return p && p->metal ? hv_pvg_metal_gpu_frames(p->metal) : 0;
 }
