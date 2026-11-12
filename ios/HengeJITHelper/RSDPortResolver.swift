@@ -9,9 +9,15 @@ import dnssd
 /// (RemotePairingPortDiscovery) connects to the service to learn its port, and on some devices that never
 /// becomes ready. This reads the port from the service's SRV record with DNSServiceResolve instead, which
 /// needs no connection.
+///
+/// Every device on the network advertises the same service type, so the first answer is not necessarily this
+/// device's: a Mac, an iPhone and an iPad all show up. The SRV target's host name tells them apart, and the
+/// caller still verifies the port before using it (HengeJITWork.findWorkingPort).
 enum RSDPortResolver {
     struct Result {
         var port: UInt16?
+        /// Every advertised port, this device's own first.
+        var candidates: [UInt16]
         /// What happened, for the log: the port found, or why there is none.
         var detail: String
     }
@@ -29,24 +35,32 @@ enum RSDPortResolver {
         let browseError = DNSServiceBrowse(&browseRef, 0, 0, serviceType, "local.", browseCallback,
                                            context.toOpaque())
         guard browseError == kDNSServiceErr_NoError, let browseRef else {
-            return Result(port: nil, detail: "browse could not start (\(describe(browseError)))")
+            return Result(port: nil, candidates: [], detail: "browse could not start (\(describe(browseError)))")
         }
         state.queue = queue
+        state.localHost = normalizeHost(localHostName)
         DNSServiceSetDispatchQueue(browseRef, queue)
 
-        let found = state.done.wait(timeout: .now() + timeout) == .success
+        // Stop as soon as this device's own service is resolved; otherwise wait for the timeout and take
+        // whatever was advertised.
+        _ = state.done.wait(timeout: .now() + timeout)
         // Tear down on the queue the callbacks run on, so none runs after its ref is gone.
         return queue.sync {
             DNSServiceRefDeallocate(browseRef)
             state.resolveRefs.forEach(DNSServiceRefDeallocate)
             state.resolveRefs.removeAll()
             state.finished = true
-            if found, let port = state.port {
-                return Result(port: port, detail: "resolved \(serviceType) to port \(port) on \(state.host ?? "?")")
+            let ordered = state.ordered()
+            let detail: String
+            if let first = ordered.first {
+                detail = "resolved \(serviceType) to port \(first.port) on \(first.host)"
+                    + (ordered.count > 1 ? " (\(ordered.count) advertised)" : "")
+            } else {
+                var text = "no port within \(Int(timeout))s: \(state.seen) service(s) seen"
+                if let error = state.lastError { text += ", last error \(describe(error))" }
+                detail = text
             }
-            var detail = "no port within \(Int(timeout))s: \(state.seen) service(s) seen"
-            if let error = state.lastError { detail += ", last error \(describe(error))" }
-            return Result(port: nil, detail: detail)
+            return Result(port: ordered.first?.port, candidates: ordered.map(\.port), detail: detail)
         }
     }
 
@@ -56,23 +70,30 @@ enum RSDPortResolver {
         var queue: DispatchQueue?
         var resolveRefs: [DNSServiceRef] = []
         var seen = 0
-        var port: UInt16?
-        var host: String?
+        var resolved: [(host: String, port: UInt16)] = []
+        var localHost = ""
         var lastError: DNSServiceErrorType?
         var finished = false
 
-        func finish(port: UInt16, host: String) {
-            guard self.port == nil, !finished else { return }
-            self.port = port
-            self.host = host
-            done.signal()
+        func add(host: String, port: UInt16) {
+            guard !finished else { return }
+            guard !resolved.contains(where: { $0.port == port && $0.host == host }) else { return }
+            resolved.append((host, port))
+            if normalizeHost(host) == localHost { done.signal() }
+        }
+
+        /// This device's own advertisement first, then the other devices' on the network.
+        func ordered() -> [(host: String, port: UInt16)] {
+            let own = resolved.filter { normalizeHost($0.host) == localHost }
+            let rest = resolved.filter { normalizeHost($0.host) != localHost }
+            return own + rest
         }
     }
 
     private static let browseCallback: DNSServiceBrowseReply = { _, flags, interface, error, name, type, domain, context in
         guard let context else { return }
         let state = Unmanaged<State>.fromOpaque(context).takeUnretainedValue()
-        guard !state.finished, state.port == nil else { return }
+        guard !state.finished else { return }
         guard error == kDNSServiceErr_NoError else {
             state.lastError = error
             return
@@ -99,7 +120,17 @@ enum RSDPortResolver {
         // The port arrives in network byte order.
         let value = UInt16(bigEndian: port)
         guard value != 0 else { return }
-        state.finish(port: value, host: host.map { String(cString: $0) } ?? "?")
+        state.add(host: host.map { String(cString: $0) } ?? "?", port: value)
+    }
+
+    /// The Bonjour host name this device advertises, e.g. "iPad" for "iPad.local.".
+    private static var localHostName: String {
+        var buffer = [CChar](repeating: 0, count: 256)
+        if gethostname(&buffer, buffer.count) == 0 {
+            let name = String(cString: buffer)
+            if !name.isEmpty { return name }
+        }
+        return ProcessInfo.processInfo.hostName
     }
 
     private static func describe(_ error: DNSServiceErrorType) -> String {
@@ -110,4 +141,12 @@ enum RSDPortResolver {
         default: return "DNSServiceErrorType \(error)"
         }
     }
+}
+
+/// "iPad.local." and "iPad" are the same host; mDNS names use hyphens for spaces.
+private func normalizeHost(_ host: String) -> String {
+    var name = host.lowercased()
+    if name.hasSuffix(".") { name.removeLast() }
+    if name.hasSuffix(".local") { name.removeLast(6) }
+    return name.replacingOccurrences(of: " ", with: "-")
 }
