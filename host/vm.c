@@ -262,7 +262,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
     if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
         return fail(err, errlen, "Cannot open the auxiliary storage.");
-    size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)768 << 20;
+    size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)1536 << 20; /* engine default code cache: 1536 MB; smaller defaults evict and retranslate through the boot translation storm */
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
     m.log = c->log;
