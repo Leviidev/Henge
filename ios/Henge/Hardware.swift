@@ -163,6 +163,8 @@ final class HardwareMouse {
     private var reverse = false
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
+    private var vendorChannels: Set<UUID> = []
+    private var vendorMovesLogged = 0
 
     func start() {
         let defaults = UserDefaults.standard
@@ -191,10 +193,12 @@ final class HardwareMouse {
             HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
         })
         PointerLock.set(true)
+        if !Device.isPad { VendorMice.shared.start() } // an iPhone passes on no mouse without AssistiveTouch
     }
 
     func stop() {
         PointerLock.set(false)
+        if !Device.isPad { VendorMice.shared.stop() }
         releaseButtons()
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
@@ -217,11 +221,63 @@ final class HardwareMouse {
         guard let input = mouse.mouseInput, !mice.contains(where: { $0 === mouse }) else { return }
         mice.append(mouse)
         HengeLog.log("input", "mouse: \(mouse.vendorName ?? "?"), right button \(input.rightButton != nil), middle \(input.middleButton != nil)")
-        input.mouseMovedHandler = { [weak self] _, dx, dy in self?.moved(dx, dy) }
-        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(0, pressed) }
-        input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(1, pressed) }
-        input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(2, pressed) }
-        input.scroll.valueChangedHandler = { [weak self] _, first, second in self?.scrolled(first, second) }
+        // While a mouse passes through its maker's channel (VendorMice), what iOS also hands GameController of it
+        // (with AssistiveTouch on) is ignored, so no click arrives twice.
+        input.mouseMovedHandler = { [weak self] _, dx, dy in
+            guard let self, self.vendorChannels.isEmpty else { return }
+            self.moved(dx, dy)
+        }
+        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.gcButton(0, pressed) }
+        input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.gcButton(1, pressed) }
+        input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.gcButton(2, pressed) }
+        input.scroll.valueChangedHandler = { [weak self] _, first, second in
+            guard let self, self.vendorChannels.isEmpty else { return }
+            self.scrolled(first, second)
+        }
+    }
+
+    private func gcButton(_ physicalButton: Int32, _ pressed: Bool) {
+        // A release still goes through, so nothing pressed before a vendor channel opened stays down.
+        guard vendorChannels.isEmpty || !pressed else { return }
+        button(physicalButton, pressed)
+    }
+
+    // MARK: A mouse read through its maker's own channel (VendorMice). Any thread; the work runs on the main one.
+
+    /// A vendor channel opened or closed for this mouse; while any is open, GameController's copy is ignored.
+    func vendorChannel(_ id: UUID, open: Bool) {
+        DispatchQueue.main.async { [self] in
+            if open { vendorChannels.insert(id) } else { vendorChannels.remove(id) }
+        }
+    }
+
+    /// Raw sensor counts, Y down, unscaled, so macOS's own mouse settings set the feel.
+    func vendorMoved(_ dx: Int32, _ dy: Int32) {
+        DispatchQueue.main.async { [self] in
+            if vendorMovesLogged < 8 { vendorMovesLogged += 1; HengeLog.log("input", "vendor mouse moved \(dx), \(dy)") }
+            henge_vm_mouse_move(dx, dy)
+        }
+    }
+
+    /// 0 left, 1 right, 2 middle.
+    func vendorButton(_ button: UInt32, _ pressed: Bool) {
+        DispatchQueue.main.async { [self] in self.button(Int32(button), pressed) }
+    }
+
+    /// Whole wheel detents, positive away from the user (wheel) and to the right (pan).
+    func vendorScrolled(wheel: Int32, pan: Int32) {
+        DispatchQueue.main.async { [self] in
+            let configured = UserDefaults.standard.object(forKey: Self.scrollSpeedKey) == nil
+                ? 0.3 : UserDefaults.standard.double(forKey: Self.scrollSpeedKey)
+            let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
+            let way: Int32 = reverse ? -1 : 1
+            let units = { (n: Int32) in way * n.signum() * Self.wheelUnits(Float(abs(n)), scale: scale) }
+            if scrollsLogged < 24 {
+                scrollsLogged += 1
+                HengeLog.log("input", "vendor scroll: wheel \(wheel), pan \(pan)")
+            }
+            henge_vm_mouse_scroll(units(pan), units(wheel))
+        }
     }
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
