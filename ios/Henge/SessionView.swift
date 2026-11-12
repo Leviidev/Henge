@@ -24,7 +24,7 @@ struct SessionView: View {
     @AppStorage("henge.cpus") private var cpus = 4
     @AppStorage("henge.matchScreenColors") private var matchScreenColors = true
     @AppStorage("henge.display.brightness") private var screenBrightness = 1.0
-    @AppStorage("henge.cursor.scale") private var cursorScale = Device.isPad ? 1 : 3
+    @AppStorage("henge.cursor.scale") private var cursorScale = 0 // 0: automatic (pvg_metal.m cursor_scale)
     @AppStorage("henge.cursor.sharp") private var sharpCursor = true
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
 
@@ -498,6 +498,7 @@ struct SessionView: View {
                 }
                 Section("Pointer") {
                     Picker("Size", selection: $cursorScale) {
+                        Text("Auto").tag(0)
                         Text("1×").tag(1)
                         Text("2×").tag(2)
                         Text("3×").tag(3)
@@ -506,7 +507,7 @@ struct SessionView: View {
                     Toggle("Sharp edges", isOn: $sharpCursor)
                     LabeledContent("Scroll speed", value: String(format: "%.1f×", scrollSpeed))
                     Slider(value: $scrollSpeed, in: 0.1...1.5)
-                    Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed changes apply immediately.")
+                    Text("Auto shows the pointer the size macOS draws it on a Retina Mac, and enlarges it on a 1x Mac, whose pointer is a few dots across on a phone. Enlarging it can look blurry. Scroll speed changes apply immediately.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Sharing") {
