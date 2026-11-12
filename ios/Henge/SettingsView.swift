@@ -22,7 +22,7 @@ struct SettingsView: View {
     /// Conservative defaults for Golden Gate on an 8 GB iPad Air M3.
     /// Only changes user preferences; never modifies the guest disk or NVRAM.
     private func applyGoldenGateM3Preset() {
-        refreshRate = 30
+        refreshRate = 60
         fastFlush = true
         wfiSpin = false
         superblocks = false
@@ -118,7 +118,7 @@ struct SettingsView: View {
                         Button("Apply Golden Gate M3 speed preset") {
                             applyGoldenGateM3Preset()
                         }
-                        Text("For 8 GB iPads: 30 Hz, faster disk writes, no idle spinning or experimental superblocks, and a 512 MB JIT code cache. The Mac's RAM, CPUs, disk and identity are not changed. Restart the Mac; code cache changes require restarting Henge.")
+                        Text("For 8 GB iPads: 60 Hz target, faster disk writes, no idle spinning or experimental superblocks, and a 512 MB JIT code cache. If the guest cannot sustain 60 Hz, try 30 Hz manually. The Mac's RAM, CPUs, disk and identity are not changed. Restart the Mac; code cache changes require restarting Henge.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     Picker("Mac refresh rate", selection: $refreshRate) {
