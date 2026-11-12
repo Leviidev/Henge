@@ -104,6 +104,34 @@ jobs:
         working-directory: Henge
         run: zsh ios/scripts/package_ipa.sh
 
+      - name: Verify unsigned IPA package
+        working-directory: Henge
+        run: |
+          set -euo pipefail
+          IPA=/Users/runner/Desktop/Henge.ipa
+          test -s "$IPA"
+          unzip -t "$IPA" > /dev/null
+          unzip -Z1 "$IPA" | grep -Eq '^Payload/[^/]+\\.app/Info\\.plist        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-GoldenGate-M3-unsigned-${{ github.sha }}
+          retention-days: 14
+          path: /Users/runner/Desktop/Henge.ipa
+          if-no-files-found: error
+
+      - name: Package Henge.tipa
+        working-directory: Henge
+        run: zsh ios/scripts/package_ipa.sh --trollstore
+
+      - name: Upload Henge.tipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-tipa-${{ github.sha }}
+          path: /Users/runner/Desktop/Henge.tipa
+          if-no-files-found: error
+
+          echo "IPA size: $(du -h "$IPA" | cut -f1)"
+          echo "Package verified: archive readable and app Info.plist present"
+
       - name: Upload Henge.ipa
         uses: actions/upload-artifact@v4
         with:
