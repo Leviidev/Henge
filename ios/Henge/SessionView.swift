@@ -163,8 +163,12 @@ struct SessionView: View {
             .onAppear {
                 shown = layout.shown
                 wantSize(space)
+                display.picture = layout.screen
+                display.full = full
             }
             .onChange(of: layout.shown) { shown = $0 }
+            .onChange(of: layout.screen) { display.picture = $0 }
+            .onChange(of: full) { display.full = $0 }
             .onChange(of: space) { wantSize($0) }
         }
         .statusBarHidden(zoomed || Device.isPad)
