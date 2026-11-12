@@ -16,6 +16,9 @@ name: Build Henge IPA
 # Manual only (Actions tab > Build Henge IPA > Run workflow): pushes to main don't build an IPA.
 on:
   workflow_dispatch: {}
+  push:
+    branches:
+      - golden-gate-m3-optimized
 
 env:
   HUSK: ${{ github.workspace }}/Husk
@@ -104,7 +107,8 @@ jobs:
       - name: Upload Henge.ipa
         uses: actions/upload-artifact@v4
         with:
-          name: Henge-ipa-${{ github.sha }}
+          name: Henge-GoldenGate-M3-unsigned-${{ github.sha }}
+          retention-days: 14
           path: /Users/runner/Desktop/Henge.ipa
           if-no-files-found: error
 
