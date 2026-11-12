@@ -26,7 +26,7 @@ struct SessionView: View {
     @AppStorage("henge.display.brightness") private var screenBrightness = 1.0
     @AppStorage("henge.cursor.scale") private var cursorScale = Device.isPad ? 1 : 3
     @AppStorage("henge.cursor.sharp") private var sharpCursor = true
-    @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
+    @AppStorage(ScrollSensitivity.key) private var scrollSpeed = ScrollSensitivity.defaultValue
 
     @State private var typing = false
     @State private var zoomed = false
@@ -504,9 +504,9 @@ struct SessionView: View {
                     }
                     .pickerStyle(.segmented)
                     Toggle("Sharp edges", isOn: $sharpCursor)
-                    LabeledContent("Scroll speed", value: String(format: "%.1f×", scrollSpeed))
-                    Slider(value: $scrollSpeed, in: 0.1...1.5)
-                    Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed changes apply immediately.")
+                    LabeledContent("Scroll speed", value: String(format: "%.2f×", scrollSpeed))
+                    Slider(value: $scrollSpeed, in: ScrollSensitivity.range)
+                    Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed applies immediately to touch, trackpads, and mouse wheels.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Sharing") {
