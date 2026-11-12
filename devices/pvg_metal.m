@@ -178,6 +178,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     id<MTLSamplerState> screen_sampler, cursor_sampler;
     uint64_t on_screen; /* the mapping showing */
     _Atomic uint64_t gpu_frames;
+    _Atomic uint64_t last_present_ns; /* CLOCK_MONOTONIC of the guest's last scanout; stops while its display sleeps */
     dispatch_queue_t presenter;
     os_unfair_lock screen_lock; /* what to show, and the pointer as the presenter reads it */
     id<MTLTexture> screen_tex;
@@ -2586,6 +2587,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
 - (void)present:(uint64_t)mapping {
     if (atomic_load(&stopping)) return;
+    last_present_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     double now = now_seconds();
     on_screen = mapping;
     if ([self hasDisplayLayer]) {
@@ -2833,6 +2835,10 @@ void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
     dispatch_async(r->worker, ^{
         if (r->on_screen) [r present:r->on_screen];
     });
+}
+
+uint64_t hv_pvg_metal_last_present_ns(HvPvgMetal *m) {
+    return m ? ((__bridge HvReplay *)m)->last_present_ns : 0;
 }
 
 uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) {

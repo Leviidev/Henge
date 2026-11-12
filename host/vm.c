@@ -664,8 +664,23 @@ void hv_vm_key_hid(uint8_t usage, int down) {
     else hv_xhci_key(board.usb, usage, down);
 }
 
+/* macOS wakes a sleeping display for the USB keyboard but not for pointer input (the virtio mouse or the
+   USB trackpad). While the guest hasn't presented a frame for 3 s (its display is likely asleep), pointer
+   input also taps F20, a key macOS leaves unbound, at most once every two seconds. */
+static void wake_display_for_pointer(int held) {
+    static uint64_t wake_sent_ns;
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    uint64_t last = pvg ? hv_pvg_lite_last_present_ns(pvg) : 0, now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (!last || held || now - last < 3000000000ull || now - wake_sent_ns < 2000000000ull) return;
+    wake_sent_ns = now;
+    fprintf(stderr, "hengevm: display asleep; pointer input tapped F20 to wake it\n");
+    hv_xhci_key(board.usb, 0x6f, 1);
+    hv_xhci_key(board.usb, 0x6f, 0);
+}
+
 static void move_now(void *ctx) {
     if (atomic_load(&input_stopping)) return;
+    wake_display_for_pointer(left_sent);
     int64_t packed = (int64_t)(intptr_t)ctx;
     int32_t dx = (int32_t)(packed >> 32), dy = (int32_t)packed;
     if (dx) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, dx);
@@ -733,6 +748,7 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
     if (x > HV_TP_SENSOR_X) x = HV_TP_SENSOR_X;
     if (y < 0) y = 0;
     if (y > HV_TP_SENSOR_Y) y = HV_TP_SENSOR_Y;
+    wake_display_for_pointer(0);
     hv_xhci_touch(board.usb, id, phase, x, y, ts_ms);
 }
 
