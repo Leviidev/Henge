@@ -1,5 +1,6 @@
 #include "vmapple.h"
 #include "pvg_lite.h"
+#include "gl_personality.h"
 #include "sysreg.h"
 
 #include <errno.h>
@@ -247,11 +248,26 @@ static uint64_t tick(HvMachine *m, HvCpu *cpu) {
     return deadline;
 }
 
+/* Gives OpenGL apps the paravirtual GPU's renderer (gl_personality.h). The kernel's first TTBR1_EL1
+   write comes after iBoot has placed the kernelcache in RAM and before it reads its prelink XML.
+   HV_GL_PERSONALITY=0 leaves the kernelcache untouched. */
+static void gl_personality_hook(HvMachine *m) {
+    static int scans;
+    const char *env = getenv("HV_GL_PERSONALITY");
+    if ((env && !atoi(env)) || !m->main_ram || scans >= 8) return;
+    scans++;
+    int r = hv_gl_personality_patch(m->main_ram->host, m->main_ram->size);
+    fprintf(stderr, "hengevm: OpenGL renderer personality: %s\n",
+            r == HV_GL_PATCHED ? "added" : r == HV_GL_PRESENT ? "already present" : r == HV_GL_NO_ROOM ? "no room, left unchanged" : "not in RAM yet");
+    if (r != HV_GL_NOT_FOUND) scans = 0, m->ttbr1_hook = NULL;
+}
+
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]) {
     memset(b, 0, sizeof *b);
     b->ram_fd = -1;
     b->m = m;
+    m->ttbr1_hook = gl_personality_hook;
     b->cpu = cpu;
     b->ncpus = cfg->nr_cpus ? (int)cfg->nr_cpus : 1;
     if (b->ncpus > HV_MAX_CPUS) b->ncpus = HV_MAX_CPUS;

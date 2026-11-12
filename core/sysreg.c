@@ -212,6 +212,7 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
         uint64_t changed = (cpu->ttbr1_el1 ^ v) & ((cpu->tcr_el1 >> 22) & 1 ? ~0ull : 0x0000ffffffffffffull);
         cpu->ttbr1_el1 = v;
         if (changed) cpu->m->stats.flush_why[3]++, hv_tlb_flush(cpu);
+        if (changed && cpu->m->ttbr1_hook) cpu->m->ttbr1_hook(cpu->m);
         return 0;
     }
     case R(3, 0, 2, 0, 2):
