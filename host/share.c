@@ -682,9 +682,12 @@ static int clipboard_get(Conn *c, Request *r) {
     until.tv_sec = now.tv_sec + 25;
     until.tv_nsec = now.tv_usec * 1000;
     pthread_mutex_lock(&clip_mu);
-    agent_seen = time(NULL);
-    while (device_seq <= since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
-    agent_seen = time(NULL);
+    /* Existing agents use this initial cursor to learn the current sequence.
+       Return it immediately so the first new copy reaches their next request. */
+    if (since != (ULONG_MAX >> 1)) {
+        agent_seen = time(NULL);
+        while (device_seq <= since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
+    }
     unsigned long seq = device_seq;
     char *text = seq > since && device_clip ? strdup(device_clip) : NULL;
     pthread_mutex_unlock(&clip_mu);
@@ -702,7 +705,6 @@ static int clipboard_put(Conn *c, Request *r) {
     pthread_mutex_lock(&clip_mu);
     free(guest_clip);
     guest_clip = text;
-    agent_seen = time(NULL);
     pthread_mutex_unlock(&clip_mu);
     return respond_empty(c, r, 204, "No Content");
 }
@@ -880,6 +882,11 @@ static void *listener(void *arg) {
 
 int hv_share_start(const char *folder, const char *socket_path, const char *agent) {
     static int started;
+    pthread_mutex_lock(&clip_mu);
+    agent_seen = 0;
+    free(guest_clip);
+    guest_clip = NULL;
+    pthread_mutex_unlock(&clip_mu);
     if (started) return 0;
     if (!realpath(folder, root)) return -1;
     if (agent) snprintf(agent_path, sizeof agent_path, "%s", agent);

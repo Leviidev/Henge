@@ -27,16 +27,42 @@ enum Sharing {
         return seen >= 0 && seen < 40
     }
 
-    /// What is copied on the Mac is copied here too. The other way needs the system's paste button: iOS
-    /// asks for permission whenever an app reads the clipboard on its own.
-    static func followMacClipboard() async {
+    /// The helper already sends changes in both directions. Remember the change count of our own writes
+    /// so that text received from the Mac is not sent straight back to it.
+    @MainActor
+    static func followClipboard(automatic: Bool) async {
+        let board = UIPasteboard.general
+        var lastChange: Int?
         while !Task.isCancelled {
-            if let text = henge_share_take_clipboard() {
-                UIPasteboard.general.string = String(cString: text)
-                free(text)
+            if henge_vm_state() == 1 && UIApplication.shared.applicationState == .active {
+                let incoming = henge_share_take_clipboard().map { pointer in
+                    defer { free(pointer) }
+                    return String(cString: pointer)
+                }
+                let change = board.changeCount
+                if automatic && helperRunning && change != lastChange && board.hasStrings {
+                    // Read each change once. If iPadOS denies access, wait for another copy.
+                    lastChange = change
+                    if let text = board.string {
+                        henge_share_set_clipboard(text)
+                    } else if let incoming {
+                        board.string = incoming
+                        lastChange = board.changeCount
+                    }
+                } else if let incoming {
+                    board.string = incoming
+                    lastChange = board.changeCount
+                }
             }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(for: .milliseconds(500))
         }
+    }
+
+    /// An always-visible alternative to the system paste control.
+    @MainActor
+    static func pasteFromDevice() {
+        guard let text = UIPasteboard.general.string else { return }
+        paste(text)
     }
 
     /// Text from this device, pasted at the Mac's cursor. Without the helper it is typed, as far as the keyboard can.
