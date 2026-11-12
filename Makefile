@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_shutdown $(B)/test_usb_touchscreen
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -53,15 +53,29 @@ $(B)/henge-agent: tools/henge-agent.m
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit $< -o $@
 	codesign -f -s - $@
 
+# Guest-side native-touch companion: USB, with provisioned CoreHID compatibility.
+$(B)/henge-touch-agent: tools/henge-touch-agent.swift tools/native-touch/*.swift
+	@mkdir -p $(B)
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx swiftc -parse-as-library -target arm64-apple-macos15.0 -O tools/henge-touch-agent.swift tools/native-touch/*.swift -o $@
+	codesign -f -s - $@
+
+# Repackage on each invocation so changed signing settings cannot reuse an old profile.
+.PHONY: native-touch-package-force
+$(B)/henge-touch-agent.tar.gz: $(B)/henge-touch-agent $(B)/henge-agent tools/package_native_touch.py native-touch-package-force
+	python3 tools/package_native_touch.py --binary $< --sharing-binary $(B)/henge-agent --output $@
+
+$(B)/native_touch.o: host/native_touch.c host/native_touch.h | $(B)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # Compressed in the app: tools that sign an IPA would try to sign a bare Mach-O too.
 $(B)/henge-agent.gz: $(B)/henge-agent
 	gzip -9 -n -c $< > $@
 
-$(B)/share.o: host/share.c host/share.h
+$(B)/share.o: host/share.c host/share.h host/native_touch.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
-	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -lcompression -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal -framework IOSurface \
+$(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/native_touch.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
+	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/native_touch.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -lcompression -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal -framework IOSurface \
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
@@ -132,7 +146,7 @@ IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isy
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
 IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/native_touch.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
 
@@ -229,6 +243,24 @@ $(B)/install.o: host/install.c host/*.h devices/*.h | $(B)
 restore-objs: $(RESTORE_OBJ)
 .PHONY: restore-objs
 
+$(B)/test_native_touch: tests/test_native_touch.c host/native_touch.c host/native_touch.h host/share.c host/share.h | $(B)
+	$(CC) $(CFLAGS) tests/test_native_touch.c host/native_touch.c host/share.c -o $@
+
+$(B)/test_native_touch_session: tests/test_native_touch_session.swift ios/Henge/NativeTouchSession.swift $(B)/native_touch.o
+	xcrun --sdk macosx swiftc -parse-as-library -import-objc-header host/native_touch.h tests/test_native_touch_session.swift ios/Henge/NativeTouchSession.swift $(B)/native_touch.o -o $@
+
+test-native-touch: $(B)/test_native_touch $(B)/test_native_touch_session
+	./$(B)/test_native_touch
+	./$(B)/test_native_touch_session
+.PHONY: test-native-touch
+
+$(B)/test_guest_connection: tests/test_guest_connection.swift tools/native-touch/GuestConnection.swift | $(B)
+	xcrun --sdk macosx swiftc -swift-version 6 -strict-concurrency=complete -warnings-as-errors -parse-as-library $^ -o $@
+
+test-guest-connection: $(B)/test_guest_connection
+	python3 tests/test_guest_connection.py $<
+.PHONY: test-guest-connection
+
 # Session-owned display routing, independent of JIT, Metal and a connected monitor.
 $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_display_targets.swift | $(B)
 	xcrun --sdk macosx swiftc $^ -o $@
@@ -264,3 +296,12 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+# Guest USB touchscreen research: protocol checks need no macOS image.
+$(B)/test_usb_touchscreen: tests/test_usb_touchscreen.c $(ENGINE) $(DEV)
+	$(CC) $(CFLAGS) $^ $(METAL_LIBS) -o $@
+
+test-usb-touchscreen: $(B)/test_usb_touchscreen
+	@mkdir -p $(B)/usb-touch-research
+	./$(B)/test_usb_touchscreen
+.PHONY: test-usb-touchscreen

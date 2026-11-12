@@ -45,6 +45,7 @@ struct SessionView: View {
     @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
     @State private var map: UIImage?
     @State private var zoomFollowing: Task<Void, Never>?
+    @State private var nativeTouch = NativeTouchSession()
     @State private var helperRunning = false
     @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
     @Environment(\.scenePhase) private var scenePhase
@@ -85,9 +86,16 @@ struct SessionView: View {
                     }
                     .position(x: layout.screen.midX, y: layout.screen.midY)
                 if state != 2 {
-                    Trackpad()
-                        .frame(width: layout.touch.width, height: layout.touch.height)
-                        .position(x: layout.touch.midX, y: layout.touch.midY)
+                    Group {
+                        if nativeTouch.ready && !display.isExternal {
+                            NativeTouchSurface(imageRect: layout.screen.offsetBy(dx: -layout.touch.minX, dy: -layout.touch.minY),
+                                               revealsControls: controlsHidden)
+                        } else {
+                            Trackpad()
+                        }
+                    }
+                    .frame(width: layout.touch.width, height: layout.touch.height)
+                    .position(x: layout.touch.midX, y: layout.touch.midY)
                     if inputMode == .volumeButtons && volumeMode == .intercept {
                         // The capture interaction must live in the SwiftUI hierarchy to receive
                         // the volume-button events; it passes touches through to the trackpad.
@@ -174,13 +182,21 @@ struct SessionView: View {
             zoomFollowing?.cancel()
             zoomFollowing = on ? Task { await followPointer() } : nil
         }
-        .onChange(of: pointerNeeded) { PointerLock.set(!$0) }
+        .onChange(of: display.isExternal) { _, external in
+            if external { nativeTouch.stop() }
+        }
+        .onChange(of: nativeTouch.requested) { _, _ in nativeTouch.changedRequest() }
+        .onChange(of: pointerNeeded) { needed in
+            PointerLock.set(!needed)
+            if needed { nativeTouch.stop() }
+        }
         .onChange(of: scenePhase) { phase in
             guard phase != .active else {
                 display.refresh()
                 InstantResume.cameBack(mac)
                 return
             }
+            nativeTouch.stop()
             HardwareKeys.releaseAll()
             HardwareMouse.shared.releaseButtons()
             VolumeClicks.shared.releaseButtons()
@@ -199,6 +215,7 @@ struct SessionView: View {
             VolumeClicks.shared.start()
         }
         .onDisappear {
+            nativeTouch.stop()
             UIApplication.shared.isIdleTimerDisabled = false
             zoomFollowing?.cancel()
             StickyKeys.shared.releaseAll()
@@ -209,6 +226,15 @@ struct SessionView: View {
         .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: mac.aspect)))
         .task(id: bootAttempt) { await run() }
         .task { await Sharing.followMacClipboard() }
+        .task {
+            defer { nativeTouch.stop() }
+            while !Task.isCancelled {
+                nativeTouch.poll(
+                    active: state == 1 && scenePhase == .active && !pointerNeeded && !display.isExternal,
+                    helperRunning: Sharing.helperRunning)
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
@@ -509,6 +535,26 @@ struct SessionView: View {
                     Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed changes apply immediately.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                Section("Touch input") {
+                    Toggle("Native touch (experimental)", isOn: $nativeTouch.requested)
+                    Text("Requires macOS 27.2 or later and the updated Henge sharing helper. Allow Local Network for Henge Sharing Agent if macOS asks. If unavailable, the screen continues to work as a trackpad.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    switch nativeTouch.status {
+                    case 2: Text("Native touch is ready.")
+                    case 3: Text("This guest needs macOS 27.2 or later. Using trackpad.")
+                    case 4: Text("Allow Accessibility for henge-touch-agent in the Mac. Using trackpad.")
+                    case 5: Text("The Mac could not connect its touchscreen. Update the helper and try again. Using trackpad.")
+                    case 6: Text("The touch helper did not respond. Retrying automatically while you use the trackpad.")
+                    default: Text("Trackpad is active. Native touch connects after you close Details.")
+                    }
+                    Button("Type the Helper Update Command") {
+                        showDetails = false
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(600))
+                            await Sharing.typeSetUpCommand()
+                        }
+                    }
+                }
                 Section("Sharing") {
                     LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
                     if !helperRunning {
@@ -696,6 +742,7 @@ struct SessionView: View {
     }
 
     private func finish() {
+        nativeTouch.stop()
         if state == 1 || state == 4 {
             MacPreview.saveNow(for: mac)
             henge_vm_stop()
