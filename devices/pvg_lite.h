@@ -25,6 +25,9 @@ void hv_pvg_metal_destroy(HvPvgMetal *m);
 void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t channel, uint32_t *command, uint32_t length);
 int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t width, uint32_t height);
 int hv_pvg_lite_snapshot(HvPvgLite *p, uint8_t *bgra, uint32_t width, uint32_t height);
+typedef struct HvPvgCursor { uint32_t width, height; int32_t hot_x, hot_y; int32_t scale; int32_t shown; } HvPvgCursor;
+int hv_pvg_metal_cursor(HvPvgMetal *m, uint8_t *glyph, size_t cap, HvPvgCursor *out);
+int hv_pvg_lite_cursor(HvPvgLite *p, uint8_t *glyph, size_t cap, HvPvgCursor *out);
 int hv_pvg_metal_frame(HvPvgMetal *m, const uint8_t **pixels, uint32_t *width, uint32_t *height);
 int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t task, uint64_t offset, void *to, uint32_t length);
 uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset);
@@ -56,6 +59,10 @@ int hv_pvg_trace_on(void);
 /* The size macOS is told its screen is. Set before the machine starts; default 1920 x 1080. */
 void hv_pvg_lite_set_mode(uint32_t width, uint32_t height);
 void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm);
+/* Both at once, for a running Mac: a size and its pixels per mm (0 for the 400 mm default), told together. */
+void hv_pvg_lite_set_mode_density(uint32_t width, uint32_t height, float px_per_mm);
+/* The mode the guest acked last: 0, or -1 before it has acked one. Any thread. */
+int hv_pvg_lite_display_mode(HvPvgLite *p, uint32_t *width, uint32_t *height);
 
 /* Instant resume (host/snapshot.c). State blobs: called with out NULL they return the size needed. */
 size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap);
