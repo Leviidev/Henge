@@ -31,7 +31,24 @@ enum Device {
     }
     static var retinaMM: (width: Int, height: Int) {
         let s = retinaScreen
-        return (Int((Double(s.width) / 264 * 25.4).rounded()), Int((Double(s.height) / 264 * 25.4).rounded()))
+        return (Int((Double(s.width) / retinaPPI * 25.4).rounded()), Int((Double(s.height) / retinaPPI * 25.4).rounded()))
+    }
+    static let retinaPPI = 264.0
+
+    /// The external display's own diagonal, in inches, from the app's settings (`henge.external.inches`).
+    /// iOS tells an app nothing about a monitor's physical size, and macOS needs the size to offer a
+    /// panel's HiDPI modes at the right scale. Default 24: the LG UltraFine 4K this is tested with.
+    static var externalInches: Double {
+        let d = UserDefaults.standard.double(forKey: "henge.external.inches")
+        return d > 10 && d < 100 ? d : 24
+    }
+
+    /// The external display's density, in pixels per mm: its pixels over its physical diagonal.
+    static func externalDensity(points: CGSize, scale: CGFloat) -> Float {
+        let px = CGSize(width: points.width * scale, height: points.height * scale)
+        let diagPx = (px.width * px.width + px.height * px.height).squareRoot()
+        guard diagPx > 0 else { return 0 }
+        return Float(diagPx / (externalInches * 25.4))
     }
 
     /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
