@@ -27,7 +27,7 @@
 /* One never-mapped page past the window: an access that starts in its last page and runs past the end faults
    there and takes the TLB path, instead of reaching whatever the host has mapped next. */
 #define WGUARD WPAGE
-#define SLOTS 8192u /* hash slots: twice the pages it holds before starting over */
+#define SLOTS 32768u /* hash slots: twice the pages it holds before starting over */
 #define MAXPAGES (SLOTS / 2)
 
 typedef struct HvWindow {
@@ -116,20 +116,24 @@ int hv_window_attach(HvCpu *cpu) {
 int hv_window_reserve(HvMachine *m, int ncpus) {
     int bits = hv_window_enabled();
     if (!bits) return 0;
+    HvCpu *probe = calloc(1, sizeof *probe);
+    if (!probe) return -1;
     for (int i = 0; i < ncpus && i < HV_MAX_CPUS; i++) {
-        HvCpu probe = {0};
-        probe.pc_state = &m->percpu[i];
-        if (hv_window_attach(&probe) != 0) {
+        memset(probe, 0, sizeof *probe);
+        probe->pc_state = &m->percpu[i];
+        if (hv_window_attach(probe) != 0) {
             fprintf(stderr, "henge: no room for %d CPUs' user-memory windows of %d bits; running without them\n", ncpus, bits);
             for (int j = 0; j < HV_MAX_CPUS; j++) {
-                HvCpu q = {0};
-                q.pc_state = &m->percpu[j];
-                hv_window_detach(&q);
+                memset(probe, 0, sizeof *probe);
+                probe->pc_state = &m->percpu[j];
+                hv_window_detach(probe);
             }
             hv_knob[HV_K_EL0WINDOW] = 0;
+            free(probe);
             return -1;
         }
     }
+    free(probe);
     fprintf(stderr, "henge: user-memory windows: %d CPUs x %llu GB\n", ncpus, (unsigned long long)(1ull << bits) >> 30);
     return 0;
 }
