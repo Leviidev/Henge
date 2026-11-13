@@ -27,11 +27,14 @@ struct SessionView: View {
     @AppStorage("henge.cursor.scale") private var cursorScale = Device.isPad ? 1 : 3
     @AppStorage("henge.cursor.sharp") private var sharpCursor = true
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
+    @Environment(\.horizontalSizeClass) private var horizontalSize
+    @Environment(\.verticalSizeClass) private var verticalSize
 
     @State private var typing = false
     @State private var zoomed = false
     @State private var showDetails = false
     @State private var controlsHidden = false
+    @State private var hiddenOnLargeScreen = false // which of an iPhone Duo's two screens they were hidden on
     @State private var showRevealHint = false
     @State private var pointerRefused = false
     @AppStorage("henge.controls.hintsShown") private var revealHintsShown = 0
@@ -56,7 +59,8 @@ struct SessionView: View {
             let full = CGSize(width: geo.size.width + insets.leading + insets.trailing,
                               height: geo.size.height + insets.top + insets.bottom)
             let landscape = full.width > full.height
-            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: mac.aspect)
+            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: mac.aspect,
+                                strip: !Device.isPad && !(mac.fillScreen ?? true) ? Device.sideStrip : 0)
             ZStack(alignment: .topLeading) {
                 (landscape || zoomed ? Color.black : Desk.page)
                 // One view in every layout: it holds the layer the engine draws into.
@@ -159,10 +163,17 @@ struct SessionView: View {
                 controlsHidden = false
                 showRevealHint = false
             }
-            .onAppear { shown = layout.shown }
+            .onAppear {
+                shown = layout.shown
+                HengeLog.log("session", "layout: \(Int(full.width))x\(Int(full.height)) points, insets top \(Int(insets.top)) left \(Int(insets.leading)) "
+                             + "bottom \(Int(insets.bottom)) right \(Int(insets.trailing)), Mac at \(Int(layout.screen.minX)),\(Int(layout.screen.minY)) "
+                             + "\(Int(layout.screen.width))x\(Int(layout.screen.height)), fill \(mac.fillScreen ?? true)")
+            }
             .onChange(of: layout.shown) { shown = $0 }
         }
-        .statusBarHidden(zoomed || Device.isPad)
+        // An iPhone's large screen (iPhone Duo unfolded: regular both ways) keeps its status bar on its side too,
+        // over the Mac's menu bar extras: a Mac that fills the screen hides it, one with a side strip has it there.
+        .statusBarHidden(zoomed || Device.isPad || (onLargeScreen && (mac.fillScreen ?? true)))
         .persistentSystemOverlays(.hidden)
         .sheet(isPresented: $showDetails) { details }
         .confirmationDialog("Shut down \(mac.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
@@ -225,12 +236,13 @@ struct SessionView: View {
         let pad: CGRect
         let insets: EdgeInsets
         var barY: CGFloat?    // where the controls go in the space beside the screen, if it has room for them
+        var sideX: CGFloat?   // where they go as a column, in the strip a Mac leaves at the right of a large screen
 
         var shown: CGSize {
             CGSize(width: min(touch.width / max(screen.width, 1), 1), height: min(touch.height / max(screen.height, 1), 1))
         }
 
-        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat) {
+        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat, strip: CGFloat) {
             self.insets = insets
             let big = full.height >= 600 // an iPad on its side, or a window on one
             if zoomed {
@@ -250,15 +262,22 @@ struct SessionView: View {
                 let room = typing ? full.height - insets.bottom - insets.top - bar - 8 : full.height
                 // An iPad keeps clear of its side insets; a big iPhone (iPhone Duo) fills edge to edge.
                 let side = Device.isPad ? 2 * max(insets.leading, insets.trailing) : 0
-                let height = max(min(room, (full.width - side) / aspect), 200)
+                // The strip at the right, for the status bar's column and the controls (not while typing: the
+                // keyboard covers most of it, and the controls go back above the Mac).
+                let strip = typing ? 0 : strip
+                let height = max(min(room, (full.width - side - strip) / aspect), 200)
                 let width = height * aspect
                 let y = typing ? insets.top + bar : (full.height - height) / 2
-                screen = CGRect(x: (full.width - width) / 2, y: y, width: width, height: height)
+                screen = CGRect(x: (full.width - strip - width) / 2, y: y, width: width, height: height)
                 touch = CGRect(origin: .zero, size: full)
                 fillsPhone = true
                 toolsY = 0
                 pad = .zero
-                if y - insets.top >= 54 { barY = insets.top + (y - insets.top) / 2 }
+                if strip > 0 {
+                    sideX = full.width - Device.sideStripCentre
+                } else if y - insets.top >= 54 {
+                    barY = insets.top + (y - insets.top) / 2
+                }
             } else if landscape {
                 // Edge to edge. Phones wider than the Mac fill the height with room to spare beside the
                 // Dynamic Island; a squarer phone (iPhone Duo) fills all of it, island and corners included.
@@ -286,7 +305,7 @@ struct SessionView: View {
     // MARK: Upright
 
     @ViewBuilder private func uprightControls(_ layout: Layout) -> some View {
-        if !typing && !controlsHidden {
+        if !typing && !controlsAreHidden {
             HStack {
                 tool("eye.slash", "Hide controls") { hideControls() }
                 Spacer()
@@ -357,9 +376,17 @@ struct SessionView: View {
         .tint(Desk.raised)
     }
 
+    /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
+    private var onLargeScreen: Bool { !Device.isPad && horizontalSize == .regular && verticalSize == .regular }
+
+    /// Hidden controls stay hidden on the screen they were hidden on: folding an iPhone Duo moves the Mac to its
+    /// other screen, where they are back (and hidden again when it is unfolded).
+    private var controlsAreHidden: Bool { controlsHidden && hiddenOnLargeScreen == onLargeScreen }
+
     /// Hides the session's controls; four fingers on the screen bring them back. The first few times say so.
     private func hideControls() {
         controlsHidden = true
+        hiddenOnLargeScreen = onLargeScreen
         typing = false
         guard revealHintsShown < 3 else { return }
         revealHintsShown += 1
@@ -385,17 +412,28 @@ struct SessionView: View {
         let top = layout.insets.top + (landscape ? 8 : 6)
         let pill = HStack(spacing: 4) {
             tool("eye.slash", "Hide controls", tint: .white) { hideControls() }
-            tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
-            pasteTool
-            tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
-            tool("info.circle", "Details", tint: .white) { showDetails = true }
+            floatingTools
             Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 22).padding(.horizontal, 4)
             tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
         }
         .padding(.horizontal, 8)
         .frame(height: 50)
         .deskGlass(in: Capsule())
-        if controlsHidden {
+        if let sideX = layout.sideX {
+            // A column under the status bar's own, in the strip the Mac leaves. It is not over the Mac, so it
+            // has no button to hide it and is there whatever that button did before.
+            let room = layout.touch.height - Device.sideStripTop
+            VStack(spacing: 4) {
+                floatingTools
+                Rectangle().fill(Color.white.opacity(0.3)).frame(width: 22, height: 1).padding(.vertical, 4)
+                tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
+            }
+            .padding(.vertical, 8)
+            .frame(width: 50)
+            .deskGlass(in: Capsule())
+            .frame(width: 50, height: room, alignment: .top)
+            .position(x: sideX, y: Device.sideStripTop + room / 2)
+        } else if controlsAreHidden {
             EmptyView()
         } else if let barY = layout.barY {
             pill.position(x: layout.touch.midX, y: barY)
@@ -405,6 +443,14 @@ struct SessionView: View {
             pill.position(x: layout.touch.midX, y: layout.touch.height - layout.insets.bottom - 34)
         }
         if zoomed { zoomMap(layout) }
+    }
+
+    /// The controls a column has too.
+    @ViewBuilder private var floatingTools: some View {
+        tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
+        pasteTool
+        tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
+        tool("info.circle", "Details", tint: .white) { showDetails = true }
     }
 
     /// The whole screen, small, with where the zoomed view is on it.
