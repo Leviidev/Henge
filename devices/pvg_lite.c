@@ -225,8 +225,9 @@ static void display_event(HvPvgLite *p, uint8_t *d, uint32_t bits) {
     }
 }
 
-/* A mode list for the guest to ack: the next sequence number, ack pending, the events (4 the first time, the hotplug;
-   0xc for a change after an ack), and the state (1, waiting for the ack) stored last. */
+/* A mode list for the guest to ack: the next sequence number, ack pending, the event bit, and the state (1, waiting
+   for the ack) stored last. Bit 2 (4) is connect/reconfigure. Bit 3 (8) is disconnect in AppleParavirtDisplay's
+   handleHostInterrupt and calls destroyDisplayAttributes, so a mode change raises 4 only. */
 static void display_announce(HvPvgLite *p, uint8_t *d, uint32_t events) {
     p->display_seq++;
     *(uint32_t *)(d + 0x200) = p->display_seq;
@@ -293,7 +294,7 @@ static void display_follow(HvPvgLite *p) {
     if (size == p->display_mode && ppmm == p->display_ppmm) return; /* nothing the guest has not got */
     p->display_mode = size, p->display_ppmm = ppmm;
     display_put_modes(d, (uint32_t)(size >> 32), (uint32_t)size);
-    display_announce(p, d, 0xc);
+    display_announce(p, d, 4);
     fprintf(stderr, "hengevm: pvg-lite: display mode %ux%u (seq %u, +100 %x, mask %x)\n", (unsigned)(size >> 32), (unsigned)size,
             p->display_seq, *(uint32_t *)(d + 0x100), *(uint32_t *)(d + 0x104));
 }
