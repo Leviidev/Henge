@@ -26,8 +26,11 @@ static int cursor_scale(const uint8_t *page, uint32_t width) {
 #if TARGET_OS_IPHONE
     NSInteger saved = [[NSUserDefaults standardUserDefaults] integerForKey:@"henge.cursor.scale"];
     if (saved >= 1 && saved <= 3) return (int)saved;
+    if (page && *(const uint32_t *)(page + 0x60) == 0) return 1; /* external display */
+    if (width >= 2560) return 1;
     uint32_t width_mm = page ? *(const uint16_t *)(page + 0x14) : 0;
     if (width_mm && width * 25.4f / width_mm >= 150) return 1;
+    if (width_mm >= 300) return 1;
     static int defaultScale;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -920,6 +923,33 @@ static void sync_iosurface(HvObject *s) {
         FILE *f = fopen(path, "wb");
         if (f) fwrite(from, 1, s->alloc, f), fclose(f);
     }
+}
+
+/* Host IOSurface pixels back into guest memory after GPU work wrote to a multi-plane IOSurface. */
+static void sync_iosurface_to_guest(HvObject *s) {
+    if (!s || !s->iosurface || !s->mapped) return;
+    uint8_t *to = s->mapped + s->first;
+    BOOL by_plane = s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count;
+    uint64_t *have = s->shared_hashes ? (uint64_t *)s->shared_hashes.mutableBytes : s->plane_hash;
+    IOSurfaceLock(s->iosurface, kIOSurfaceLockReadOnly, NULL);
+    if (by_plane) {
+        for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
+            const uint8_t *src = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
+            size_t src_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
+            size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
+            uint64_t dst_row = s->plane_row[i], dst_off = s->plane_from[i];
+            if (!src || !dst_row || dst_off > s->alloc || rows > (s->alloc - dst_off) / dst_row) continue;
+            size_t bytes = MIN((size_t)dst_row, src_row);
+            for (size_t y = 0; y < rows; y++)
+                memcpy(to + dst_off + y * dst_row, src + y * src_row, bytes);
+            have[i] = hash_bytes(to + dst_off, plane_bytes(s, i));
+        }
+    } else {
+        const uint8_t *base = IOSurfaceGetBaseAddress(s->iosurface);
+        if (base) memcpy(to, base, MIN(s->alloc, IOSurfaceGetAllocSize(s->iosurface)));
+        s->content_hash = guest_hash(s);
+    }
+    IOSurfaceUnlock(s->iosurface, kIOSurfaceLockReadOnly, NULL);
 }
 
 /* A surface (IOSurface in the guest): a texture over its guest pages, so the
@@ -2129,10 +2159,24 @@ typedef struct {
     [blit endEncoding];
     /* Bit 1: this exec writes it, so the guest's copy is out of date from here on. Never
        upload that over what the GPU drew: mostly zeros, which show as black boxes. */
+    NSMutableSet<HvObject *> *written_iosurfaces = nil;
     for (uint32_t i = 0; i < nres; i++)
         if (res[i * 2 + 1] & 2) { /* and what it is made from: a texture in a heap is the heap's bytes */
-            for (HvObject *o = [self object:res[i * 2] task:task]; o; o = o->parent) o->guest_stale = YES;
+            for (HvObject *o = [self object:res[i * 2] task:task]; o; o = o->parent) {
+                o->guest_stale = YES;
+                if (o->surface && o->surface->iosurface &&
+                    (o->surface->fourcc == 0x34343466u || o->surface->fourcc == 0x66343434u)) {
+                    if (!written_iosurfaces) written_iosurfaces = [NSMutableSet new];
+                    [written_iosurfaces addObject:o->surface];
+                }
+            }
         }
+    if (written_iosurfaces.count) {
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            for (HvObject *s in written_iosurfaces) sync_iosurface_to_guest(s);
+        }];
+    }
     id e = nil; /* the open encoder */
     uint32_t etype = 0;
     for (uint32_t b = 0; b < nbuf; b++) {
