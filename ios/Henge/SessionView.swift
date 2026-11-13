@@ -189,6 +189,9 @@ struct SessionView: View {
             HardwareKeys.releaseAll()
             HardwareMouse.shared.releaseButtons()
             VolumeClicks.shared.releaseButtons()
+            // While docked to an external display, locking the phone makes the phone's scene inactive/background
+            // even though the external monitor stays visible; keep the Mac running unless there is no external display.
+            guard !display.isExternal else { return }
             if phase == .inactive { InstantResume.pause() }
             if phase == .background && bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
         }
@@ -621,6 +624,13 @@ struct SessionView: View {
         var buffer = [CChar](repeating: 0, count: 256)
         JITBootstrap.releaseLingeringDebugger()
         Sharing.prepare()
+        // What the guest's display driver answers when macOS asks whether this is a built-in panel: only a
+        // built-in display gets macOS's panel artwork (rounded corners, insets), so a Mac shown on a monitor
+        // answers external there. It is read once per guest boot: moving the Mac between screens needs a boot.
+        let docked = UIApplication.shared.connectedScenes.contains {
+            ($0 as? UIWindowScene)?.session.role == .windowExternalDisplayNonInteractive
+        } || UIScreen.screens.count > 1 || display.isExternal
+        EngineTuning.session["HV_PVG_EXTERNAL"] = docked ? "1" : "0"
         EngineTuning.apply()
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         if mac.isRetina {

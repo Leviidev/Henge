@@ -194,7 +194,7 @@ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
     if (atomic_exchange(&display_size, want) != want) atomic_fetch_add(&display_gen, 1);
 }
 
-/* The mode list and what goes with it, as the guest reads it: physical size, then the one mode at its rate. */
+/* The mode list and what goes with it, as the guest reads it: physical size, then the mode list at its rate. */
 static void display_put_modes(uint8_t *d, uint32_t w, uint32_t h) {
 #define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
 #define PUTF(off, v) (*(float *)(d + (off)) = (v))
@@ -204,12 +204,35 @@ static void display_put_modes(uint8_t *d, uint32_t w, uint32_t h) {
     PUT32(0x14, height_mm << 16 | width_mm);
     PUTF(0x24, (float)width_mm);
     PUTF(0x28, (float)height_mm);
-    PUT32(0x208, 1); /* one mode: */
-    PUT32(0x210, h << 16 | w);
-    {   /* m4 fork: 120 Hz on ProMotion (HV_HZ), so WindowServer animates at the panel's rate */
-        const char *hz = getenv("HV_HZ");
-        uint32_t r = hz && atoi(hz) > 0 ? (uint32_t)atoi(hz) : 60;
-        PUT32(0x214, r << 16);
+    /* +4c is two uint16_t (originX, originY), initialized by AppleParavirtDisplay::setupSharedState to 0xffff, 0xffff.
+       createDisplayAttributes skips originX/originY when *(uint32_t *)(d + 0x4c) == 0xffffffff. */
+    PUT32(0x4c, 0xffffffffu);
+    d[0x50] = (ppmm >= 5.0f) ? 2 : 1;
+    *(uint64_t *)(d + 0x58) += 1; /* configEpoch */
+    const char *hz = getenv("HV_HZ");
+    uint32_t r = hz && atoi(hz) > 0 ? (uint32_t)atoi(hz) : 60;
+    typedef struct { uint32_t w, h; } Mode;
+    Mode modes[8];
+    uint32_t n = 0;
+    modes[n++] = (Mode){ w, h };
+    if (ppmm >= 5.0f && (w & 1) == 0 && (h & 1) == 0 && w >= 1280 && h >= 720) {
+        /* SkyLight pairs (2W, 2H) as the 2x HiDPI backing of (W, H) only when both are in the mode list. */
+        modes[n++] = (Mode){ w / 2, h / 2 };
+        if (w == 3840 && h == 2160) {
+            /* Standard 24"/27" 4K HiDPI scaled tiers ("Looks like 2304x1296" and "More Space 3008x1692"). */
+            modes[n++] = (Mode){ 4608, 2592 };
+            modes[n++] = (Mode){ 2304, 1296 };
+            modes[n++] = (Mode){ 6016, 3384 };
+            modes[n++] = (Mode){ 3008, 1692 };
+        }
+    }
+    PUT32(0x208, n);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t off = 0x210 + i * 16;
+        PUT32(off + 0, modes[i].h << 16 | modes[i].w);
+        PUT32(off + 4, r << 16);
+        PUT32(off + 8, 0);
+        PUT32(off + 12, 0);
     }
 #undef PUT32
 #undef PUTF
@@ -245,14 +268,17 @@ static void display_set_page(HvPvgLite *p, uint64_t pa) {
 #define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
 #define PUTF(off, v) (*(float *)(d + (off)) = (v))
     PUT32(0x00, 1);
+    memcpy(d + 0x04, "Apple Display", 14);
     PUT32(0x18, 0x01000100);
     PUT32(0x1c, 0x400);
     PUT32(0x20, 3);
+    uint64_t size = atomic_load(&display_size);
+    if ((size >> 32) >= 2560) p->external = 1;
     /* +60 flags: 0 or 2 makes the driver mark the display external (no rounded-corner artwork); any other bit makes it
        the primary built-in panel. HV_PVG_EXTERNAL=1 keeps it external. */
     PUT32(0x60, p->external ? 0 : 1);
+    *(uint64_t *)(d + 0x68) = 0; /* protectionOptions */
     p->display_gen = atomic_load(&display_gen);
-    uint64_t size = atomic_load(&display_size);
     p->display_mode = size, p->display_ppmm = atomic_load(&display_ppmm);
     display_put_modes(d, (uint32_t)(size >> 32), (uint32_t)size);
     PUTF(0xa10, 1.0f); /* identity colour matrix */
@@ -298,6 +324,10 @@ static void display_follow(HvPvgLite *p) {
     float ppmm = atomic_load(&display_ppmm);
     if (size == p->display_mode && ppmm == p->display_ppmm) return; /* nothing the guest has not got */
     p->display_mode = size, p->display_ppmm = ppmm;
+    if ((size >> 32) >= 2560) {
+        p->external = 1;
+        *(uint32_t *)(d + 0x60) = 0;
+    }
     display_put_modes(d, (uint32_t)(size >> 32), (uint32_t)size);
     display_announce(p, d, 4);
     fprintf(stderr, "hengevm: pvg-lite: display mode %ux%u (seq %u, +100 %x, mask %x)\n", (unsigned)(size >> 32), (unsigned)size,
@@ -797,27 +827,16 @@ static void do_mapper(HvPvgLite *p) {
     hv_gicv3_pend(p->gic, p->iosfc_irq);
 }
 
-/* Device work no doorbell took care of: a channel that had to wait for another one's work. */
-/* Experiment (HV_PVG_VBLANK=1): the display's refresh event. The guest asks for event 8 in its mask (+104) while
-   something waits on the display's timing (a display link); without it a video wallpaper stops when nothing else
-   draws. Sent at the mode's rate while asked for. */
+/* Device work no doorbell took care of: a channel that had to wait for another one's work.
+   Note on display page +100/+104 and +68 in AppleParavirtDisplay (macOS 27):
+   - start_hardware writes 0xc (bits 2 and 3) to +104 (interrupt mask).
+   - handleHostInterrupt checks bit 2 (0x4 = connect/reconfigure -> createDisplayAttributes) and
+     bit 3 (0x8 = disconnect/unplug -> destroyDisplayAttributes). Raising bit 3 on a timer tears
+     down DisplayAttributes 60 times a second, preventing WindowServer from bringing the display up.
+   - +68 is protectionOptions (uint64_t), read by get_protection_options; vblank timing is driven by
+     AppleParavirtDisplay's own IOTimerEventSource. */
 static void vblank(HvPvgLite *p) {
-    static int on = -1;
-    static uint64_t period, next;
-    if (on < 0) {
-        on = getenv("HV_PVG_VBLANK") && atoi(getenv("HV_PVG_VBLANK"));
-        const char *hz = getenv("HV_HZ");
-        uint64_t r = hz && atoi(hz) > 0 ? (uint64_t)atoi(hz) : 60;
-        period = 24000000ull / r; /* host counter ticks (24 MHz) */
-    }
-    if (!on || !p->display_pa) return;
-    uint8_t *d = hv_phys_ptr(p->m, p->display_pa, 0x4000);
-    if (!d || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
-    uint64_t now = mach_absolute_time();
-    if (now < next) return;
-    next = now + period;
-    display_event(p, d, 8);
-    p->vblanks++;
+    (void)p;
 }
 
 void hv_pvg_lite_poll(HvPvgLite *p) {
@@ -845,7 +864,12 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
         v = __atomic_exchange_n(&p->status, 0, __ATOMIC_ACQ_REL);
         break;
     case 0x122c: v = 1; break;
-    case 0x1234: v = p->external ? 0 : 1; break; /* port 0 built in, not external */
+    case 0x1234: {
+        uint64_t cur = atomic_load(&display_size);
+        int ext = p->external || (cur >> 32) >= 2560 || (getenv("HV_PVG_EXTERNAL") && atoi(getenv("HV_PVG_EXTERNAL")));
+        v = ext ? 0 : 1;
+        break; /* port 0 built in (1) vs external (0) */
+    }
     case 0x1014: /* displays with an event, cleared by the read */
         v = __atomic_exchange_n(&p->display_bits, 0, __ATOMIC_ACQ_REL);
         if (v && p->display_reads_logged++ < 4) fprintf(stderr, "hengevm: pvg-lite: guest reads +1014 = %llx\n", (unsigned long long)v);
