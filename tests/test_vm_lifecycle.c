@@ -21,11 +21,14 @@ static int failures;
 static _Atomic int reader_done;
 HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
 void hv_prof_ios_start(void) {}
+static int install_ok;
 int hv_install_start(HvVirtioUsb *usb, const char *ipsw, const char *work, uint64_t ecid,
                      HvInstallProgress progress, void *user) {
     (void)usb; (void)ipsw; (void)work; (void)ecid; (void)progress; (void)user;
-    return -1;
+    return install_ok ? 0 : -1;
 }
+static int detached;
+void hv_install_detach(void) { detached++; }
 static void check(const char *what, int ok) {
     if (!ok) { fprintf(stderr, "FAIL: %s\n", what); failures++; }
 }
@@ -200,11 +203,38 @@ int main(void) {
         check("refused, it can start from cold", henge_vm_state() == 0 && henge_vm_can_start());
         unlink(snap);
     }
+    /* A device install: when its machine stops, the restore tools let go of its USB port and the machine is
+       released, so a device starts in the same launch (it used to need Henge quit and opened again). */
+    {
+        uint32_t spin[] = {0x14000000};
+        write_file(rom, spin, sizeof spin);
+        install_ok = 0;
+        check("failed install start reports an error",
+              henge_vm_install(rom, disk, aux, 1, "none.ipsw", dir, 64, 2, error, sizeof error) != 0);
+        check("failed install detaches the restore tools and allows a start",
+              detached == 1 && henge_vm_state() == 0 && henge_vm_can_start());
+        install_ok = 1;
+        int rc = henge_vm_install(rom, disk, aux, 1, "none.ipsw", dir, 64, 2, error, sizeof error);
+        if (rc) fprintf(stderr, "install: %s\n", error);
+        check("install starts", rc == 0 && henge_vm_state() == 1);
+        check("nothing else starts while it runs", !henge_vm_can_start());
+        henge_vm_stop();
+        for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
+        check("install's machine stops", henge_vm_state() == 2);
+        check("restore tools detached", detached == 2);
+        check("install's machine released", hv_vm_board()->ram == NULL && hv_vm_board()->vusb == NULL);
+        check("a device can start after an install", henge_vm_can_start());
+        rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        check("a device boots after an install without quitting", rc == 0);
+        henge_vm_stop();
+        for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
+        check("and stops", henge_vm_state() == 2);
+    }
     hv_vm_destroy();
     atomic_store(&reader_done, 1);
     pthread_join(reader, NULL);
     hv_jit_region_close(&jit);
     unlink(rom); unlink(disk); unlink(aux); rmdir(dir);
-    printf("VM lifecycle: 12 power cycles, 3 failed boots and a suspend/resume, %d failures\n", failures);
+    printf("VM lifecycle: 12 power cycles, 3 failed boots and a suspend/resume, an install, %d failures\n", failures);
     return failures != 0;
 }
