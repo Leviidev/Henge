@@ -1,10 +1,12 @@
 # Light build: one clang call per file, no parallel jobs needed.
 CC = clang
-CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices
+# ENGINE_DEFS: build-time engine settings for experiments, such as ENGINE_DEFS=-DHV_TLB_BITS=12 (core/cpu.h).
+ENGINE_DEFS ?=
+CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices $(ENGINE_DEFS)
 B = build
 
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
-       $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
+       $(B)/exception.o $(B)/sysreg.o $(B)/machine.o $(B)/window.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o
@@ -65,8 +67,10 @@ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
-# mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
+# mmu.c and window.c (which its TLB drops call): no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
 $(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
+	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
+$(B)/window.o: core/window.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
 $(B)/%.o: core/%.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -93,7 +97,7 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
+$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/snapshot.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o $(B)/fault_bench.o
 	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -lcompression -o $@
 
 test-vm-lifecycle: $(B)/test_vm_lifecycle
@@ -130,13 +134,16 @@ IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
 # ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
-IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp $(ENGINE_DEFS)
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/fault_bench.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
 
 $(IB)/core/mmu.o: core/mmu.c core/*.h host/*.h devices/*.h
+	@mkdir -p $(dir $@)
+	$(IOS_CC) $(IOS_CFLAGS) -mgeneral-regs-only -c $< -o $@
+$(IB)/core/window.o: core/window.c core/*.h host/*.h devices/*.h
 	@mkdir -p $(dir $@)
 	$(IOS_CC) $(IOS_CFLAGS) -mgeneral-regs-only -c $< -o $@
 $(IB)/%.o: %.c core/*.h host/*.h devices/*.h
@@ -170,6 +177,12 @@ $(IB)/libhengetl.a: $(TL_IOS_OBJ) $(TL_SHIM_IOS_OBJ) $(IB)/tl/shim/hk_symbols.o
 	xcrun --sdk iphoneos libtool -static -o $@ $(TL_IOS_OBJ) $(TL_SHIM_IOS_OBJ) $(IB)/tl/shim/hk_symbols.o
 ios-lib: $(IB)/libhengevm.a $(IB)/libhengetl.a
 .PHONY: ios-lib
+
+# ENGINE_DEFS can change the HvCpu layout, so every engine object is rebuilt when it changes: mixing objects
+# built under two settings links without complaint and breaks at run time.
+DEFS_STAMP = $(B)/engine-defs.stamp
+$(shell mkdir -p $(B); [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = "$(ENGINE_DEFS)" ] || printf '%s' "$(ENGINE_DEFS)" > $(DEFS_STAMP))
+$(ENGINE) $(DEV) $(IOS_OBJ): $(DEFS_STAMP)
 
 # The app's glue to it (ios/Henge/Native/henge-tl.c) on the Mac: import a disk image, describe what it holds, run a program.
 $(B)/test_tl_glue: tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c | $(B)
