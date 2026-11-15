@@ -1,6 +1,6 @@
 # Changelog
 
-This fork collects the fixes from the community forks of [Leviidev/Henge](https://github.com/Leviidev/Henge)
+Henge collects the fixes from the community forks of [Leviidev/Henge](https://github.com/Leviidev/Henge)
 into one build, with a few additions, aimed above all at iPad (tested hardware: iPad Pro M4).
 Every change keeps its original author in the git history.
 
@@ -63,7 +63,7 @@ Based on upstream `main` at b744a78.
 - Personal (free) teams can sign the app: `HENGE_ENTITLEMENTS`.
   — both: [hungbenjamin402](https://github.com/hungbenjamin402/Henge)
 
-### New in this fork
+### Additions
 - **About This Mac can report the device Henge runs on**: a per-Mac *About This Mac*
   setting makes the Mac say it is this iPhone/iPad, with its chip (the config region's
   SoC name) and its name (a boot-time fixup of the firmware's Apple ADT device tree,
