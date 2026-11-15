@@ -4,7 +4,7 @@ Built on current upstream e98920c. Adds exact-tag multiwindow kernel read cachin
 
 The segmented JIT ring and hot-system-register work derive in part from oliverames/Henge (upstream PR #186); this is an integration and additional correctness/performance work, not an independent claim of authorship. Related prior experiments: bradenbeast PRs #78/#80/#81 and selected custom-fork engine work. The upstream review should retain that original attribution; this branch combines that groundwork with the additional checked-reuse and selective branch-cache changes described below.
 
-Native checks: `make test-memory-jit`, then the existing `make test` on arm64 macOS. This extracted branch has NOT yet been cloud compiled. The previously shipped aggregate passed these tests; that is not validation of this rebase. No hardware thermal/FPS improvement is claimed.
+Native checks: `make test-memory-jit`, then the existing `make test` on arm64 macOS. This extracted branch passed ARM64 macOS source checks in https://github.com/stride-praline-2f-ai/henge-/actions/runs/43724598061, including the previous register-policy reference, precise load/store faults, ring/selective IJC eviction, retention, branch sites and native publication. The tested code tree is a19cfd6ae1d1d2f4bb014af5445ba77f2e3fa004 (fork commit a40441dd378c76c1af9306dfa113b161fa896c7b). No hardware thermal/FPS improvement is claimed.
 
 No app branding, version changes, iOS17 Metal removal, IPA workflow or translation-layer deletions are included. New upstream Mac Apps sources remain intact.
 
@@ -17,5 +17,5 @@ work overlaps PR157. Preserve that attribution when extracting this integrated
 follow-up; this contribution adds checked memory/PAN/invalidation coverage and
 cache-preservation extensions rather than claiming the original ring design.
 Native custom-integration regression/ASan/UBSan/TSan and full app build passed
-43719589751; updated standalone upstream-engine validation follows separately.
+43719589751; updated standalone upstream-engine validation passed43724598061.
 Physical M4/Duo FPS and energy are not measured by the cloud M1 runner.
