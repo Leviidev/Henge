@@ -6,6 +6,7 @@
 
 #include "cpu.h"
 #include "jit_region.h"
+#include "quiesce_wait.h"
 
 /* Guest physical memory: RAM regions backed by host memory, and MMIO regions
    handled by device callbacks. The fast path only ever sees RAM. */
@@ -24,10 +25,6 @@ typedef struct HvRam {
     /* Per page: the VA page (| 2) its blocks have been cached as branch targets under since its code last changed;
        0 none, ~0 more than one. So a code change drops just those cached targets (hv_invalidate_code). */
     uint64_t *ijc_va;
-    /* Per page: the exits from other pages chained into it (a slot + 1, 0 none), listed through HvMachine.slot_xnext,
-       so its code changing unchains just those (it scanned every such exit, under the translation lock: 2.3% of the
-       phone's busy time at a login, and the other CPUs waited for the lock). */
-    uint32_t *xhead;
     size_t npages;
 } HvRam;
 
@@ -50,6 +47,7 @@ typedef struct HvBlock {
     uint64_t pg;
     uint32_t *code;
     struct HvBlock *next;
+    uint32_t host_next; /* descriptor index+1 of next block starting on this host page */
     uint32_t maker;      /* the CPU that translated it (index + 1; 0: not a CPU, as in tests) */
 } HvBlock;
 
@@ -65,10 +63,15 @@ typedef struct HvBlock {
 #define HV_MAX_BLOCKS (3 << 20) /* a macOS boot runs well over a million distinct blocks; a full flush retranslates them all */
 #define HV_PROF_RING (1 << 16)
 #define HV_MAX_SLOTS (6 << 20)  /* chainable exits: about two per block */
+#define HV_FLUSH_EVICT 2        /* flush_pending: the code cache is full; taking back its oldest segment will do */
 
 /* Counters for --stats: where the time goes. */
 typedef struct HvStats {
+    uint64_t duplicate_place_avoided, duplicate_bytes_avoided, duplicate_place_late;
+    uint64_t flush_capacity, flush_block_limit, jit_tail_allocations;
     uint64_t blocks, translations, block_flushes;
+    uint64_t evictions, evict_ticks, evict_blocks, evict_unchained; /* code-cache segments taken back, host ticks it took, blocks dropped, chained exits undone */
+    uint64_t evict_phase[3];  /* of those ticks: caches, blocks and hash; the slots; the instruction-cache lines */
     uint64_t flush_smc, flush_ic, flush_full;  /* why translations were dropped */
     uint64_t chained, ijc_fills, ijc_resets;
     uint64_t xchained;
@@ -128,6 +131,7 @@ typedef struct HvStats {
     uint64_t helper[12];      /* by HV_OP_* */
     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
+    uint64_t vmem_read_reuses, metadata_reclaim_bytes;
 } HvStats;
 
 #define HV_MAX_CPUS 8
@@ -154,10 +158,18 @@ typedef struct HvTlbStash {
 } HvTlbStash;
 
 typedef struct HvPerCpu {
+    struct HvFastmem *fastmem; /* owned here, survives CPU reset */
     /* Interrupt lines into this CPU, driven by the GIC. First and together:
        translated code reads both with one load (HvCpu.lines_ptr). */
     int irq_line, fiq_line;
     uint64_t *ijc;           /* indirect-branch cache tables (cpu->ijc points here) */
+    uint64_t *ijc_segments; /* conservative slot bitmaps per JIT segment, owner-written */
+    uint32_t ijc_segment_count;
+    uint64_t ijc_sites[HV_IJC_TABLES][32]; /* slot-address hints, never independent target pointers */
+    struct {uint64_t site,target;uint32_t flags,hits;} branch_history[256];
+    uint64_t branch_observations;
+    uint64_t jit_seen;
+    uint32_t jit_sample_count;
     uint64_t ijc_pages[2][1024]; /* hashed bitmap of the user pages any process cached targets in (for all-ASID TLBIs) */
     /* Hashed bitmap of (page, salt) pairs with cached targets: a TLBI for one
        address space drops its entries only if that address space cached
@@ -201,6 +213,11 @@ typedef struct HvPerCpu {
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
        may be using TLB entries right now. */
     int active, tlb_live;
+    uint64_t timer_deadline;
+    uint32_t timer_deadline_valid;
+    uint64_t wfe_ticks, wfe_timeouts, wfe_dispatches;
+    uint64_t sync_sleeps, sync_timeouts, sync_errors; /* per waiting CPU; diagnostic snapshots are atomic */
+    uint32_t ack_event;          /* generation for both acknowledgement and parked-state notifications */
     uint32_t ack_waiters;        /* CPUs asleep in hv_cpu_sync waiting for ack_seq to move (HV_SYNC_WAIT) */
     uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
     uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; HV_WALK_ANY: a process switch */
@@ -228,12 +245,14 @@ typedef struct HvMachine {
     HvBlock *blocks;
     int nblocks;
     uint32_t max_blocks, max_slots; /* sized from the JIT region (machine.c) */
-    int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left */
+    int flush_pending;   /* set by helpers; the dispatcher flushes once the block has left. HV_FLUSH_EVICT: only room is needed */
 
     void *gic;
     /* Devices: called between blocks every so often and while the CPU waits.
        Returns the host time (mach_absolute_time units) of the next timer event, or 0. */
     uint64_t (*tick)(struct HvMachine *m, HvCpu *cpu);
+    /* Timer register writes must update GIC lines immediately, without incidental device polling. */
+    uint64_t (*timer_changed)(struct HvMachine *m, HvCpu *cpu);
     void *tick_opaque;
     /* GIC CPU interface system registers (ICC_*_EL1), reg = op0:op1:CRn:CRm:op2. */
     uint64_t (*icc_read)(struct HvMachine *m, HvCpu *cpu, uint32_t reg);
@@ -246,6 +265,11 @@ typedef struct HvMachine {
     int gen_checks;
     int trace;           /* print every block entered */
     int log;             /* 1: unknown sysregs, undefined instructions, unmapped accesses; 2: also every exception */
+    int fastmem_enabled; /* boot-time opt-in; kernel read LUT prototype */
+    int fastmem_tlb_first; /* probe the secondary kernel LUT only after an ordinary TLB miss */
+    int fastmem_diagnostics; /* boot-time opt-in; extra instructions count actual JIT outcomes */
+    int tlb_preload; /* load the host addend alongside its tag; guard before guest memory */
+    int chain_stub_reference; /* private fixture:1 compact reference,-1 force inline;0 selects by cache reach */
     int slow_mem;        /* tests: send every load and store through hv_mem_emulate */
     uint64_t switch_flush_pc[4]; /* HV_SWITCH_FLUSH=3: PCs of the TLBI VMALLE1s seen within 20 us of a TTBR0 change (xnu's pmap switch) */
     uint64_t stat_slow_mem; /* hv_mem_emulate calls */
@@ -253,6 +277,10 @@ typedef struct HvMachine {
     uint64_t watch_va;   /* debugging: log every write that touches this guest VA (0: off) */
     uint64_t watch_pa;   /* debugging: the same by physical address */
     HvStats stats;
+    int deadline_kicks_enabled;
+    _Atomic uint64_t timer_kicks_cpu0, timer_kicks_due, timer_kicks_unknown, timer_kicks_deferred;
+    int wait_stats;
+    int jit_tail_enabled;
     int chain;               /* block chaining and the indirect-branch cache are enabled */
     uint64_t *slots;         /* chainable exits' targets (0: not chained) */
     uint32_t **slot_site;    /* the B in each exit's stub that chaining rewrites to jump to the target */
@@ -261,14 +289,31 @@ typedef struct HvMachine {
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
-       (| 1) so that invalidating its code can unchain it. Each such page's chained exits are a list from its
-       HvRam.xhead through slot_xnext (slot + 1, 0 at the end); a slot is on one at a time, until the page's code changes. */
+       (| 1) so that invalidating its code can unchain it. xchained links their destination-page buckets. */
     uint64_t *slot_xa, *slot_xpa;
-    uint32_t *slot_xnext, nxchained;
+    /* Intrusive next indices (slot+1, zero terminator), bucketed by destination PA.
+       All mutations hold tr_mu; reset happens with guest CPUs parked. */
+    uint32_t *xchained, nxchained;
+#define HV_XCHAIN_BUCKETS 65536
+    uint32_t xchain_heads[HV_XCHAIN_BUCKETS];
+    uint64_t xchain_examined, xchain_removed;
     uint32_t nslots;
+    uint32_t *slot_free, nslot_free, slot_take;
+    uint32_t blocks_wrap;
+    int branch_site_hints;
+    int ijc_pair;
+    int jit_retention;
+    uint64_t branch_hint_emissions;
+    uint32_t *jit_page_heads;
+    size_t jit_page_count;
+    uint64_t ijc_evict_examined, ijc_evict_removed, ijc_evict_preserved;
+    uint32_t **evict_words;
+    size_t evict_words_cap;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
     int ncpus;
+    void (*notify_cpu_active)(void *); /* optional host idle-ticker wake */
+    void *activity_opaque;
     HvPerCpu percpu[HV_MAX_CPUS];
     /* With more than one CPU, only the holder of this runs guest code (a fair
        ticket lock, handed over at every kick and while a CPU sleeps). */
@@ -278,9 +323,12 @@ typedef struct HvMachine {
     /* Translating and inserting blocks, the JIT region and the slots. */
     pthread_mutex_t tr_mu;
     /* Stopping every CPU to flush all translations. */
+    uint64_t cntvoff; /* host counter at board reset; shared origin for all vCPUs */
     pthread_mutex_t stw_mu;
     pthread_cond_t stw_cv;
     int stw_active;
+    HvQuiesceWait quiesce;
+    int quiesce_enabled, quiesce_initialized;
     pthread_mutex_t big_mu;
     pthread_cond_t big_cv;
     uint64_t big_next, big_serving;
@@ -288,11 +336,6 @@ typedef struct HvMachine {
     /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
     uint64_t *prof;
     uint32_t prof_head, prof_tail;
-    /* The host counter when the machine started: every CPU's CNTVOFF, so the guest's virtual counter (its
-       mach_absolute_time) starts near 0 as on a Mac or under Virtualization.framework. With the host's own
-       count (days of uptime) macOS 12 took the user as idle for that long and put itself to sleep while
-       still starting up: its window server never drew. */
-    uint64_t cntvoff;
 } HvMachine;
 
 static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
@@ -300,7 +343,7 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
     return (uint32_t)(h ^ (h >> 29)) & (HV_BLOCK_HASH - 1);
 }
 
-/* Lock-free: blocks are only added (release store) until a flush, which stops every CPU. */
+/* Lock-free: blocks are only added (release store) until a flush or an eviction, which stop every CPU. */
 static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
     for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
         if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
@@ -317,6 +360,17 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                         void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name);
 
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
+/* Diagnostics: the block whose code starts at or before host address pc (nearest), or NULL. */
+HvBlock *hv_block_at(HvMachine *m, const uint32_t *pc);
+void hv_block_index_add(HvMachine *m,uint32_t index);
+static inline void hv_jit_note_execution(HvCpu *cpu,const uint32_t *pc) {
+    if(!cpu->m->jit_retention)return;
+    HvJitRegion *r=&cpu->m->jit;uintptr_t value=(uintptr_t)pc,base=(uintptr_t)r->base;
+    if(r->seg_words&&value>=base&&value-base<r->seg_words*r->nseg*4)
+        cpu->pc_state->jit_seen|=1ull<<((value-base)/(r->seg_words*4));
+}
+
+
 /* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
 void hv_invalidate_code(HvMachine *m, uint64_t pa);
 void hv_ret_clear(HvCpu *cpu);
@@ -324,7 +378,7 @@ int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
    ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
    from the environment variable named in hv_knob_names. */
-enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_SYNCWAIT, HV_K_SWITCHFLUSH, HV_K_RANGEDROP, HV_K_MOVIMM, HV_K_PREDSTAT, HV_K_WALKLOG, HV_K_HOIST, HV_K_IJCPAGES, HV_K_DNSPROXY, HV_K_COUNT };
+enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_SYNCWAIT, HV_K_SWITCHFLUSH, HV_K_RANGEDROP, HV_K_MOVIMM, HV_K_PREDSTAT, HV_K_WALKLOG, HV_K_HOIST, HV_K_IJCPAGES, HV_K_DNSPROXY, HV_K_JITSEGS, HV_K_GROUP_MIN, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 /* Debugging (HV_WATCH): which pages keep losing their translations. */
@@ -365,6 +419,10 @@ void hv_big_unlock(HvMachine *m);
 void hv_big_yield(HvMachine *m);
 /* Make every CPU leave its block at the next exit. */
 void hv_machine_kick_all(HvMachine *m);
+/* Periodic timer only: parked CPUs service their timers when they resume.
+   Invalidation/stop-the-world/device requests must retain their existing paths. */
+unsigned hv_machine_kick_active(HvMachine *m);
+unsigned hv_machine_kick_due(HvMachine *m, uint64_t now);
 /* Publish a terminal reason, then wake all CPUs, including CPU_OFF waits.
    A later host stop must not overwrite the guest's shutdown/panic reason. */
 void hv_machine_halt(HvMachine *m, enum HvHaltReason reason);
@@ -376,5 +434,11 @@ void hv_cpu_kick(HvCpu *cpu);
 /* From any thread: device work is waiting for the CPU thread's tick. Makes a
    running block leave and ends a WFI sleep. */
 void hv_machine_wake(HvMachine *m);
+
+
+/* Hash the physical page, ignoring its valid flag and byte offset. */
+static inline uint32_t hv_xchain_bucket(uint64_t pa) {
+    return (uint32_t)(((pa >> HV_TLB_PAGE_BITS) * 0x9e3779b97f4a7c15ull) >> 48);
+}
 
 #endif
