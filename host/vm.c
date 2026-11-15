@@ -681,8 +681,11 @@ static void move_now(void *ctx) {
     if (atomic_load(&input_stopping)) return;
     int64_t packed = (int64_t)(intptr_t)ctx;
     int32_t dx = (int32_t)(packed >> 32), dy = (int32_t)packed;
-    if (dx) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, dx);
-    if (dy) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, dy);
+    /* Always both axes. macOS's virtio mouse keeps the last value of an axis a report leaves out,
+       so a report without X or Y moved the pointer by the previous amount again (the pointer kept drifting the
+       last way it went while a page scrolled). */
+    hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, dx);
+    hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, dy);
     hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
 }
 
@@ -691,10 +694,16 @@ void hv_vm_mouse_move(int dx, int dy) {
     dispatch_async_f(pointer_queue(), (void *)(intptr_t)packed, move_now);
 }
 
+static void zero_motion(void) { /* see move_now: a report must say "no motion", or the last motion repeats */
+    hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, 0);
+    hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, 0);
+}
+
 static void left_update(void) {
     int down = left_user || left_click;
     if (down == left_sent) return;
     left_sent = down;
+    zero_motion();
     hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, down);
     hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
 }
@@ -718,6 +727,7 @@ static void button_now(void *ctx) {
             rctrl_hold(&rctrl_click, 0);
         }
     } else if (button == 2) {
+        zero_motion();
         hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_MIDDLE, down);
         hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
     }
@@ -732,14 +742,25 @@ void hv_vm_mouse_button(int button, int down) {
 static void wheel(uint16_t axis, int amount) {
     while (amount) {
         int piece = amount > 100 ? 100 : amount < -100 ? -100 : amount;
+        zero_motion();
         hv_virtio_input_send(board.mouse, HV_EV_REL, axis, piece);
         hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
         amount -= piece;
     }
 }
 
-void hv_vm_mouse_wheel(int dy) { wheel(HV_REL_WHEEL, dy); }
-void hv_vm_mouse_hwheel(int dx) { wheel(HV_REL_HWHEEL, dx); }
+/* The wheel goes through the pointer queue too, so its events stay in order with motion and buttons. */
+static void wheel_now(void *ctx) {
+    if (atomic_load(&input_stopping)) return;
+    int64_t packed = (int64_t)(intptr_t)ctx;
+    wheel((uint16_t)(packed & 0xffff), (int32_t)(packed >> 32));
+}
+static void wheel_async(uint16_t axis, int amount) {
+    int64_t packed = (int64_t)((uint64_t)(uint32_t)amount << 32 | axis);
+    dispatch_async_f(pointer_queue(), (void *)(intptr_t)packed, wheel_now);
+}
+void hv_vm_mouse_wheel(int dy) { wheel_async(HV_REL_WHEEL, dy); }
+void hv_vm_mouse_hwheel(int dx) { wheel_async(HV_REL_HWHEEL, dx); }
 
 void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
     if (x < 0) x = 0;
