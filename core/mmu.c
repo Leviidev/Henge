@@ -1,4 +1,5 @@
 #include "mmu.h"
+#include "fastmem.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -140,6 +141,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
 int hv_tlb_tmajor;
 
 void hv_tlb_flush(HvCpu *cpu) {
+    hv_fastmem_clear(cpu);
     if (cpu->m) cpu->m->stats.tlb_flushes++;
     if (cpu->m) cpu->m->stats.reset_why[0]++;
     hv_ijc_reset(cpu, 0); /* mappings changed: branch targets cached by VA are no longer trusted */
@@ -353,6 +355,7 @@ void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len) {
    second, Sequoia none). Up to 64 MB page by page, as small ranges are; past that, a scan for kernel entries in the range
    and the kernel half of the branch caches. */
 void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len) {
+    hv_fastmem_drop(cpu, va, len);
     if (cpu->m && cpu->m->stats_interval) cpu->m->stats.kernel_ranges++;
     uint64_t first = va & ~(uint64_t)PAGE_MASK;
     if (len <= (4096ull << HV_TLB_PAGE_BITS)) {
@@ -483,6 +486,7 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
 static void stash_drop_va(HvPerCpu *p, uint64_t va, int asid);
 
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
+    hv_fastmem_drop(cpu, va & ~(uint64_t)PAGE_MASK, PAGE_MASK + 1);
     /* Tagged addresses may sit in any slot's tag byte, so check by the low 56 bits. */
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     hv_ijc_drop_va(cpu, va, asid);
@@ -497,6 +501,7 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
    not every entry of the address space (macOS 27 sends tens of thousands a second, and each made a
    process refill its whole TLB the next time it ran). */
 void hv_tlb_flush_va_page(HvCpu *cpu, uint64_t va, int asid) {
+    hv_fastmem_drop(cpu, va & ~(uint64_t)PAGE_MASK, PAGE_MASK + 1);
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
     hv_ijc_drop_va(cpu, va, asid);
     if (!((va >> 55) & 1) && cpu->pc_state) stash_drop_va(cpu->pc_state, va, asid);
@@ -576,13 +581,13 @@ static void write_hint(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code) {
     if (!(old & HV_WHINT_MANY)) {
         /* Up to three entries: this one, in a free place or one whose entry maps
            something else by now; beyond that the protector scans. */
-        int have = 0, place = -1;
+        int place = -1;
         for (int k = 0; k < 3; k++) {
             uint64_t c = old >> (16 * k) & 0xffff;
-            if (c == mine) have = 1;
+            if (c == mine) return; /* existing hint already publishes this slot; caller still fences/checks code_pages */
             else if (place < 0 && (!c || !maps_writable(&cpu->tlb[0] + (c - 1), host_page))) place = k;
         }
-        if (!have) now = place >= 0 ? (old & ~(0xffffull << (16 * place))) | mine << (16 * place) : HV_WHINT_MANY;
+        now = place >= 0 ? (old & ~(0xffffull << (16 * place))) | mine << (16 * place) : HV_WHINT_MANY;
         if (now != old) __atomic_store_n(hint, now, __ATOMIC_RELAXED);
     }
 }
@@ -656,6 +661,20 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     if (e->write_tag != HV_TLB_INVALID) write_guard(cpu, ram, pg, hv_tlb_code(slot, table), e);
 }
 
+/* The ordinary walker and RAM bounds checks remain authoritative. Only
+   canonical kernel data with normal-memory attributes enters the read LUT. */
+static void fastmem_fill_data(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
+    if (!cpu->fm_read[0] || !(cpu->sctlr_el1 & 1) || el != 1 || !w->r || !(w->attr & 0xf0) || va >> 48 != 0xffff) return;
+    if (w->block_size < (1ull << HV_TLB_PAGE_BITS)) return;
+    HvRam *ram = ram_of(cpu->m, w->pa);
+    if (!ram) return;
+    uint64_t page_pa = w->pa & ~(uint64_t)PAGE_MASK;
+    if (page_pa < ram->pa || page_pa + PAGE_MASK + 1 - ram->pa > ram->size) return;
+    uint64_t page_va = va & ~(uint64_t)PAGE_MASK;
+    uint64_t addend = (uintptr_t)(ram->host + (page_pa - ram->pa)) - page_va;
+    hv_fastmem_fill(cpu, va, hv_tlb_table(cpu, el), addend);
+}
+
 /* Walks that may fill the TLB are bracketed by the CPU's walk_seq (odd while
    one runs), so another CPU's TLBI can drop entries here itself and know no
    fill from an old page table raced it (hv_tlbi_drop_remote_va).
@@ -699,7 +718,10 @@ uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *
     HvWalk w;
     walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, acc, el, &w);
-    if (!w.fsc) tlb_fill(cpu, va, el, &w);
+    if (!w.fsc) {
+        tlb_fill(cpu, va, el, &w);
+        if (acc != HV_ACC_EXEC) fastmem_fill_data(cpu, va, el, &w);
+    }
     walk_end(cpu);
     if (w.fsc) return w.fsc;
     *pa = w.pa;
@@ -730,6 +752,9 @@ static int walks_elsewhere(HvCpu *target, uint32_t s1, uint32_t s2, uint64_t va,
 }
 
 int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
+    /* Only the owner mutates its LUT. Have the normal posted TLBI path
+       invalidate it and acknowledge before the other CPU can reuse the page. */
+    if (target->fm_read[0] && ((va >> 55) & 1)) return -1;
     HvPerCpu *p = target->pc_state;
     uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
     /* mid-walk: it may be about to fill from the old table, unless the walk is of another page (and not a switch's) */
@@ -769,6 +794,9 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
 static void stash_drop_range(HvPerCpu *p, uint64_t va, uint64_t npages, int asid);
 
 int hv_tlbi_drop_remote_range(HvCpu *target, uint64_t va, uint64_t npages, int asid) {
+    /* The optional kernel LUT is owner-only, exactly as for a single-page TLBI.
+       A remote range must be posted and acknowledged, not leave stale LUT reads. */
+    if (target->fm_read[0] && ((va >> 55) & 1)) return -1;
     HvPerCpu *p = target->pc_state;
     uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
     if ((s1 & 1) && !walks_elsewhere(target, s1, s1, va, npages)) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; }
@@ -865,7 +893,10 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
     HvWalk w;
     walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
-    if (!w.fsc) tlb_fill(cpu, va, el, &w);
+    if (!w.fsc) {
+        tlb_fill(cpu, va, el, &w);
+        fastmem_fill_data(cpu, va, el, &w);
+    }
     walk_end(cpu);
     if (w.fsc) return 1;
     HvTlbEntry *e = hv_tlb_ent(cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table);
@@ -876,6 +907,54 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
 
 /* Put block b in this CPU's indirect-branch cache under its VA (b->va must be in
    the half its flags say: kernel blocks, kernel VAs). */
+static void ijc_mark_segment(HvCpu *cpu,uint64_t *entry) {
+    HvPerCpu *p=cpu->pc_state;HvJitRegion *r=&cpu->m->jit;
+    if(!p->ijc_segments||p->ijc_segment_count!=r->nseg||!r->seg_words)return;
+    uintptr_t address=(uintptr_t)entry[1],base=(uintptr_t)r->base;
+    if(address<base || address-base>=(size_t)r->nseg*r->seg_words*4)return;
+    size_t segment=(address-base)/(r->seg_words*4),slot=(size_t)(entry-p->ijc)/2;
+    p->ijc_segments[segment*HV_IJC_SEGMENT_WORDS+slot/64]|=1ull<<(slot&63);
+}
+
+/* Only the currently owned segment's index is read in the common case. Old
+   bits are conservative: entries are revalidated against their actual target.
+   TLBI clearing need not edit this owner-only bitmap. No hit-path counters. */
+int hv_ijc_evict_range(HvCpu *cpu,const uint32_t *lo,const uint32_t *hi,uint32_t *const *removed,size_t count) {
+    HvPerCpu *p=cpu->pc_state;HvMachine *m=cpu->m;HvJitRegion *r=&m->jit;
+    if(!p->ijc_segments||p->ijc_segment_count!=r->nseg||count==SIZE_MAX)return -1;
+    uint64_t examined=0,retired=0,preserved=0;
+    uint64_t mask=1ull<<((size_t)(lo-r->base)/r->seg_words);
+    for(size_t k=0;k<count;k++) {
+        uintptr_t target=(uintptr_t)removed[k],base=(uintptr_t)r->base;
+        if(target>=base && target-base<(size_t)r->nseg*r->seg_words*4)mask|=1ull<<((target-base)/(r->seg_words*4));
+    }
+    for(unsigned segment=0;segment<r->nseg;segment++)if(mask>>segment&1) {
+        uint64_t *bits=p->ijc_segments+(size_t)segment*HV_IJC_SEGMENT_WORDS;
+        for(size_t word=0;word<HV_IJC_SEGMENT_WORDS;word++) {
+            uint64_t pending=bits[word];
+            while(pending) {
+                unsigned bit=(unsigned)__builtin_ctzll(pending);pending&=pending-1;
+                uint64_t *entry=p->ijc+2*(word*64+bit);uintptr_t target=(uintptr_t)entry[1];
+                examined++;
+                uintptr_t segment_lo=(uintptr_t)r->base+(size_t)segment*r->seg_words*4;
+                /* Retire overwritten/invalidated index bits as we visit them.
+                   The replacement's own segment was marked on fill. Without
+                   this pruning every old bitmap would approach a full scan. */
+                if(!entry[0]||target<segment_lo||target-segment_lo>=r->seg_words*4)
+                    bits[word]&=~(1ull<<bit);
+                int drop=target>=(uintptr_t)lo&&target<(uintptr_t)hi;
+                if(!drop&&count){size_t a=0,b=count;while(a<b){size_t mid=a+(b-a)/2;if((uintptr_t)removed[mid]<target)a=mid+1;else b=mid;}drop=a<count&&(uintptr_t)removed[a]==target;}
+                if(drop){entry[0]=0;entry[1]=0;bits[word]&=~(1ull<<bit);retired++;}
+                else if(entry[0])preserved++;
+            }
+        }
+    }
+    __atomic_fetch_add(&m->ijc_evict_examined,examined,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&m->ijc_evict_removed,retired,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&m->ijc_evict_preserved,preserved,__ATOMIC_RELAXED);
+    return 0;
+}
+
 void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     HvMachine *m = cpu->m;
     HvPerCpu *pcs = cpu->pc_state;
@@ -886,6 +965,7 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     if (ent[0] != tag && ent[0]) ent[2] = ent[0], ent[3] = ent[1]; /* way 0's goes to way 1 (over this one's, if there) */
     ent[0] = tag;
     ent[1] = (uint64_t)(uintptr_t)b->code;
+    ijc_mark_segment(cpu,ent);ijc_mark_segment(cpu,ent+2);
     pcs->ijc_tables_used |= 1u << (b->flags & (HV_IJC_TABLES - 1));
     {   /* the page's hint: which piece has a target now */
         uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1, bit = 1ull << ((b->va >> 8) & 63);
@@ -995,6 +1075,36 @@ int hv_ijc_fill_checked(HvCpu *cpu, HvBlock *b) {
 
 static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
 
+static unsigned site_history_index(uint64_t site,unsigned flags){return (unsigned)((site>>2)^(site>>13)^(flags*0x9e3779b9u))&255;}
+void hv_ijc_site_observe(HvCpu *cpu,uint64_t site,uint64_t target,uint32_t flags) {
+    if(!site||!cpu->m->branch_site_hints)return;
+    HvPerCpu *p=cpu->pc_state;unsigned index=site_history_index(site,flags);
+    if(p->branch_history[index].site!=site||p->branch_history[index].target!=target||p->branch_history[index].flags!=flags)
+        p->branch_history[index]=(__typeof__(p->branch_history[0])){site,target,flags,1};
+    else if(p->branch_history[index].hits<255)p->branch_history[index].hits++;
+    p->branch_observations++;
+}
+int hv_ijc_site_admitted(HvMachine *m,uint64_t site,uint32_t flags) {
+    if(!m->branch_site_hints||!hv_self||hv_self->m!=m)return 0;
+    HvPerCpu *p=hv_self->pc_state;unsigned i=site_history_index(site,flags);
+    return p->branch_history[i].site==site&&p->branch_history[i].flags==flags&&p->branch_history[i].hits>=3;
+}
+void *hv_ijc_resolve_site(HvCpu *cpu,uint64_t va,uint32_t flags,uint64_t site) {
+    void *result=ijc_resolve(cpu,va,flags);
+    /* Only cold misses observe sites. This history is not executable state: a
+       failed resolution may train it, but every emitted hint still checks IJC. */
+    hv_ijc_site_observe(cpu,site,va,flags);
+    if(result) {
+        if(site&&cpu->m->branch_site_hints) {
+            uint64_t tag=va^cpu->ijc_salt[flags&1];
+            uint64_t *entry=cpu->pc_state->ijc+(size_t)(flags&15)*(HV_IJC_TABLE_BYTES/8)+2*hv_ijc_index(tag);
+            if(entry[0]!=tag)entry+=2;
+            if(entry[0]==tag)((uint64_t *)cpu->pc_state->ijc_sites)[hv_ijc_site_slot(site,flags)]=(uint64_t)(uintptr_t)entry;
+        }
+    }
+    return result;
+}
+
 void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     return ijc_resolve(cpu, va, flags);
 }
@@ -1051,6 +1161,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     }
     /* Cached only while the TLB still maps it, inside ijc_seq (see hv_ijc_fill_checked). */
     if (!hv_ijc_fill_checked(cpu, b)) return 0;
+    hv_jit_note_execution(cpu,b->code);
     return b->code;
 }
 

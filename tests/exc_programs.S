@@ -108,6 +108,71 @@ PROGRAM p_dabt
     mov x10, x8
 END p_dabt
 
+// A grouped range must preserve completed loads and the exact first fault PC.
+PROGRAM p_group_fault
+    SETUP
+    ldr x15, [x9] // warm ordinary RAM before the independently planned group
+    dmb ish
+1:  ldr x1, [x9]
+    ldr x2, [x9, #8]
+2:  ldr x3, [x9, #16] // first byte beyond the mapped RAM region
+    adr x4, 2b
+END p_group_fault
+
+PROGRAM p_group_interleaved_fault
+    SETUP
+    sub x12,x9,#256
+    ldr x15,[x12]
+    ldr x15,[x9]
+    dmb ish
+    ldr x1,[x12]
+    ldr x2,[x9]
+    ldr x3,[x12,#8]
+1:  ldr x5,[x9,#16]
+    ldr x6,[x12,#16]
+    adr x4,1b
+END p_group_interleaved_fault
+
+PROGRAM p_group_interleaved_store_fault
+    SETUP
+    sub x12,x9,#256
+    ldr x15,[x12]
+    ldr x15,[x9]
+    dmb ish
+    mov x1,#19
+    mov x2,#23
+    str x1,[x12]
+    str x2,[x9]
+    str x1,[x12,#8]
+1:  str x2,[x9,#16]
+    ldr x6,[x12,#8]
+    adr x4,1b
+END p_group_interleaved_store_fault
+
+// The span guard falls back as a whole; each completed post-index updates
+// its base exactly once, and a faulting pre-index never commits writeback.
+PROGRAM p_group_writeback_fault
+    SETUP
+    ldr x15, [x9]
+    dmb ish
+    ldr x1, [x9], #8
+    ldr x2, [x9], #8
+1:  ldr x3, [x9, #8]!
+    adr x4, 1b
+END p_group_writeback_fault
+
+PROGRAM p_group_writeback_store_fault
+    SETUP
+    ldr x15, [x9]
+    dmb ish
+    mov x1, #13
+    mov x2, #17
+    str x1, [x9], #8
+    str x2, [x9], #8
+1:  str x3, [x9, #8]!
+    adr x4, 1b
+END p_group_writeback_store_fault
+
 // Down to EL0 and back up through SVC and an undefined MRS.
 PROGRAM p_el0
     SETUP

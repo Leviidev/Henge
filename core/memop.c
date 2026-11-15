@@ -187,7 +187,7 @@ int hv_mem_decode(uint32_t insn, HvMemOp *op) {
         } else {
             op->size = opc ? 3 : 2;
         }
-        op->imm = sext((insn >> 15) & 0x7f, 7) << op->size;
+        op->imm = sext((insn >> 15) & 0x7f, 7) * (1ll << op->size);
         op->mode = mode == 1 ? HV_ADDR_POST : mode == 3 ? HV_ADDR_PRE : HV_ADDR_OFFSET;
         op->bytes = 2u << op->size;
         return 0;
@@ -296,8 +296,23 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                 (unsigned long long)cpu->x[30]);
     }
     while (len) {
+        /* A live read tag validates the entire ordinary-RAM TLB granule.
+           Coalesce reads across internal 4K boundaries only after this check.
+           Misses and every write retain the precise 4K fallback below. */
+        uint32_t span = (1u << HV_TLB_PAGE_BITS) - (uint32_t)(va & ((1u << HV_TLB_PAGE_BITS) - 1));
+        if (span > len) span = len;
+        const void *cached = write ? NULL : hv_tlb_read_span(cpu, va, span, el);
+        if (cached) {
+            if (cpu->m->stats_interval) cpu->m->stats.vmem_read_reuses++;
+            memcpy(b, cached, span);
+            va += span; b += span; len -= span;
+            continue;
+        }
         uint32_t chunk = 4096 - (uint32_t)(va & 4095);
         if (chunk > len) chunk = len;
+        /* Plain reads can use the exact RAM span the JIT's TLB already checked.
+           Stores retain hv_phys_write's ROM, watch and code-invalidation path.
+           A miss still splits at 4K so smaller guest granules fault precisely. */
         uint64_t pa;
         int had_entry = 0;
         if (cpu->m->stats_interval) { /* --stats: was the TLB entry there before this access? */
@@ -335,8 +350,10 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
                 }
             }
         }
-        if (hv_phys_ptr(cpu->m, pa, chunk)) {
-            rc = write ? hv_phys_write(cpu->m, pa, b, chunk) : hv_phys_read(cpu->m, pa, b, chunk);
+        const void *ram_bytes = hv_phys_ptr(cpu->m, pa, chunk);
+        if (ram_bytes) {
+            if (write) rc = hv_phys_write(cpu->m, pa, b, chunk);
+            else memcpy(b, ram_bytes, chunk); /* resolve this physical span once */
         } else {
             for (uint32_t off = 0; off < chunk && !rc; off += 8) { /* MMIO: at most 8 bytes at a time */
                 uint32_t piece = chunk - off < 8 ? chunk - off : 8;
@@ -347,6 +364,13 @@ int hv_vmem_xfer(HvCpu *cpu, uint64_t va, void *buf, uint32_t len, int write, in
             if (cpu->m->log)
                 fprintf(stderr, "unmapped %s: pa %llx (va %llx) size %u pc %llx\n", write ? "write" : "read",
                         (unsigned long long)pa, (unsigned long long)va, chunk, (unsigned long long)pc);
+            if (cpu->m->log) {
+                HvWalk fresh;
+                hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &fresh);
+                fprintf(stderr, "mmu-unmapped: cpu=%u el=%d cached_pa=%llx fresh_pa=%llx fresh_fsc=%x tcr=%llx ttbr0=%llx ttbr1=%llx (diagnostic only; abort retained)\n",
+                        cpu->index, el, (unsigned long long)pa, (unsigned long long)fresh.pa, fresh.fsc,
+                        (unsigned long long)cpu->tcr_el1, (unsigned long long)cpu->ttbr0_el1, (unsigned long long)cpu->ttbr1_el1);
+            }
             hv_raise_abort(cpu, 0, va, HV_FSC_EXTERNAL, write, 0, pc);
             return 1;
         }

@@ -1,0 +1,11 @@
+Henge Link protocol 2 — experimental second PVG display
+Wired mode requires compatible USB-C Ethernet adapters; plain USB-C is not supported.
+Pair before boot; no guest macOS reinstall is needed. Viewer mode does not require JIT.
+Native hardware codec/transport checks are not physical iPad-to-Duo validation.
+Remote video is compressed; primary Retina output is unchanged.
+Source and detailed setup/security/validation: docs/henge-link/README.md
+Decoder-consumption acknowledgements bound the end-to-end video window to three frames. Update both devices.
+
+Nearby iPads discovery finds the current address and port. Opt-in Remember on both devices saves the pairing in device-only Keychain. Forget on the iPad revokes the key. No key is advertised. Manual connection remains available.
+
+Three-finger tap on the Duo toggles local display controls without changing video dimensions. Choose the iPad as Main Display in macOS System Settings > Displays; the Duo remains an extension. All emulation runs on the iPad.

@@ -203,6 +203,9 @@ HvBdif *hv_bdif_create(HvMachine *m, uint64_t pa, HvDisk *root, HvDisk *aux) {
     b->m = m;
     b->root = root;
     b->aux = aux;
+    fprintf(stderr, "hengevm: firmware disk capacity: root %llu sectors, aux %llu sectors; large transfers enabled (128 MiB syscall chunks)\n",
+            (unsigned long long)(root ? root->size / 512 : 0),
+            (unsigned long long)(aux ? aux->size / 512 : 0));
     hv_machine_add_mmio(m, pa, 0x200000, b, bdif_read, bdif_write, "bdif");
     return b;
 }
