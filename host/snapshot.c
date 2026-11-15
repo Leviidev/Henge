@@ -25,13 +25,38 @@
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#include <os/proc.h>
+#endif
 
 #include "pvg_lite.h"
+#include "surface_hash.h"
 #include "sysreg.h"
 #include "vm.h"
 
+/* Native regression builds inject one allocation failure at a time. Release
+   binaries have neither this hook nor a per-allocation diagnostic branch. */
+#ifdef HV_SNAPSHOT_TESTING
+static int snapshot_fail_after = -1, snapshot_fail_persistent, snapshot_packing_retries;
+static int snapshot_force_full_compression;
+void hv_snapshot_test_fail_after(int n) { snapshot_fail_after = n; snapshot_fail_persistent = 0; if(n>=0)snapshot_packing_retries=0; }
+int hv_snapshot_test_packing_retries(void) { return snapshot_packing_retries; }
+void hv_snapshot_test_fail_persistently(int n) { snapshot_fail_after = n; snapshot_fail_persistent = 1; }
+static void (*snapshot_progress_hook)(uint64_t);
+void hv_snapshot_test_progress(void (*hook)(uint64_t)) { snapshot_progress_hook = hook; }
+static void *snapshot_malloc(size_t n) {
+    if (snapshot_fail_after >= 0) {
+        if (!snapshot_fail_after) { if (!snapshot_fail_persistent) snapshot_fail_after = -1; return NULL; }
+        snapshot_fail_after--;
+    }
+    return malloc(n);
+}
+#define malloc snapshot_malloc
+#endif
+
 #define SNAP_MAGIC "HENGESN1"
-#define SNAP_VERSION 1
+#define SNAP_VERSION 3
 #define PAGE 0x4000ull
 #define CHUNK_PAGES 256u
 #define CHUNK_BYTES ((uint64_t)CHUNK_PAGES * PAGE)
@@ -50,10 +75,11 @@ typedef struct SnapHeader {
     uint32_t ncpus, nram;
     uint64_t ram_size;
     char disk[256];         /* hv_vm_disk_identity when saved: the disk has to be exactly that again */
+    uint64_t checksum;
 } SnapHeader;
 
 typedef struct SecHdr {
-    uint32_t tag, flags;
+    uint32_t tag, checksum; /* full-content corruption check, not authentication */
     uint64_t len;
 } SecHdr;
 
@@ -72,6 +98,7 @@ typedef struct ChunkHdr {
     uint32_t bytes;         /* what follows */
     uint32_t raw;           /* 1: the pages as they are (LZ4 did not make them smaller) */
     uint8_t bitmap[CHUNK_PAGES / 8];
+    uint64_t checksum;
 } ChunkHdr;
 
 /* A CPU's architectural state: everything but its caches, which a new machine starts empty. */
@@ -119,11 +146,25 @@ typedef struct W {
     uint8_t *buf;
     size_t n, cap;
     uint64_t total;
+    const HvSnapshotControl *control;
+    uint64_t scanned, ram_total;
 } W;
+
+static int cancelled(const HvSnapshotControl *c) { return c && c->cancelled && c->cancelled(c->context); }
+static int w_cancelled(W *w) {
+    if (!w->err && cancelled(w->control)) w->err = ECANCELED;
+    return w->err != 0;
+}
+static void report_progress(W *w, uint64_t scanned) {
+    if (w->control && w->control->progress) w->control->progress(scanned, w->ram_total, w->control->context);
+#ifdef HV_SNAPSHOT_TESTING
+    if (snapshot_progress_hook) snapshot_progress_hook(scanned);
+#endif
+}
 
 static void w_flush(W *w) {
     size_t off = 0;
-    while (!w->err && off < w->n) {
+    while (!w_cancelled(w) && off < w->n) {
         ssize_t k = write(w->fd, w->buf + off, w->n - off);
         if (k < 0 && errno == EINTR) continue;
         if (k <= 0) w->err = errno ? errno : EIO;
@@ -134,7 +175,7 @@ static void w_flush(W *w) {
 
 static void w_raw(W *w, const void *d, uint64_t len) {
     const uint8_t *p = d;
-    while (len && !w->err) {
+    while (len && !w_cancelled(w)) {
         size_t room = w->cap - w->n, k = len < room ? (size_t)len : room;
         memcpy(w->buf + w->n, p, k);
         w->n += k, p += k, len -= k, w->total += k;
@@ -143,7 +184,9 @@ static void w_raw(W *w, const void *d, uint64_t len) {
 }
 
 static void w_section(W *w, uint32_t tag, const void *d, uint64_t len) {
-    SecHdr h = {tag, 0, len};
+    if (w_cancelled(w)) return;
+    uint64_t signature = hv_surface_hash(d, len);
+    SecHdr h = {tag, (uint32_t)(signature ^ (signature >> 32)), len};
     w_raw(w, &h, sizeof h);
     w_raw(w, d, len);
 }
@@ -180,7 +223,9 @@ static int r_raw(R *r, void *d, uint64_t len) {
 static int r_section(R *r, uint32_t tag, void *d, uint64_t len) {
     SecHdr h;
     if (r_raw(r, &h, sizeof h) || h.tag != tag || h.len != len) return r->err = r->err ? r->err : EINVAL, -1;
-    return r_raw(r, d, len);
+    if (r_raw(r, d, len)) return -1;
+    uint64_t signature = hv_surface_hash(d, len);
+    return h.checksum == (uint32_t)(signature ^ (signature >> 32)) ? 0 : (r->err = EINVAL, -1);
 }
 
 /* A section of any length (up to max), in memory the caller frees. */
@@ -191,7 +236,9 @@ static int r_section_any(R *r, uint32_t tag, void **d, uint64_t *len, uint64_t m
     *d = malloc(h.len ? h.len : 1);
     if (!*d) return r->err = ENOMEM, -1;
     *len = h.len;
-    return r_raw(r, *d, h.len);
+    if (r_raw(r, *d, h.len)) return -1;
+    uint64_t signature = hv_surface_hash(*d, h.len);
+    return h.checksum == (uint32_t)(signature ^ (signature >> 32)) ? 0 : (r->err = EINVAL, -1);
 }
 
 #define R_RANGE(r, tag, p, from, to) r_section(r, tag, (uint8_t *)(p) + offsetof(__typeof__(*(p)), from), \
@@ -251,8 +298,28 @@ typedef struct Slot {
     ChunkHdr h;
     uint8_t *stage; /* the chunk's stored pages, one after another */
     uint8_t *out;   /* compressed */
+    const uint8_t *raw_source; /* immutable paused guest RAM when the whole chunk is dense */
     void *scratch;
+    uint32_t compression_probe_skipped;
 } Slot;
+
+/* Four disjoint, spread-out LZ4 trials keep large incompressible GPU/game
+   buffers off the full compressor. Raw chunks already belong to schema3:
+   every byte is still written and checksummed. This is an admission choice,
+   never an assumption used to reconstruct or discard guest memory. */
+static int chunk_store_raw(Slot *s,const uint8_t *bytes,size_t n) {
+#ifdef HV_SNAPSHOT_TESTING
+    if(snapshot_force_full_compression)return 0;
+#endif
+    enum { probe=16*1024, trials=4 };
+    if(n<512*1024)return 0;
+    for(unsigned i=0;i<trials;i++) {
+        size_t at=((n-probe)*i)/(trials-1);
+        size_t got=compression_encode_buffer(s->out,probe,bytes+at,probe,s->scratch,COMPRESSION_LZ4);
+        if(got&&got<probe-probe/100)return 0;
+    }
+    return 1;
+}
 
 static int slots_alloc(Slot *s, int n) {
     size_t scratch = compression_encode_scratch_buffer_size(COMPRESSION_LZ4);
@@ -271,11 +338,39 @@ static void slots_free(Slot *s, int n) {
     for (int i = 0; i < n; i++) free(s[i].stage), free(s[i].out), free(s[i].scratch);
 }
 
+/* Both directions share one bounded allocation/retry policy. No pages are
+   discarded; a smaller batch changes concurrency, never the snapshot format. */
+static unsigned slots_prepare(Slot set[2][BATCH], unsigned batch) {
+    if (!batch || batch > BATCH) batch = BATCH;
+    memset(set, 0, sizeof(Slot) * 2 * BATCH);
+    while (slots_alloc(set[0], batch) || slots_alloc(set[1], batch)) {
+        slots_free(set[0], BATCH); slots_free(set[1], BATCH);
+        memset(set, 0, sizeof(Slot) * 2 * BATCH);
+        if (batch == 1) return 0;
+#ifdef HV_SNAPSHOT_TESTING
+        snapshot_packing_retries++;
+#endif
+        unsigned previous = batch;
+        batch = batch > 2 ? batch / 2 : 1;
+        fprintf(stderr,"hengevm: snapshot: memory allocation reduced workers %u -> %u\n",previous,batch);
+    }
+    return batch;
+}
+
+static uint64_t chunk_checksum(const ChunkHdr *header, const uint8_t *raw, size_t n) {
+    ChunkHdr h = *header;
+    h.checksum = 0;
+    return hv_surface_hash((const uint8_t *)&h, sizeof h) ^ hv_surface_hash(raw, n);
+}
+
 /* One chunk into a slot: which pages have something, and those pages compressed. */
-static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t index, int use_mincore) {
+static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t index, int use_mincore,
+                       const HvSnapshotControl *control) {
     uint64_t from = (uint64_t)index * CHUNK_BYTES;
     uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
     memset(&s->h, 0, sizeof s->h);
+    s->compression_probe_skipped=0;
+    s->raw_source = s->stage;
     s->h.index = index;
     size_t host_page = (size_t)getpagesize();
     size_t vec_n = (size_t)(pages * PAGE + host_page - 1) / host_page;
@@ -284,6 +379,7 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
        then looks the same while it holds data: file-backed RAM is read whole. */
     int have_vec = use_mincore && mincore((void *)(base + from), (size_t)pages * PAGE, vec) == 0;
     for (uint32_t i = 0; i < pages; i++) {
+        if (cancelled(control)) return;
         const uint8_t *pg = base + from + (uint64_t)i * PAGE;
         if (have_vec) {
             int touched = 0;
@@ -293,18 +389,32 @@ static void chunk_pack(Slot *s, const uint8_t *base, uint64_t size, uint32_t ind
             if (!touched) continue;
         }
         if (page_zero(pg)) continue;
-        memcpy(s->stage + (uint64_t)s->h.stored * PAGE, pg, PAGE);
         s->h.bitmap[i / 8] |= (uint8_t)(1u << (i % 8));
         s->h.stored++;
     }
     size_t raw = (size_t)s->h.stored * PAGE;
-    if (!raw) return;
-    size_t got = compression_encode_buffer(s->out, CHUNK_BYTES, s->stage, raw, s->scratch, COMPRESSION_LZ4);
+    if (cancelled(control)) return;
+    if (!raw) { s->h.checksum = chunk_checksum(&s->h, s->stage, 0); return; }
+    /* Dense chunks already have exactly the serialized page order. CPUs and
+       DMA are quiesced for the whole save, so borrow this immutable RAM until
+       the writer completes instead of copying another4MB through a stage. */
+    if (s->h.stored == pages) s->raw_source = base + from;
+    else {
+        unsigned k = 0;
+        for (unsigned i = 0; i < pages; i++)
+            if (s->h.bitmap[i / 8] & (1u << (i % 8)))
+                memcpy(s->stage + (uint64_t)k++ * PAGE, base + from + (uint64_t)i * PAGE, PAGE);
+    }
+    size_t got=0;
+    if(chunk_store_raw(s,s->raw_source,raw))s->compression_probe_skipped=1;
+    else got = compression_encode_buffer(s->out, CHUNK_BYTES, s->raw_source, raw, s->scratch, COMPRESSION_LZ4);
     if (got && got < raw) s->h.bytes = (uint32_t)got;
     else s->h.raw = 1, s->h.bytes = (uint32_t)raw;
+    s->h.checksum = chunk_checksum(&s->h, s->raw_source, raw);
 }
 
 static double pack_secs, write_secs, wait_secs; /* for the log: compressing, writing, and waiting for a batch to be compressed */
+static uint64_t pack_probe_skipped,pack_raw_bytes;
 
 static double mono(void) {
     struct timespec t;
@@ -314,16 +424,19 @@ static double mono(void) {
 
 /* Chunks are compressed a batch at a time on every core, the next batch while the last one is written. */
 static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
+    if (w_cancelled(w)) return -1;
+    const HvSnapshotControl *control = w->control;
+    unsigned batch = control && control->workers ? control->workers : BATCH;
+    if (batch > BATCH) batch = BATCH;
     uint32_t nchunks = (uint32_t)((ram->size + CHUNK_BYTES - 1) / CHUNK_BYTES);
     RamHdr rh = {ram->pa, ram->size, CHUNK_PAGES, nchunks};
-    w_raw(w, &(SecHdr){TAG('R', 'A', 'M', ' '), 0, sizeof rh}, sizeof(SecHdr));
-    w_raw(w, &rh, sizeof rh);
+    w_section(w, TAG('R', 'A', 'M', ' '), &rh, sizeof rh);
     Slot set[2][BATCH];
-    memset(set, 0, sizeof set);
-    if (slots_alloc(set[0], BATCH) || slots_alloc(set[1], BATCH)) {
-        slots_free(set[0], BATCH), slots_free(set[1], BATCH);
-        return w->err = ENOMEM, -1;
-    }
+    batch = slots_prepare(set, batch);
+    if (!batch) return w->err = ENOMEM, -1;
+    /* A bounded, explicitly enabled automatic save must finish before iOS
+       expires its assertion. It is user-requested work, not deferrable upkeep.
+       Guest CPUs remain paused; this does not change their scheduling policy. */
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_group_t packing = dispatch_group_create();
     const uint8_t *base = ram->host;
@@ -332,37 +445,42 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
     void (^pack)(Slot *, uint32_t, uint32_t) = ^(Slot *sl, uint32_t first, uint32_t n) {
         dispatch_group_async(packing, q, ^{
             double t0 = mono();
-            dispatch_apply(n, q, ^(size_t k) { chunk_pack(&sl[k], base, size, first + (uint32_t)k, !file_backed); });
+            dispatch_apply(n, q, ^(size_t k) { chunk_pack(&sl[k], base, size, first + (uint32_t)k, !file_backed, control); });
             packed += mono() - t0;
         });
     };
-    uint32_t n0 = nchunks < BATCH ? nchunks : BATCH;
+    uint32_t n0 = nchunks < batch ? nchunks : batch;
     if (n0) pack(set[0], 0, n0);
     int cur = 0;
-    for (uint32_t first = 0; first < nchunks && !w->err; first += BATCH, cur ^= 1) {
-        uint32_t n = nchunks - first < BATCH ? nchunks - first : BATCH;
+    for (uint32_t first = 0; first < nchunks && !w_cancelled(w); first += batch, cur ^= 1) {
+        uint32_t n = nchunks - first < batch ? nchunks - first : batch;
         double t0 = mono();
         dispatch_group_wait(packing, DISPATCH_TIME_FOREVER);
+        if (w_cancelled(w)) break;
         double t1 = mono();
-        uint32_t next = first + BATCH;
-        if (next < nchunks) pack(set[cur ^ 1], next, nchunks - next < BATCH ? nchunks - next : BATCH);
+        uint32_t next = first + batch;
+        if (next < nchunks && !cancelled(control)) pack(set[cur ^ 1], next, nchunks - next < batch ? nchunks - next : batch);
         Slot *sl = set[cur];
         /* The batch's chunks at once, each at its own place in the file: past the page cache a write waits for
            the flash, and one at a time leaves it mostly idle. */
         w_flush(w);
+        if (w_cancelled(w)) break;
         uint64_t at[BATCH], pos = w->total;
         for (uint32_t k = 0; k < n; k++) {
             at[k] = pos;
             pos += sizeof sl[k].h + sl[k].h.bytes;
             *stored_pages += sl[k].h.stored;
+            pack_probe_skipped+=sl[k].compression_probe_skipped;
+            if(sl[k].compression_probe_skipped)pack_raw_bytes+=sl[k].h.bytes;
         }
         __block _Atomic int failed = 0;
         int fd = w->fd;
         const uint64_t *atp = at;
         dispatch_apply(n, q, ^(size_t k) {
-            struct iovec v[2] = {{&sl[k].h, sizeof sl[k].h}, {sl[k].h.raw ? sl[k].stage : sl[k].out, sl[k].h.bytes}};
+            struct iovec v[2] = {{&sl[k].h, sizeof sl[k].h}, {sl[k].h.raw ? (void *)sl[k].raw_source : sl[k].out, sl[k].h.bytes}};
             size_t want = v[0].iov_len + v[1].iov_len, done = 0;
             while (done < want) {
+                if (cancelled(control)) { failed = ECANCELED; return; }
                 ssize_t got = pwritev(fd, v, v[1].iov_len ? 2 : 1, (off_t)(atp[k] + done));
                 if (got < 0 && errno == EINTR) continue;
                 if (got <= 0) {
@@ -381,10 +499,16 @@ static int save_ram(W *w, HvRam *ram, uint64_t *stored_pages, int file_backed) {
         if (lseek(fd, (off_t)pos, SEEK_SET) != (off_t)pos && !w->err) w->err = errno;
         write_secs += mono() - t1;
         wait_secs += t1 - t0;
+        if (!w_cancelled(w)) {
+            uint64_t scanned = (uint64_t)(first + n) * CHUNK_BYTES;
+            if (scanned > size) scanned = size;
+            report_progress(w, w->scanned + scanned);
+        }
     }
     dispatch_group_wait(packing, DISPATCH_TIME_FOREVER);
     pack_secs += packed;
     slots_free(set[0], BATCH), slots_free(set[1], BATCH);
+    if (!w_cancelled(w)) w->scanned += size;
     return w->err ? -1 : 0;
 }
 
@@ -392,12 +516,19 @@ static int chunk_unpack(Slot *s, uint8_t *base, uint64_t size) {
     uint64_t from = (uint64_t)s->h.index * CHUNK_BYTES;
     if (from >= size) return -1;
     uint32_t pages = (uint32_t)((size - from < CHUNK_BYTES ? size - from : CHUNK_BYTES) / PAGE);
+    unsigned marked = 0;
+    for (unsigned i = 0; i < CHUNK_PAGES; i++) if (s->h.bitmap[i / 8] & (1u << (i % 8))) {
+        if (i >= pages) return -1;
+        marked++;
+    }
+    if (marked != s->h.stored || s->h.raw > 1 || (!marked && s->h.bytes)) return -1;
     size_t raw = (size_t)s->h.stored * PAGE;
     const uint8_t *src = s->out;
     if (!s->h.raw) {
         if (compression_decode_buffer(s->stage, CHUNK_BYTES, s->out, s->h.bytes, s->scratch, COMPRESSION_LZ4) != raw) return -1;
         src = s->stage;
     } else if (s->h.bytes != raw) return -1;
+    if (s->h.checksum != chunk_checksum(&s->h, src, raw)) return -1;
     uint32_t k = 0;
     for (uint32_t i = 0; i < pages && k < s->h.stored; i++)
         if (s->h.bitmap[i / 8] & (1u << (i % 8))) memcpy(base + from + (uint64_t)i * PAGE, src + (uint64_t)k++ * PAGE, PAGE);
@@ -412,12 +543,14 @@ static int load_ram(R *r, HvRam *ram) {
     if (r_section(r, TAG('R', 'A', 'M', ' '), &rh, sizeof rh)) return -1;
     uint32_t nchunks = (uint32_t)((ram->size + CHUNK_BYTES - 1) / CHUNK_BYTES);
     if (rh.pa != ram->pa || rh.size != ram->size || rh.chunk_pages != CHUNK_PAGES || rh.nchunks != nchunks) return r->err = EINVAL, -1;
+    unsigned batch = BATCH;
+#if TARGET_OS_IOS
+    long active = sysconf(_SC_NPROCESSORS_ONLN);
+    batch = hv_snapshot_workers(active > 0 ? (unsigned)active : 1, os_proc_available_memory());
+#endif
     Slot set[2][BATCH];
-    memset(set, 0, sizeof set);
-    if (slots_alloc(set[0], BATCH) || slots_alloc(set[1], BATCH)) {
-        slots_free(set[0], BATCH), slots_free(set[1], BATCH);
-        return r->err = ENOMEM, -1;
-    }
+    batch = slots_prepare(set, batch);
+    if (!batch) return r->err = ENOMEM, -1;
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_group_t unpacking = dispatch_group_create();
     __block _Atomic int bad = 0;
@@ -425,8 +558,8 @@ static int load_ram(R *r, HvRam *ram) {
     uint8_t *base = ram->host;
     uint64_t size = ram->size;
     int cur = 0;
-    for (uint32_t first = 0; first < nchunks && !bad; first += BATCH, cur ^= 1) {
-        uint32_t n = nchunks - first < BATCH ? nchunks - first : BATCH;
+    for (uint32_t first = 0; first < nchunks && !bad; first += batch, cur ^= 1) {
+        uint32_t n = nchunks - first < batch ? nchunks - first : batch;
         Slot *sl = set[cur];
         double t0 = mono();
         for (uint32_t k = 0; k < n; k++) {
@@ -442,7 +575,7 @@ static int load_ram(R *r, HvRam *ram) {
         dispatch_group_async(unpacking, q, ^{
             double t1 = mono();
             dispatch_apply(n, q, ^(size_t k) {
-                if (sl[k].h.stored && chunk_unpack(&sl[k], base, size)) bad = 1;
+                if (chunk_unpack(&sl[k], base, size)) bad = 1;
             });
             unpacked += mono() - t1;
         });
@@ -529,12 +662,16 @@ static void save_devices(W *w, HvVmapple *b) {
     }
     size_t pn = hv_pvg_lite_state(b->pvg, NULL, 0);
     uint8_t *pb = malloc(pn);
+    if (pn && b->pvg && !pb) { w->err = ENOMEM; return; }
     if (pb && b->pvg) hv_pvg_lite_state(b->pvg, pb, pn);
     w_section(w, TAG('P', 'V', 'G', 'L'), pb, pb && b->pvg ? pn : 0);
     free(pb);
     size_t dn = b->pvg ? hv_pvg_lite_display_state(b->pvg, NULL, 0) : 0;
     uint8_t *db = dn ? malloc(dn) : NULL;
-    if (db) hv_pvg_lite_display_state(b->pvg, db, dn);
+    if (dn && !db) { w->err = ENOMEM; return; }
+    if (db && hv_pvg_lite_display_state(b->pvg, db, dn) != dn) {
+        free(db); w->err = EINVAL; return;
+    }
     w_section(w, TAG('P', 'V', 'G', 'D'), db, db ? dn : 0);
     free(db);
 }
@@ -577,6 +714,13 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
             r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, usbcmd), offsetof(HvXhci, mu) - offsetof(HvXhci, usbcmd)) ||
             r_section(r, XHCI, (uint8_t *)x + offsetof(HvXhci, reports), sizeof(HvXhci) - offsetof(HvXhci, reports)))
             return -1;
+        /* A helper/socket/display mapping cannot be restored. Retain the last
+           delivered contacts only to emit lifts, discard queued old motion,
+           then detach until a fresh helper epoch maps the current display. */
+        pthread_mutex_lock(&x->mu);
+        x->ts_rhead=x->ts_rtail=0;x->ts_mapped=0;x->ts_wanted=0;
+        x->ts_connection_pending=1;x->ts_release_phase=0;x->ts_deadline_ns=0;x->ts_ep0_waiting=0;
+        pthread_mutex_unlock(&x->mu);
     }
     void *blob;
     uint64_t len;
@@ -592,12 +736,22 @@ static int load_devices(R *r, HvVmapple *b, void **display, uint64_t *display_le
 /* ---- the file ---- */
 
 int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errlen) {
+    return hv_snapshot_save_controlled(path, ident, NULL, err, errlen);
+}
+
+int hv_snapshot_save_controlled(const char *path, const char *ident, const HvSnapshotControl *control,
+                                char *err, size_t errlen) {
+    if (!path || strlen(path) + 6 > 1100 || (ident && strlen(ident) >= 1024))
+        return fail(err,errlen,"The saved-state path or identity is too long.");
+    if (cancelled(control)) return fail(err, errlen, "Saving cancelled; the Mac remains paused in memory.");
     HvMachine *m = hv_vm_machine();
     HvVmapple *b = hv_vm_board();
     int ncpus = hv_vm_ncpus();
     if (!m || !b || !b->ram || ncpus < 1) return fail(err, errlen, "No machine to save.");
-    if (!hv_vm_pause_clean()) return fail(err, errlen, "The machine is not paused, or has disk work in flight.");
+    if (!hv_vm_pause_clean()) return fail(err, errlen, "The machine is not paused, or disk/graphics work could not be preserved.");
     if (b->vusb) return fail(err, errlen, "An installer cannot be saved.");
+    if (hv_vm_sync_disks() != 0) return fail(err, errlen, "The Mac's disks could not be synchronized: %s", strerror(errno));
+    if (cancelled(control)) return fail(err, errlen, "Saving cancelled; the Mac remains paused in memory.");
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     char tmp[1100];
@@ -605,7 +759,9 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return fail(err, errlen, "Cannot write %s: %s", tmp, strerror(errno));
     fcntl(fd, F_NOCACHE, 1);
-    W w = {.fd = fd, .cap = 4u << 20};
+    W w = {.fd = fd, .cap = 4u << 20, .control = control};
+    for (int i = 0; i < m->nram; i++) w.ram_total += m->ram[i].size;
+    report_progress(&w, 0);
     w.buf = malloc(w.cap);
     if (!w.buf) {
         close(fd);
@@ -624,6 +780,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
         unlink(tmp);
         return fail(err, errlen, "Cannot read the disk's details.");
     }
+    h.checksum = hv_surface_hash((const uint8_t *)&h, offsetof(SnapHeader, checksum));
     w_raw(&w, &h, sizeof h);
     for (int i = 0; i < ncpus; i++) {
         CpuState s;
@@ -634,6 +791,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
     save_devices(&w, b);
     uint64_t stored = 0;
     pack_secs = write_secs = wait_secs = 0;
+    pack_probe_skipped=pack_raw_bytes=0;
     for (int i = 0; i < m->nram && !w.err; i++) save_ram(&w, &m->ram[i], &stored, m->ram[i].host == b->ram && b->ram_fd >= 0);
     Trailer t = {TAG('E', 'N', 'D', ' '), 0, w.total + sizeof(Trailer)};
     w_raw(&w, &t, sizeof t);
@@ -641,10 +799,12 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
     free(w.buf);
     int bad = w.err;
     if (!bad && fsync(fd) != 0) bad = errno;
+    if (!bad && cancelled(control)) bad = ECANCELED;
     close(fd);
     if (!bad && rename(tmp, path) != 0) bad = errno;
     if (bad) {
         unlink(tmp);
+        if (bad == ECANCELED) return fail(err, errlen, "Saving cancelled; the Mac remains paused in memory.");
         return fail(err, errlen, "Cannot write the saved Mac: %s", strerror(bad));
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -652,6 +812,7 @@ int hv_snapshot_save(const char *path, const char *ident, char *err, size_t errl
     fprintf(stderr, "hengevm: snapshot: saved %d CPUs and %llu MB of RAM (%llu pages with data) in %llu MB, %.2f s "
                     "(compressing %.2f s alongside writing %.2f s; %.2f s waiting for compression)\n", ncpus, (unsigned long long)(b->ram_size >> 20),
             (unsigned long long)stored, (unsigned long long)(t.total >> 20), secs, pack_secs, write_secs, wait_secs);
+    fprintf(stderr,"hengevm: snapshot-compression: raw_admitted_chunks=%llu raw_admitted_bytes=%llu probe=4x16KiB policy=lossless-schema3 (full integrity checksum retained; admission may trade file size for less CPU work)\n",(unsigned long long)pack_probe_skipped,(unsigned long long)pack_raw_bytes);
     return 0;
 }
 
@@ -659,11 +820,11 @@ static int read_header(int fd, SnapHeader *h, const char *ident, uint64_t *bytes
     struct stat st;
     Trailer t;
     if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < sizeof *h + sizeof t) return -1;
-    if (pread(fd, h, sizeof *h, 0) != (ssize_t)sizeof *h || memcmp(h->magic, SNAP_MAGIC, 8) || h->version != SNAP_VERSION ||
-        h->header_bytes != sizeof *h || h->fingerprint != fingerprint())
-        return -1;
+    if (pread(fd, h, sizeof *h, 0) != (ssize_t)sizeof *h || memcmp(h->magic, SNAP_MAGIC, 8)) return -1;
+    if (h->version != SNAP_VERSION || h->header_bytes != sizeof *h || h->fingerprint != fingerprint()) return -3;
+    if (h->checksum != hv_surface_hash((const uint8_t *)h, offsetof(SnapHeader, checksum))) return -1;
     h->ident[sizeof h->ident - 1] = 0;
-    if (strcmp(h->ident, ident ? ident : "")) return -2;
+    if (ident && strcmp(h->ident, ident)) return -2;
     if (pread(fd, &t, sizeof t, st.st_size - (off_t)sizeof t) != (ssize_t)sizeof t || t.tag != TAG('E', 'N', 'D', ' ') ||
         t.total != (uint64_t)st.st_size)
         return -1;
@@ -675,10 +836,24 @@ int hv_snapshot_check(const char *path, const char *ident, uint64_t *bytes, int6
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     SnapHeader h;
-    int r = read_header(fd, &h, ident, bytes);
+    int r = read_header(fd, &h, ident ? ident : "", bytes);
     close(fd);
     if (!r && saved_at) *saved_at = h.saved_at;
     return r;
+}
+
+int hv_snapshot_inspect(const char *path, char *ident, size_t capacity, HvSnapshotInfo *info) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    SnapHeader h;
+    uint64_t bytes = 0;
+    int r = read_header(fd, &h, NULL, &bytes);
+    close(fd);
+    if (r) return r;
+    if (!ident || capacity <= strlen(h.ident)) return -1;
+    memcpy(ident, h.ident, strlen(h.ident) + 1);
+    if (info) *info = (HvSnapshotInfo){bytes, h.ram_size >> 20, h.saved_at, h.ncpus};
+    return 0;
 }
 
 int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t errlen) {
@@ -692,10 +867,11 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
     if (fd < 0) return fail(err, errlen, "No saved Mac: %s", strerror(errno));
     fcntl(fd, F_NOCACHE, 1);
     SnapHeader h;
-    int hr = read_header(fd, &h, ident, NULL);
+    int hr = read_header(fd, &h, ident ? ident : "", NULL);
     if (hr) {
         close(fd);
-        return fail(err, errlen, hr == -2 ? "The saved Mac is from another build of Henge or another disk." : "The saved Mac is incomplete or damaged.");
+        return fail(err, errlen, hr == -3 ? "The saved Mac uses an incompatible snapshot format or native layout. Start it from cold." :
+                    hr == -2 ? "The saved Mac is from another build of Henge or another disk." : "The saved Mac is incomplete or damaged.");
     }
     char disk_now[256];
     h.disk[sizeof h.disk - 1] = 0;
@@ -728,7 +904,7 @@ int hv_snapshot_restore(const char *path, const char *ident, char *err, size_t e
     if (!bad) bad = r_raw(&r, &t, sizeof t) || t.tag != TAG('E', 'N', 'D', ' ');
     free(r.buf);
     close(fd);
-    if (!bad && b->pvg && display_len) hv_pvg_lite_set_display_state(b->pvg, display, (size_t)display_len);
+    if (!bad && b->pvg && display_len) bad = hv_pvg_lite_set_display_state(b->pvg, display, (size_t)display_len);
     free(display);
     if (bad) return fail(err, errlen, "The saved Mac could not be read (%s).", strerror(r.err ? r.err : EINVAL));
     /* The guest's clock goes on as far as the wall clock went since it stopped (see hv_vm_resume_counter). */

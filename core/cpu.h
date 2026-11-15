@@ -91,13 +91,26 @@ typedef struct HvCpu {
     uint64_t ijc_tab[16];    /* 0x440: each flags value's branch-cache table (ijc + flags * table size) */
     uint64_t gaddend[4];     /* 0x4c0: host addends of the pages groups of accesses on one base register were checked in (translate_mem) */
     uint64_t xjump_thunk;    /* 0x4e0: hv_xjump_thunk */
-    uint64_t tcr_el1;        /* 0x4e8: here, in reach of one load, for translated MRS (xnu reads it ~17K times a second at login) */
-    uint64_t par_el1;        /* 0x4f0: likewise, read after each AT */
-    uint64_t cntvoff;        /* 0x4f8: the virtual counter is the host's less this (m->cntvoff), read inline */
+    uint64_t fm_read[2];    /* 0x4e8: experimental kernel read LUTs, EL1 / EL1 with PAN */
+    uint64_t fm_base;       /* 0x4f8: reserved; retained for assembly ABI compatibility */
     /* 0x500: what tags in the return tables (ret_tab) are xored with, [0] user, [1] kernel.
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
     uint64_t helper_came_from; /* 0x510: where hv_helper_entry was called from, to tell if it goes back there */
+    /* Optional diagnostic counters, one writer (this CPU's generated code).
+       Kept in existing padding so the TLB and assembly offsets stay fixed. */
+    uint64_t fm_attempts;     /* 0x518: eligible inline lookup attempts */
+    uint64_t fm_hits;         /* 0x520: lookups that supplied the actual load address */
+    uint64_t fm_misses[4];    /* 0x528: nonkernel, unavailable, empty/tag/page-end mismatch, reserved */
+    /* Plain EL1 register reads fit in one generated load. Upstream c7f4279
+       used 0x4e8/0x4f0; those slots hold this fork's fastmem pointers. Use
+       remaining padding instead, preserving every TLB/assembly/LUT offset. */
+    uint64_t tcr_el1;         /* 0x548 */
+    uint64_t par_el1;         /* 0x550 */
+    uint64_t cntvoff;         /* 0x558: machine virtual-counter origin; fastmem slots intact */
+    uint64_t ttbr0_el1;       /* 0x560: inline reads; writes retain full helper semantics */
+    uint64_t ttbr1_el1;       /* 0x568 */
+    uint64_t ijc_site_hints;  /* 0x570: per-CPU hints into the authoritative IJC */
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
@@ -116,8 +129,6 @@ typedef struct HvCpu {
        compare-and-swap against the value the LDXR saw, the way QEMU does it, so
        another CPU's store in between makes it fail. */
 
-    uint64_t ttbr0_el1;
-    uint64_t ttbr1_el1;
     uint64_t mair_el1;
     uint64_t amair_el1;
     uint64_t vbar_el1;
@@ -173,6 +184,15 @@ typedef struct HvCpu {
     int parked_off;          /* off, and its thread is waiting (so CPU_ON may reset it) */
 } HvCpu;
 
+#define HV_CPU_FM_READ     0x4e8
+#define HV_CPU_FM_BASE     0x4f8
+#define HV_CPU_FM_ATTEMPTS 0x518
+#define HV_CPU_FM_HITS     0x520
+#define HV_CPU_FM_MISSES   0x528
+#define HV_CPU_TCR_EL1     0x548
+#define HV_CPU_PAR_EL1     0x550
+#define HV_CPU_CNTVOFF     0x558
+
 #define HV_CPU_X(n)        ((n) * 8)
 #define HV_CPU_SP          0x0f8
 #define HV_CPU_PC          0x100
@@ -215,12 +235,12 @@ typedef struct HvCpu {
 #define HV_CPU_SP_EL1      0x398
 #define HV_CPU_IJC_TAB     0x440
 #define HV_CPU_TLB         0x580
+#define HV_CPU_TTBR0_EL1   0x560
+#define HV_CPU_TTBR1_EL1   0x568
+#define HV_CPU_IJC_SITE_HINTS 0x570
 #define HV_CPU_RET_SALT    0x500
 #define HV_CPU_GADDEND     0x4c0
 #define HV_CPU_XJUMP_THUNK 0x4e0
-#define HV_CPU_TCR_EL1     0x4e8
-#define HV_CPU_PAR_EL1     0x4f0
-#define HV_CPU_CNTVOFF     0x4f8
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -229,6 +249,17 @@ typedef struct HvCpu {
 #define HV_IJC_TABLE_BYTES ((1u << HV_IJC_BITS) * 16)
 #define HV_CPU_TLB_EL      32 /* between a slot's tables */
 
+_Static_assert(offsetof(HvCpu, fm_read) == HV_CPU_FM_READ, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, fm_base) == HV_CPU_FM_BASE, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, fm_attempts) == HV_CPU_FM_ATTEMPTS, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, fm_hits) == HV_CPU_FM_HITS, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, fm_misses) == HV_CPU_FM_MISSES, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, tcr_el1) == HV_CPU_TCR_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, par_el1) == HV_CPU_PAR_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, cntvoff) == HV_CPU_CNTVOFF, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, ttbr0_el1) == HV_CPU_TTBR0_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, ttbr1_el1) == HV_CPU_TTBR1_EL1, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, ijc_site_hints) == HV_CPU_IJC_SITE_HINTS,"HvCpu layout");
 _Static_assert(offsetof(HvCpu, sp) == HV_CPU_SP, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, pc) == HV_CPU_PC, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, nzcv) == HV_CPU_NZCV, "HvCpu layout");

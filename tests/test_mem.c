@@ -16,13 +16,26 @@ DECLARE_PROGRAM(epilogue);
 DECLARE_PROGRAM(dczva);
 DECLARE_PROGRAM(pageend);
 DECLARE_PROGRAM(groups);
+DECLARE_PROGRAM(groups_increment);
+DECLARE_PROGRAM(groups_shared);
+DECLARE_PROGRAM(groups_interleaved);
+DECLARE_PROGRAM(groups_interleaved_cross);
+DECLARE_PROGRAM(groups_slot_pressure);
+DECLARE_PROGRAM(groups_register);
+DECLARE_PROGRAM(groups_two);
+DECLARE_PROGRAM(groups_stack_frame);
+DECLARE_PROGRAM(groups_writeback_cross);
+DECLARE_PROGRAM(groups_writeback_negative);
+DECLARE_PROGRAM(groups_writeback_scratch);
 DECLARE_PROGRAM(mmio);
 extern const char mem_programs_begin[], mem_programs_finish[];
 
 static const TestProgram programs[] = {
     TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
     TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
-    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
+    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(groups_increment), TEST_PROGRAM(groups_shared), TEST_PROGRAM(groups_interleaved), TEST_PROGRAM(groups_interleaved_cross), TEST_PROGRAM(groups_register), TEST_PROGRAM(groups_two),
+    TEST_PROGRAM(groups_stack_frame), TEST_PROGRAM(groups_writeback_cross), TEST_PROGRAM(groups_writeback_negative), TEST_PROGRAM(groups_writeback_scratch),
+    TEST_PROGRAM(groups_slot_pressure),
 };
 
 #define DATA_SIZE 65536
@@ -36,6 +49,7 @@ static uint64_t data_seed;
 static uint64_t ttbr0, ttbr0_el0, pt_next, map_ap;
 
 static void reset_data(void) {
+    memset(stack,0x5a,STACK_SIZE);
     uint64_t s = data_seed * 0x2545f4914f6cdd1dull + 7;
     for (size_t i = 0; i < DATA_SIZE; i += 8) {
         s ^= s << 13; s ^= s >> 7; s ^= s << 17;
@@ -164,6 +178,9 @@ int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     static HvMachine m;
     if (hv_machine_init(&m, 8 << 20) != 0) return 1;
+    m.chain_stub_reference=-1; /* validate inline slots under all MMU/PAN/device/group variants */
+    /* Exercise the actual generated diagnostic counters as well as production mode. */
+    m.stats_interval = getenv("HV_STATS") ? atoi(getenv("HV_STATS")) : 0;
     data = aligned_alloc(16384, DATA_SIZE);
     stack = aligned_alloc(16384, STACK_SIZE);
     pt = aligned_alloc(16384, PT_SIZE);
@@ -180,6 +197,7 @@ int main(void) {
     size_t count = sizeof programs / sizeof programs[0];
     int failed = 0;
     static uint8_t native_data[DATA_SIZE];
+    static uint8_t native_stack[STACK_SIZE];
     for (int mode = 0; mode < 4; mode++) {
         m.slow_mem = mode == 0;
         hv_flush_blocks(&m);
@@ -192,6 +210,7 @@ int main(void) {
             data_seed = i + 3;
             run_native(p, &init, &native, reset_data);
             memcpy(native_data, data, DATA_SIZE);
+            memcpy(native_stack, stack, STACK_SIZE);
             reset_data();
             m.stat_slow_mem = 0;
             int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : mode == 3 ? mmu_on_el0 : NULL);
@@ -205,6 +224,16 @@ int main(void) {
                            (unsigned long long)b);
                     bad = 1;
                 }
+            /* Native END uses 16 bytes below its final SP as capture scratch.
+               Compare every other stack byte, including the new frame's
+               three stored register pairs, after independent memory resets. */
+            size_t native_sp=(size_t)(native.sp-(uint64_t)(uintptr_t)stack);
+            for(size_t off=0;off<STACK_SIZE&&!bad;off++) {
+                if(native_sp>=16&&off>=native_sp-16&&off<native_sp)continue;
+                if(stack[off]!=native_stack[off]){
+                    printf("  %s: stack byte %zu native %02x jit %02x\n",p->name,off,native_stack[off],stack[off]);bad=1;
+                }
+            }
             printf("%-11s %-18s: %-4s (%llu slow-path accesses)\n", p->name, mode_names[mode], bad ? "FAIL" : "ok",
                    (unsigned long long)m.stat_slow_mem);
             failed += bad != 0;

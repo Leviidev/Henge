@@ -1,7 +1,10 @@
 #include "vm.h"
+#include "idle_ticker.h"
+#include "scheduling.h"
 #include "pvg_lite.h"
 
 #include <TargetConditionals.h>
+#include <mach/mach.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <os/lock.h>
@@ -21,12 +24,16 @@
 
 #include "audio_mac.h"
 #include "dispatch.h"
+#include "sysreg.h"
 #include "net_slirp.h"
 #include "sysreg.h"
+#include "native_touch.h"
 
 static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
 static int ncpus = 1;
+/* Captured before VM workers start; never changed while guest execution runs. */
+static HvSchedulePlan schedule_plan;
 static HvVmapple board = {.ram_fd = -1};
 static _Atomic int input_stopping = 1;
 static void stop_pointer(void);
@@ -42,7 +49,7 @@ static double boot_last_scan;
 static int net_on;
 static void (*extra_poll)(void);
 static void (*exit_cb)(int);
-static pthread_t secondary_threads[HV_MAX_CPUS], kicker;
+static pthread_t secondary_threads[HV_MAX_CPUS], kicker_handle;
 static int secondary_started[HV_MAX_CPUS], kicker_started;
 static _Atomic int kicker_stopped;
 static pthread_t primary_thread;
@@ -57,6 +64,53 @@ static uint64_t paused_counter; /* the guest's virtual counter when its CPUs sto
 static int64_t paused_wall_ns;  /* and the wall clock then */
 static _Atomic int nudge_after_start; /* resumed: tell the guest someone is here as soon as it runs */
 
+/* Deferred network events cannot keep a board alive. This queue fences an
+   executing callback before pause/destruction, and epochs reject old timers. */
+static dispatch_queue_t network_events(void) {
+    static dispatch_once_t once;
+    static dispatch_queue_t queue;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("hengevm.network-events", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
+    return queue;
+}
+static uint64_t network_epoch; /* network_events only */
+static int network_live, network_flap_down;
+static void network_cancel(void) {
+    dispatch_sync(network_events(), ^{
+        network_live = 0; network_epoch++;
+        if (network_flap_down && board.net) {
+            hv_dev_lock(&m); hv_virtio_net_set_link(board.net, 1); hv_dev_unlock(&m);
+        }
+        network_flap_down = 0;
+    });
+}
+static int network_apply(uint64_t token, int up) { /* queue held */
+    if (!network_live || token != network_epoch || !board.net) return 0;
+    hv_dev_lock(&m);
+    hv_virtio_net_set_link(board.net, up);
+    hv_dev_unlock(&m);
+    network_flap_down = !up;
+    return 1;
+}
+#if HV_VM_TESTING
+uint64_t hv_vm_test_network_token(void) {
+    __block uint64_t token;
+    dispatch_sync(network_events(), ^{ token = network_epoch; });
+    return token;
+}
+int hv_vm_test_network_apply(uint64_t token, int up) {
+    __block int applied;
+    dispatch_sync(network_events(), ^{ applied = network_apply(token, up); });
+    return applied;
+}
+#endif
+
+int hv_vm_audio_event(int recover) {
+    if(!sound_on || !board.snd || hv_vm_paused())return -1;
+    hv_dev_lock(&m);
+    int result=0;
+    if(recover)result=hv_audio_recover(board.snd);else hv_audio_interrupt(board.snd);
+    hv_dev_unlock(&m);return result;
+}
 HvMachine *hv_vm_machine(void) { return &m; }
 HvVmapple *hv_vm_board(void) { return &board; }
 HvCpu *hv_vm_cpu(int index) { return index >= 0 && index < ncpus ? &cpus[index] : NULL; }
@@ -131,6 +185,12 @@ static void board_poll(void) {
     if (net_on) hv_net_poll();
 }
 
+static int touch_usb_connect(void *context, int connected) { return hv_xhci_touchscreen_connect(context, connected); }
+static int touch_usb_connected(void *context) { return hv_xhci_touchscreen_connected(context); }
+static int touch_usb_report(void *context, const uint8_t report[32]) { return hv_xhci_touchscreen_report(context, report); }
+static void touch_usb_keepalive(void *context) { hv_xhci_touchscreen_keepalive(context); }
+static int touch_usb_mapped(void *context) { return hv_xhci_touchscreen_mapped(context); }
+
 static int fail(char *err, size_t n, const char *msg) {
     if (err && n) snprintf(err, n, "%s", msg);
     return -1;
@@ -143,13 +203,13 @@ static struct sigaction prior_ill, prior_bus, prior_segv;
 static void on_ill(int sig, siginfo_t *info, void *ctx) {
     ucontext_t *uc = ctx;
     uint64_t pc = uc->uc_mcontext->__ss.__pc, rx = (uint64_t)(uintptr_t)m.jit.base, size = (uint64_t)m.jit.capacity * 4;
-    uint64_t used = (uint64_t)m.jit.used * 4;
+    uint64_t used = (uint64_t)hv_jit_extent(&m.jit) * 4;
     int in_rx = pc >= rx && pc < rx + size;
     int fetch = (uint64_t)(uintptr_t)info->si_addr == pc;
     if (sig == SIGILL || in_rx || fetch) {
-        fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, lr %llx, addr %p\n",
+        fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, evictions %llu, lr %llx, addr %p\n",
                 sig, (unsigned long long)pc, (unsigned long long)rx, (unsigned long long)size, (unsigned long long)used, (long long)(pc - rx),
-                (unsigned long long)m.stats.block_flushes, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
+                (unsigned long long)m.stats.block_flushes, (unsigned long long)m.stats.evictions, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
         for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%llx%c", i, (unsigned long long)uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? '\n' : ' ');
         fprintf(stderr, "\n");
         fprintf(stderr, "sp=%llx ram %llx size %llx\n", (unsigned long long)uc->uc_mcontext->__ss.__sp, (unsigned long long)(uintptr_t)board.ram, (unsigned long long)board.ram_size);
@@ -224,6 +284,8 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
 }
 
 void (*hv_prof_register)(void);
+void (*hv_prof_session)(int);
+void (*hv_prof_unregister)(void);
 
 void hv_vm_set_display_layer(void *layer) {
     CFTypeRef retained = layer ? CFRetain(layer) : NULL;
@@ -269,6 +331,9 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
+    schedule_plan = hv_schedule_read(ncpus);
+    hv_host_log_capabilities();
+    hv_schedule_log_plan(&schedule_plan);
     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = c->ecid, .seed = c->seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01}};
     if (c->installer) cfg.run_installer1 = cfg.run_installer2 = 1;
@@ -281,6 +346,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
         return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
     if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
+    if (board.usb && board.usb->ts_enabled) {
+        HvNativeTouchUSB transport = {board.usb, touch_usb_connect, touch_usb_connected, touch_usb_report, touch_usb_keepalive, touch_usb_mapped};
+        hv_native_touch_set_usb(&transport);
+    }
     hv_vmapple_reset_cpu(&board);
     if (board.net && !c->no_net) {
         if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");
@@ -302,6 +371,7 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
 }
 
 void hv_vm_destroy(void) {
+    network_cancel();
     if (primary_started && !pthread_equal(primary_thread, pthread_self())) {
         pthread_join(primary_thread, NULL);
         primary_started = 0;
@@ -313,9 +383,10 @@ void hv_vm_destroy(void) {
     atomic_store_explicit(&display_pvg, NULL, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
     stop_pointer();
+    hv_native_touch_set_usb(NULL);
     hv_net_detach();
     net_on = 0;
-    hv_audio_detach();
+    hv_audio_detach(board.snd);
     hv_vmapple_destroy(&board);
     hv_disk_close(&disk);
     hv_disk_close(&aux);
@@ -328,11 +399,68 @@ void hv_vm_destroy(void) {
     machine_created = 0;
 }
 
-static void *kicker_thread(void *unused) {
-    (void)unused;
-    while (!atomic_load(&kicker_stopped)) {
+static HvIdleTicker kicker = HV_IDLE_TICKER_INITIALIZER;
+static int idle_ticker_enabled = 1;
+static int deadline_kicks;
+
+void hv_vm_log_ticker(void) {
+    uint64_t generation = atomic_load_explicit(&kicker.epoch.value, memory_order_acquire);
+    for (int i = 0; i < m.ncpus; i++) {
+        HvPerCpu *p = &m.percpu[i];
+        /* Hold the thread right stable while Continue publishes its replacement. */
+        pthread_mutex_lock(&p->req_mu);
+        mach_port_t thread = __atomic_load_n(&p->thread, __ATOMIC_ACQUIRE);
+        thread_basic_info_data_t info = {0};
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        kern_return_t status = thread ? thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) : KERN_INVALID_ARGUMENT;
+        pthread_mutex_unlock(&p->req_mu);
+        if (status == KERN_SUCCESS) {
+            uint64_t user = (uint64_t)info.user_time.seconds * 1000000 + info.user_time.microseconds;
+            uint64_t system = (uint64_t)info.system_time.seconds * 1000000 + info.system_time.microseconds;
+            fprintf(stderr, "vcpu-work: cpu=%d generation=%llu user_us=%llu system_us=%llu wfe_ticks=%llu wfe_timeouts=%llu unmonitored_exits=%llu (cumulative; compare within one generation; WFE is elapsed time, not low-power residency)\n",
+                i, (unsigned long long)generation, (unsigned long long)user, (unsigned long long)system,
+                (unsigned long long)__atomic_load_n(&p->wfe_ticks, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&p->wfe_timeouts, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&p->wfe_dispatches, __ATOMIC_RELAXED));
+        } else fprintf(stderr, "vcpu-work: cpu=%d generation=%llu unavailable=%d\n", i, (unsigned long long)generation, status);
+    }
+    HvPvgLite *metrics_pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    if (metrics_pvg) hv_pvg_lite_log_metrics(metrics_pvg);
+    fprintf(stderr, "timer-kicks: filter=%d cpu0_poll=%llu secondary_due=%llu unknown_deadline=%llu secondary_deferred=%llu (cumulative scheduler decisions; explicit work bypasses filter)\n",
+            deadline_kicks,
+            (unsigned long long)atomic_load_explicit(&m.timer_kicks_cpu0, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&m.timer_kicks_due, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&m.timer_kicks_unknown, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&m.timer_kicks_deferred, memory_order_relaxed));
+    fprintf(stderr,"flush-wait: enabled=%d waits=%llu timeouts=%llu errors=%llu (cumulative; notifications on peer park and pending requests)\n",m.quiesce_enabled,(unsigned long long)atomic_load(&m.quiesce.waits),(unsigned long long)atomic_load(&m.quiesce.timeouts),(unsigned long long)atomic_load(&m.quiesce.errors));
+    fprintf(stderr, "idle-ticker: active_ticks=%llu sleep_waits=%llu resumes=%llu waiting=%u marked_cpu_flags=%llu (cumulative; timer/device wakeups remain active)\n",
+            (unsigned long long)atomic_load_explicit(&kicker.ticks, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&kicker.sleeps, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&kicker.resumes, memory_order_relaxed),
+            atomic_load_explicit(&kicker.waiters, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&kicker.marked_cpus, memory_order_relaxed));
+}
+
+static int cpu_active(void *opaque) {
+    HvMachine *machine = opaque;
+    for (int i = 0; i < machine->ncpus; i++)
+        if (machine->cpus[i] && __atomic_load_n(&machine->percpu[i].active, __ATOMIC_SEQ_CST)) return 1;
+    return 0;
+}
+
+static void *kicker_thread(void *arg) {
+    hv_schedule_apply(HV_ROLE_TICKER, 0, &schedule_plan, 1);
+    uint64_t token = (uint64_t)(uintptr_t)arg;
+    while (idle_ticker_enabled ? hv_idle_ticker_wait(&kicker, token, cpu_active, &m) : hv_wake_current(&kicker.epoch, token)) {
         usleep(1000);
-        hv_machine_kick_all(&m);
+        if (!hv_wake_current(&kicker.epoch, token)) break;
+        if (!idle_ticker_enabled || cpu_active(&m)) {
+            atomic_fetch_add_explicit(&kicker.ticks, 1, memory_order_relaxed);
+            unsigned marked;
+            if (idle_ticker_enabled) marked = deadline_kicks ? hv_machine_kick_due(&m, hv_counter()) : hv_machine_kick_active(&m);
+            else { hv_machine_kick_all(&m); marked = (unsigned)m.ncpus; }
+            atomic_fetch_add_explicit(&kicker.marked_cpus, marked, memory_order_relaxed);
+        }
     }
     return NULL;
 }
@@ -341,25 +469,35 @@ static void *kicker_thread(void *unused) {
    guest's SP, a guest address, so the kernel must never push a signal frame
    there: other threads take the asynchronous signals, and a handler that does
    run here (a fault) gets a stack of its own. */
-static pthread_key_t stack_key;
-static pthread_once_t stack_key_once = PTHREAD_ONCE_INIT;
-static void free_cpu_stack(void *memory) {
-    stack_t disabled = {.ss_flags = SS_DISABLE};
-    sigaltstack(&disabled, NULL);
-    free(memory);
+static pthread_key_t signal_stack_key;
+static pthread_once_t signal_stack_once = PTHREAD_ONCE_INIT;
+static int signal_stack_key_ready;
+static void release_signal_stack(void *p) {
+    /* Darwin's wrapper still validates stack size on SS_DISABLE. */
+    stack_t disabled = {.ss_sp = p, .ss_size = 1u << 16, .ss_flags = SS_DISABLE};
+    if (sigaltstack(&disabled, NULL) == 0) free(p);
 }
-static void make_stack_key(void) { pthread_key_create(&stack_key, free_cpu_stack); }
+static void make_signal_stack_key(void) {
+    signal_stack_key_ready = pthread_key_create(&signal_stack_key, release_signal_stack) == 0;
+}
 
 void hv_vm_prepare_cpu_thread(void) {
+    if (hv_prof_register) hv_prof_register();
     static __thread int done;
     if (done) return;
     done = 1;
-    if (hv_prof_register) hv_prof_register();
-    stack_t ss = {.ss_sp = malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
+    /* A runtime (including AddressSanitizer) may already own this thread's
+       alternate stack. Replacing it makes its thread destructor unmap our
+       malloc allocation and also loses the runtime's original stack. */
+    stack_t previous = {0};
+    int has_stack = sigaltstack(NULL, &previous) == 0 && !(previous.ss_flags & SS_DISABLE) && previous.ss_sp && previous.ss_size;
+    stack_t ss = {.ss_sp = has_stack ? NULL : malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
     if (ss.ss_sp) {
-        sigaltstack(&ss, NULL);
-        pthread_once(&stack_key_once, make_stack_key);
-        pthread_setspecific(stack_key, ss.ss_sp);
+        if (sigaltstack(&ss, NULL) != 0) free(ss.ss_sp);
+        else {
+            pthread_once(&signal_stack_once, make_signal_stack_key);
+            if (signal_stack_key_ready) pthread_setspecific(signal_stack_key, ss.ss_sp);
+        }
     }
     sigset_t set;
     sigfillset(&set);
@@ -367,27 +505,19 @@ void hv_vm_prepare_cpu_thread(void) {
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 }
 
-/* iOS parks default-QoS threads on efficiency cores readily; the guest's CPUs are what the user waits on. */
-void hv_vm_cpu_qos(void) {
+static void cpu_qos(unsigned index) {
     hv_vm_prepare_cpu_thread();
-    /* HV_QOS=ui|init|default (testing): the class the guest's CPUs run at. */
-    const char *q = getenv("HV_QOS");
-#if TARGET_OS_IPHONE
-    qos_class_t c = QOS_CLASS_USER_INITIATED;
-#else
-    qos_class_t c = QOS_CLASS_DEFAULT;
-#endif
-    if (q && !strcmp(q, "ui")) c = QOS_CLASS_USER_INTERACTIVE;
-    else if (q && !strcmp(q, "init")) c = QOS_CLASS_USER_INITIATED;
-    else if (q && !strcmp(q, "default")) c = QOS_CLASS_DEFAULT;
-    if (c != QOS_CLASS_DEFAULT) pthread_set_qos_class_self_np(c, 0);
+    hv_schedule_apply(HV_ROLE_CPU, index, &schedule_plan, 1);
 }
+/* Public caller is the Mac command-line tool's CPU 0. */
+void hv_vm_cpu_qos(void) { cpu_qos(0); }
 
 /* CPUs 1 and up: run whenever PSCI CPU_ON starts them; the machine stops with CPU 0. */
 static void *secondary_thread(void *arg) {
     HvCpu *c = arg;
-    hv_vm_cpu_qos();
+    cpu_qos(c->index);
     int r = hv_run(c);
+    if (hv_prof_unregister) hv_prof_unregister();
     if (!c->halted)
         fprintf(stderr, "hengevm: cpu %u stopped (%s) at pc %llx el%u\n", c->index, hv_vm_reason_name(r),
                 (unsigned long long)c->pc, c->el);
@@ -396,20 +526,17 @@ static void *secondary_thread(void *arg) {
 
 /* The network cable out for a moment and back in, as a Mac waking from sleep sees its network come back: macOS
    renews its address and lets connections that died while it was saved go at once. */
+int hv_vm_paused(void);
 void hv_vm_link_flap(void) {
-    if (!machine_created || !board.net) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (!machine_created || !board.net || hv_vm_paused()) return;
-        hv_dev_lock(&m);
-        hv_virtio_net_set_link(board.net, 0);
-        hv_dev_unlock(&m);
-        fprintf(stderr, "hengevm: network link down (after a resume)\n");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            if (!machine_created || !board.net) return;
-            hv_dev_lock(&m);
-            hv_virtio_net_set_link(board.net, 1);
-            hv_dev_unlock(&m);
-            fprintf(stderr, "hengevm: network link up\n");
+    dispatch_async(network_events(), ^{
+        if (!network_live || !board.net) return;
+        uint64_t token = ++network_epoch;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), network_events(), ^{
+            if (!network_apply(token, 0)) return;
+            fprintf(stderr, "hengevm: network link down (after a resume)\n");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), network_events(), ^{
+                if (network_apply(token, 1)) fprintf(stderr, "hengevm: network link up\n");
+            });
         });
     });
 }
@@ -423,16 +550,34 @@ int hv_vm_disk_identity(char *out, size_t n) {
     return 0;
 }
 
-void hv_vm_flush_disks(void) {
-    hv_disk_flush(&disk);
-    hv_disk_flush(&aux);
+int hv_vm_flush_disks(void) {
+    int root = hv_disk_flush(&disk), auxiliary = hv_disk_flush(&aux);
+    return root || auxiliary ? -1 : 0;
+}
+
+/* Persistent snapshots must reach storage even if normal guest flushes use
+   the user's cache-only policy. This is once per save, never per guest write. */
+int hv_vm_sync_disks(void) {
+    int root = disk.readonly ? 0 : fsync(disk.fd);
+    int auxiliary = aux.readonly ? 0 : fsync(aux.fd);
+    return root || auxiliary ? -1 : 0;
 }
 
 int hv_vm_run_cpu0(void) {
-    return hv_run(&cpus[0]);
+    if (hv_prof_session) hv_prof_session(1);
+    int result = hv_run(&cpus[0]);
+    if (hv_prof_session) hv_prof_session(0);
+    if (hv_prof_unregister) hv_prof_unregister();
+    hv_idle_ticker_advance(&kicker);
+    network_cancel();
+    hv_native_touch_enable(0); /* fence helper epochs before pause/snapshot */
+    hv_dev_lock(&m);
+    if(atomic_load(&cpus[0].halted)==HV_HALT_SAVE)hv_audio_pause(board.snd);
+    else hv_audio_detach(board.snd);
+    hv_dev_unlock(&m);
+    return result;
 }
 
-int hv_vm_paused(void);
 static void set_pause_state(int v) {
     pthread_mutex_lock(&pause_mu);
     pause_state = v;
@@ -451,24 +596,32 @@ int hv_vm_finish_pause(void) {
     atomic_store(&kicker_stopped, 1);
     for (int i = 1; i < ncpus; i++)
         if (secondary_started[i]) pthread_join(secondary_threads[i], NULL);
-    if (kicker_started) pthread_join(kicker, NULL);
+    hv_idle_ticker_advance(&kicker);
+    if (kicker_started) pthread_join(kicker_handle, NULL);
     kicker_started = 0;
     memset(secondary_started, 0, sizeof secondary_started);
-    if (!all_saving()) return -1;
+    if (!all_saving()) {
+        fprintf(stderr, "hengevm: suspend rejected: non-SAVE halt; cpus=%d\n", ncpus);
+        for (int i=0;i<ncpus;i++) fprintf(stderr, "hengevm: suspend cpu[%d] halted=%d pc=%llx\n", i, atomic_load(&cpus[i].halted), (unsigned long long)cpus[i].pc);
+        return -1;
+    }
     paused_counter = hv_counter() - m.cntvoff;
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     paused_wall_ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
     hv_virtio_blk_stop(board.root_blk);
     hv_virtio_blk_stop(board.aux_blk);
-    if (sound_on) hv_audio_detach(); /* the host's player stops; the stream's state stays in the device */
-    hv_pvg_lite_quiesce(board.pvg);
+    /* hv_vm_run_cpu0 already detached board.snd under the device lock. */
+    hv_pvg_lite_set_display_paused(board.pvg, 1);
+    int graphics_clean = hv_pvg_lite_quiesce(board.pvg) == 0;
     hv_dev_lock(&m);
     int idle = hv_virtio_blk_idle(board.root_blk) && hv_virtio_blk_idle(board.aux_blk);
     hv_dev_unlock(&m);
     if (!idle) fprintf(stderr, "hengevm: pause: disk requests still in flight; it cannot be saved like this\n");
-    pause_clean = idle;
-    hv_vm_flush_disks();
+    if (!graphics_clean) fprintf(stderr, "hengevm: pause: graphics could not be preserved; snapshot refused\n");
+    int disks_clean = hv_vm_flush_disks() == 0;
+    if (!disks_clean) fprintf(stderr, "hengevm: pause: disk flush failed; snapshot refused\n");
+    pause_clean = idle && graphics_clean && disks_clean;
     set_pause_state(2);
     return 0;
 }
@@ -500,12 +653,14 @@ int hv_vm_pause(void) {
         return 0;
     }
     if (run_ended) {
+        fprintf(stderr, "hengevm: suspend rejected: CPU0 run already ended\n");
         pthread_mutex_unlock(&pause_mu);
         return -1;
     }
     pause_state = 1;
     pthread_mutex_unlock(&pause_mu);
-    atomic_store(&input_stopping, 1);
+    network_cancel();
+    stop_pointer(); /* drain delayed input before CPUs and snapshot stop */
     hv_machine_halt(&m, HV_HALT_SAVE);
     pthread_mutex_lock(&pause_mu);
     while (pause_state == 1) pthread_cond_wait(&pause_cv, &pause_mu);
@@ -537,10 +692,8 @@ int hv_vm_continue(void) {
     }
     hv_virtio_blk_start(board.root_blk);
     hv_virtio_blk_start(board.aux_blk);
-    if (sound_on) {
-        hv_audio_attach(board.snd);
-        hv_virtio_snd_resume(board.snd);
-    }
+    if (sound_on) hv_audio_attach(board.snd);
+    hv_virtio_snd_resume(board.snd); /* reset the fallback clock even without output */
     atomic_store(&input_stopping, 0);
     set_pause_state(0);
     return hv_vm_start(cpu0_ours, exit_cb);
@@ -550,8 +703,10 @@ static void *cpu0_thread(void *unused) {
     (void)unused;
     hv_vm_cpu_qos();
     int r = hv_vm_run_cpu0();
+    fprintf(stderr, "hengevm: cpu0 exited: reason=%d halt=%d pc=0x%llx exit_req=%d\n", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, __atomic_load_n(&cpus[0].exit_req, __ATOMIC_RELAXED));
     if (atomic_load(&cpus[0].halted) == HV_HALT_SAVE && hv_vm_finish_pause() == 0) return NULL;
     pthread_mutex_lock(&pause_mu);
+    fprintf(stderr, "hengevm: CPU0 exit before pause: reason=%d halt=%d pc=%llx pause_state=%d\n", r, atomic_load(&cpus[0].halted), (unsigned long long)cpus[0].pc, pause_state);
     run_ended = 1;
     if (pause_state == 1) pause_state = 3, pthread_cond_broadcast(&pause_cv);
     pthread_mutex_unlock(&pause_mu);
@@ -561,29 +716,34 @@ static void *cpu0_thread(void *unused) {
     atomic_store(&kicker_stopped, 1);
     for (int i = 1; i < ncpus; i++)
         if (secondary_started[i]) pthread_join(secondary_threads[i], NULL);
-    if (kicker_started) pthread_join(kicker, NULL);
+    if (kicker_started) pthread_join(kicker_handle, NULL);
     kicker_started = 0;
     memset(secondary_started, 0, sizeof secondary_started);
     /* A DMA worker can still be writing after the guest CPUs have exited. */
     hv_virtio_blk_stop(board.root_blk);
     hv_virtio_blk_stop(board.aux_blk);
-    hv_audio_detach();
+    hv_audio_detach(board.snd);
     hv_vm_flush_disks();
     if (exit_cb) exit_cb(r);
     return NULL;
 }
 
 int hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
+    dispatch_sync(network_events(), ^{ network_epoch++; network_live = 1; });
+    hv_pvg_lite_set_display_paused(board.pvg, 0);
     exit_cb = on_exit;
-    cpu0_ours = cpu0;
-    if (atomic_exchange(&nudge_after_start, 0)) /* someone is back: macOS counts the time away as idle (display off) */
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            hv_vm_mouse_move(1, 0);
-            hv_vm_mouse_move(-1, 0);
-        });
     pthread_mutex_lock(&pause_mu);
     run_ended = 0;
     pthread_mutex_unlock(&pause_mu);
+    cpu0_ours = cpu0;
+    const char *idle_mode = getenv("HV_IDLE_TICKER");
+    idle_ticker_enabled = !idle_mode || strcmp(idle_mode, "0");
+    const char *filter = getenv("HV_DEADLINE_KICKS");
+    deadline_kicks = filter && !strcmp(filter, "1") && m.timer_changed;
+    m.notify_cpu_active = idle_ticker_enabled ? hv_idle_ticker_notify : NULL;
+    m.activity_opaque = &kicker;
+    fprintf(stderr, "hengevm: scheduler-policy: timer_direct=%d deadline_filter=%d fallback_us=1000 (explicit work wakeups unchanged)\n", m.timer_changed != NULL, deadline_kicks);
+    uint64_t token = hv_idle_ticker_advance(&kicker);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
@@ -593,7 +753,7 @@ int hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
         secondary_started[i] = pthread_create(&secondary_threads[i], &attr, secondary_thread, &cpus[i]) == 0;
         if (!secondary_started[i]) goto failed;
     }
-    kicker_started = pthread_create(&kicker, NULL, kicker_thread, NULL) == 0;
+    kicker_started = pthread_create(&kicker_handle, NULL, kicker_thread, (void *)(uintptr_t)token) == 0;
     if (!kicker_started) goto failed;
     if (cpu0) {
         primary_started = pthread_create(&primary_thread, &attr, cpu0_thread, NULL) == 0;
@@ -602,18 +762,21 @@ int hv_vm_start(int cpu0, void (*on_exit)(int reason)) {
     pthread_attr_destroy(&attr);
     return 0;
 failed:
+    network_cancel();
     pthread_attr_destroy(&attr);
     hv_machine_halt(&m, HV_HALT_HOST);
     atomic_store(&kicker_stopped, 1);
+    hv_idle_ticker_advance(&kicker);
     for (int i = 1; i < ncpus; i++)
         if (secondary_started[i]) pthread_join(secondary_threads[i], NULL);
     memset(secondary_started, 0, sizeof secondary_started);
-    if (kicker_started) pthread_join(kicker, NULL);
+    if (kicker_started) pthread_join(kicker_handle, NULL);
     kicker_started = 0;
     return -1;
 }
 
 void hv_vm_stop(void) {
+    hv_idle_ticker_advance(&kicker);
     hv_machine_halt(&m, HV_HALT_HOST);
 }
 
@@ -627,6 +790,7 @@ void hv_vm_stop(void) {
 static os_unfair_lock rctrl_lock = OS_UNFAIR_LOCK_INIT;
 static int rctrl_user, rctrl_click;
 static int left_user, left_click, left_sent; /* only the pointer queue touches these */
+static uint8_t button_owners[3];
 
 static dispatch_queue_t pointer_queue(void) {
     static dispatch_queue_t q;
@@ -640,8 +804,18 @@ static void stop_pointer(void) {
     /* The bridge excludes new input. Finish a click already in progress and
        discard queued input before releasing the keyboard and mouse. */
     dispatch_sync(pointer_queue(), ^{
+        if (board.mouse && left_sent) {
+            hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, 0);
+            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        }
+        if (board.mouse) {
+            hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_MIDDLE, 0);
+            hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+        }
         left_user = left_click = left_sent = 0;
+        memset(button_owners,0,sizeof button_owners);
         os_unfair_lock_lock(&rctrl_lock);
+        hv_xhci_release_input(board.usb);
         rctrl_user = rctrl_click = 0;
         os_unfair_lock_unlock(&rctrl_lock);
     });
@@ -689,7 +863,9 @@ static void left_update(void) {
 static void button_now(void *ctx) {
     if (atomic_load(&input_stopping)) return;
     intptr_t v = (intptr_t)ctx;
-    int button = (int)(v >> 1), down = (int)(v & 1);
+    int button = (int)((v >> 1)&3), down = (int)(v & 1);
+    unsigned owner=(unsigned)(v>>3)&7u;
+    if(!hv_input_button_owner(button_owners,(unsigned)button,owner,down,&down))return;
     if (button == 0) {
         left_user = down;
         left_update();
@@ -713,6 +889,16 @@ static void button_now(void *ctx) {
 void hv_vm_mouse_button(int button, int down) {
     if (button < 0 || button > 2) return;
     dispatch_async_f(pointer_queue(), (void *)(intptr_t)(button << 1 | !!down), button_now);
+}
+void hv_vm_mouse_button_source(int button,int down,unsigned source) {
+    if(button<0 || button>2 || source>7)return;
+    dispatch_async_f(pointer_queue(),(void *)(intptr_t)(source<<3|button<<1|!!down),button_now);
+}
+void hv_vm_key_hid_source(uint8_t usage,int down,unsigned source) { hv_xhci_key_source(board.usb,usage,down,source); }
+void hv_vm_release_input_source(unsigned source) {
+    if(source<1 || source>7)return;
+    hv_xhci_release_source(board.usb,source);
+    for(int b=0;b<3;b++)hv_vm_mouse_button_source(b,0,source);
 }
 
 /* The guest takes a wheel event as 8 bits: -200 arrives as +56, the wrong way. So big moves go in pieces. */
@@ -739,6 +925,9 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
 void hv_vm_touch_frame(uint32_t ts_ms) { hv_xhci_touch_frame(board.usb, ts_ms); }
 
 void hv_vm_touch_button(int down) { hv_xhci_touch_button(board.usb, down); }
+void hv_vm_gamepad(int connected,uint16_t buttons,unsigned hat,const int16_t axes[4],uint8_t left,uint8_t right) {
+    hv_xhci_gamepad(board.usb,connected,buttons,hat,axes,left,right);
+}
 
 int hv_vm_pointer(int *x, int *y) {
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);

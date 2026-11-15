@@ -49,6 +49,7 @@ HvGic *hv_gicv3_create(HvMachine *m, uint64_t dist_pa, uint64_t redist_pa);
 void hv_gicv3_set_irq(HvGic *g, int intid, int level);
 /* Drive one CPU's PPI (16-31). */
 void hv_gicv3_set_ppi(HvGic *g, int cpu, int intid, int level);
+void hv_gicv3_set_timer_lines(HvGic *g, int cpu, int virtual_level, int physical_level);
 /* Make an SPI pending, as an MSI write does. */
 void hv_gicv3_pend(HvGic *g, int intid);
 /* Recompute every CPU's IRQ and FIQ inputs (waking any that just got one). */

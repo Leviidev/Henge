@@ -16,7 +16,7 @@ typedef struct {
     void *context;
 } Resolver;
 static atomic_int immediate, active, started, sent, block_send, release_send, stopped;
-static atomic_int fail_lookup;
+static atomic_int fail_lookup, forwarded;
 static int failures;
 /* The standalone resolver test supplies the engine's runtime settings. */
 int hv_knob[HV_K_COUNT];
@@ -52,7 +52,14 @@ void DNSServiceRefDeallocate(DNSServiceRef ref) {
     atomic_fetch_sub(&active, 1);
 }
 static void send_frame(const uint8_t *frame, uint32_t len, int to_guest) {
-    if (!to_guest || len < 54 || !(frame[44] & 0x80)) exit(1);
+    if (len < 54) exit(1);
+    if (to_guest) { if (!(frame[44] & 0x80)) exit(1); }
+    else {
+        // The custom resolver preserves the original query via libslirp;
+        // it must not fabricate a guest reply when the system resolver fails.
+        if (frame[44] & 0x80) exit(1);
+        atomic_fetch_add(&forwarded, 1);
+    }
     atomic_fetch_add(&sent, 1);
     while (atomic_load(&block_send) && !atomic_load(&release_send)) usleep(1000);
 }
@@ -148,6 +155,7 @@ int main(void) {
     check("restart after fallback gets a fresh failure streak", hv_dns_proxy_on());
     hv_dns_proxy_stop();
     check("fallback session releases every resolver", atomic_load(&active) == 0);
+    check("failed queries use libslirp rather than SERVFAIL replies", atomic_load(&forwarded) == 17);
     printf("DNS lifecycle: %d failures\n", failures);
     return failures != 0;
 }
