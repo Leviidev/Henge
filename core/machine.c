@@ -646,6 +646,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->spsel = 1;
     cpu->daif = HV_PSTATE_DAIF;
     cpu->excl_addr = ~0ull;
+    cpu->apf_p = 1; /* PF and AF clear */
     /* Architectural reset value has the MMU and caches off; RES1 bits set. */
     cpu->sctlr_el1 = 0x30d00980; /* RES1 bits, and ITD and SED, which read as 1 without AArch32 at EL0 */
     cpu->nkernel_fills = HV_KERNEL_FILLS + 1; /* nothing is logged yet: make every entry invalid */

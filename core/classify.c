@@ -37,6 +37,9 @@ static HvInsnKind classify_system(uint32_t insn) {
             (void)op2;
             return HV_INSN_BARRIER;
         }
+        /* CFINV, XAFLAG, AXFLAG (FlagM, FlagM2) only touch NZCV, which translated code keeps in the host's flags: they
+           run as they are. Rosetta 2 uses them all the time (x86 borrow, float compares). */
+        if (insn == 0xd500401fu || insn == 0xd500403fu || insn == 0xd500405fu) return HV_INSN_COPY;
         if (l == 0 && crn == 4) return HV_INSN_SYSREG; /* MSR (immediate) to PSTATE */
         if (l == 0 && crn == 1 && op1 == 3 && (insn & 0x1f) == 0x1f) {
             /* WFET, WFIT (FEAT_WFxT) live in CRn=1. */

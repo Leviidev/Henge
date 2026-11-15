@@ -6,6 +6,26 @@
 
 struct HvMachine;
 
+/* Apple's x86 memory ordering (TSO) for Rosetta 2. Apple CPUs say they can run with
+   total store ordering in AIDR_EL1 bit 9, and the kernel turns it on for a thread with ACTLR_EL1 bit 1
+   (EnTSO) while that thread runs translated x86 code. Translated EL0 code of such a thread is made in
+   its own HV_BLOCK_TSO form, whose memory accesses keep TSO's order (core/translate.c). */
+#define HV_AIDR_TSO (1ull << 9)
+#define HV_ACTLR_TSO (1ull << 1)
+/* macOS 15.6.1's exec_mach_imgact accepts an x86_64 Mach-O only when AIDR_EL1 has bits 9 and 19, and either bits 20
+   and 23 or ID_AA64MMFR1_EL1.AFP (read from the 24G90 VirtualMac kernelcache, 2026-11-15). Bits 20 and 23 would mean
+   emulating Apple's own float-mode registers; FEAT_AFP is real ARM and passes through to the host (core/sysreg.c). */
+#define HV_AIDR_X86 (1ull << 19)
+#define HV_AIDR (HV_AIDR_TSO | HV_AIDR_X86)
+/* AIDR bit 19 is APFLG: Apple's x86 flags. With ACTLR_EL1 bit 4 (EnAPFLG, set with EnTSO for translated threads),
+   ADDS, SUBS, ADCS, SBCS, ANDS and BICS also compute x86's parity flag (PF: the low byte of the result has an even
+   number of ones) and adjust flag (AF: the carry or borrow out of bit 3), AXFLAG sets them as x86's float compares
+   do, and NZCV shows them in bits 26 and 27. Rosetta 2 reads them there for SETP, JP, LAHF, PUSHF and NaN checks.
+   Henge keeps them per CPU in apf_p and apf_a and computes them in translated code (HV_BLOCK_APF, core/translate.c). */
+#define HV_ACTLR_APFLG (1ull << 4)
+#define HV_NZCV_PF (1ull << 26)
+#define HV_NZCV_AF (1ull << 27)
+
 enum HvHaltReason {
     HV_HALT_NONE, HV_HALT_SHUTDOWN, HV_HALT_RESET, HV_HALT_HOST, HV_HALT_PANIC,
     HV_HALT_SAVE /* stopped to be saved (instant resume): it can run on, or be saved and resumed later */
@@ -98,6 +118,10 @@ typedef struct HvCpu {
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
     uint64_t helper_came_from; /* 0x510: where hv_helper_entry was called from, to tell if it goes back there */
+    /* 0x518: Apple's x86 flags (HV_ACTLR_APFLG): PF is set when apf_p has an even number of ones, AF is bit 4 of
+       apf_a. They sit in the padding before the TLB, so sizeof(HvCpu) and every offset (snapshots check them) stay. */
+    uint8_t apf_p;
+    uint8_t apf_a;
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
@@ -221,6 +245,8 @@ typedef struct HvCpu {
 #define HV_CPU_TCR_EL1     0x4e8
 #define HV_CPU_PAR_EL1     0x4f0
 #define HV_CPU_CNTVOFF     0x4f8
+#define HV_CPU_APF_P       0x518
+#define HV_CPU_APF_A       0x519
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -266,6 +292,7 @@ _Static_assert(offsetof(HvCpu, ijc_thunk) == HV_CPU_IJC_THUNK, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, spsel) == HV_CPU_SPSEL, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, sp_el1) == HV_CPU_SP_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ijc_tab) == HV_CPU_IJC_TAB, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, apf_p) == HV_CPU_APF_P && offsetof(HvCpu, apf_a) == HV_CPU_APF_A, "HvCpu layout");
 _Static_assert(HV_IJC_TABLES == 16, "ijc_tab has one pointer per table");
 _Static_assert(sizeof(HvTlbEntry) == 32, "TLB entries are indexed with lsl #5");
 
@@ -304,5 +331,23 @@ static inline uint32_t hv_tlb_code(uint32_t slot, int table) {
     return hv_tlb_tmajor ? (uint32_t)table << HV_TLB_BITS | slot : slot << 2 | (uint32_t)table;
 }
 static inline HvTlbEntry *hv_tlb_ent(HvCpu *cpu, uint32_t slot, int table) { return &cpu->tlb[hv_tlb_code(slot, table)]; }
+
+/* Apple's x86 flags as NZCV shows them (bits 26 and 27), and setting them from such a value. */
+static inline uint64_t hv_apf_get(const HvCpu *cpu) {
+    return (__builtin_popcount(cpu->apf_p) & 1 ? 0 : HV_NZCV_PF) | (cpu->apf_a & 0x10 ? HV_NZCV_AF : 0);
+}
+static inline void hv_apf_set(HvCpu *cpu, uint64_t nzcv) {
+    cpu->apf_p = nzcv & HV_NZCV_PF ? 0 : 1;
+    cpu->apf_a = nzcv & HV_NZCV_AF ? 0x10 : 0;
+}
+static inline int hv_apf_on(const HvCpu *cpu) { return !cpu->el && (cpu->actlr_el1 & HV_ACTLR_APFLG); }
+
+/* NZCV for a snapshot: N, Z, C and V, with Apple's x86 flags in bits 26 and 27, which NZCV leaves unused otherwise,
+   so the snapshot format stays as it was. A snapshot from before has them 0: clear, as after a reset. */
+static inline uint64_t hv_nzcv_save(const HvCpu *cpu) { return (cpu->nzcv & 0xf0000000) | hv_apf_get(cpu); }
+static inline void hv_nzcv_restore(HvCpu *cpu, uint64_t saved) {
+    cpu->nzcv = saved & 0xf0000000;
+    hv_apf_set(cpu, saved);
+}
 
 #endif

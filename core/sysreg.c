@@ -9,6 +9,7 @@
 #include "memop.h"
 #include "mmu.h"
 #include <stdlib.h>
+#include <sys/sysctl.h>
 
 /* System registers are named by op0:op1:CRn:CRm:op2, which is bits 20..5 of MRS/MSR. */
 #define R(op0, op1, crn, crm, op2) ((op0) << 14 | (op1) << 11 | (crn) << 7 | (crm) << 3 | (op2))
@@ -16,10 +17,22 @@
 /* ID registers: only features the translator handles. Host features are a
    superset (Apple M1 and later), so copied instructions always exist. */
 #define ID_AA64PFR0  0x1100000001110011ull /* EL0/EL1 AArch64, FP+AdvSIMD with FP16, GICv3 sysregs, CSV2, CSV3 */
-#define ID_AA64ISAR0 0x0011100110212120ull /* AES+PMULL, SHA1, SHA2/512, CRC32, LSE, RDM, SHA3, DotProd, FHM, FlagM */
+#define ID_AA64ISAR0 0x0021100110212120ull /* AES+PMULL, SHA1, SHA2/512, CRC32, LSE, RDM, SHA3, DotProd, FHM, FlagM2 */
 #define ID_AA64ISAR1 0x0000001110211011ull /* DPB, PAuth (no-op), JSCVT, FCMA, LRCPC2, PACGA, FRINTTS, SB */
 #define ID_AA64MMFR0 0x0000000000100025ull /* 48-bit PA, 16-bit ASID, 4K/16K/64K granules */
 #define ID_AA64MMFR1 0x0000000000111000ull /* HPDS, LOR, PAN */
+#define ID_AA64MMFR1_AFP (1ull << 44)     /* FEAT_AFP, when the host has it: Rosetta 2 needs it (see cpu.h) */
+
+/* FEAT_AFP (FPCR.FIZ/AH/NEP) is used as is by guest code, so it is offered only when this CPU has it. */
+static uint64_t mmfr1_value(void) {
+    static int afp = -1;
+    if (afp < 0) {
+        int v = 0;
+        size_t n = sizeof v;
+        afp = sysctlbyname("hw.optional.arm.FEAT_AFP", &v, &n, NULL, 0) == 0 && v ? 1 : 0;
+    }
+    return ID_AA64MMFR1 | (afp ? ID_AA64MMFR1_AFP : 0);
+}
 #define ID_AA64DFR0  0x0000000000000006ull /* Armv8 debug, no PMU */
 #define MIDR         0x611f0220ull         /* Apple; a configuration constant for now */
 #define CTR_EL0      0x9444c004ull         /* 64-byte lines, PIPT I-cache, IDC */
@@ -72,7 +85,7 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     uint64_t now = counter();
     HvMachine *m = cpu->m;
     switch (reg) {
-    case R(3, 3, 4, 2, 0): *v = cpu->nzcv & 0xf0000000; return 0;
+    case R(3, 3, 4, 2, 0): *v = (cpu->nzcv & 0xf0000000) | (hv_apf_on(cpu) ? hv_apf_get(cpu) : 0); return 0;
     case R(3, 3, 4, 2, 1): *v = cpu->daif; return 0;
     case R(3, 0, 4, 2, 2): *v = (uint64_t)cpu->el << 2; return 0;      /* CurrentEL */
     case R(3, 0, 4, 2, 0): *v = cpu->spsel; return 0;
@@ -121,11 +134,11 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     case R(3, 0, 0, 6, 0): *v = ID_AA64ISAR0; return 0;
     case R(3, 0, 0, 6, 1): *v = ID_AA64ISAR1; return 0;
     case R(3, 0, 0, 7, 0): *v = ID_AA64MMFR0; return 0;
-    case R(3, 0, 0, 7, 1): *v = ID_AA64MMFR1; return 0;
+    case R(3, 0, 0, 7, 1): *v = mmfr1_value(); return 0;
     case R(3, 3, 0, 0, 1): *v = CTR_EL0; return 0;
     case R(3, 3, 0, 0, 7): *v = 4; return 0;                             /* DCZID: 64-byte DC ZVA */
     case R(3, 1, 0, 0, 1): *v = CLIDR; return 0;
-    case R(3, 1, 0, 0, 7): *v = 0; return 0;                             /* AIDR */
+    case R(3, 1, 0, 0, 7): *v = HV_AIDR; return 0;                       /* AIDR: Apple's TSO and x86-flag bits (see cpu.h) */
     case R(3, 1, 0, 0, 0):                                               /* CCSIDR for CSSELR's level */
         *v = (cpu->csselr_el1 >> 1) == 0 ? (127u << 13 | 7u << 3 | 2) : (2047u << 13 | 15u << 3 | 2);
         return 0;
@@ -158,6 +171,18 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
     /* Apple implementation-defined registers (op0 3, CRn 15). The vmapple
        kernel reads error-status registers there (S3_6_C15_C0_0, S3_3_C15_C8_0..)
        when it reports a machine error; zero means no error recorded. */
+    /* S3_6_C15_C8_3 (APSTATE, xnu's proc_reg.h): bit 1 P and bit 2 A are Apple's x86 flags, which the kernel saves
+       (into the thread's saved state, offset 0x114) when a Rosetta thread enters it and puts back before it returns.
+       Bit 0 (G, guarded execution) is never set here. S3_6_C15_C2_5 (AFPCR, Apple's float modes): nothing kept,
+       FEAT_AFP is offered instead (see cpu.h). */
+    if (reg == R(3, 6, 15, 8, 3)) {
+        *v = hv_apf_get(cpu) >> 25;
+        return 0;
+    }
+    if (reg == R(3, 6, 15, 2, 5)) {
+        *v = 0;
+        return 0;
+    }
     if ((reg >> 14) == 3 && ((reg >> 7) & 15) == 15) {
         if (m->log) fprintf(stderr, "hengevm: read of implementation-defined S3_%u_C15_C%u_%u = 0\n", (reg >> 11) & 7,
                             (reg >> 3) & 15, reg & 7);
@@ -170,14 +195,17 @@ static int read_reg(HvCpu *cpu, uint32_t reg, uint64_t *v) {
 static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     HvMachine *m = cpu->m;
     switch (reg) {
-    case R(3, 3, 4, 2, 0): cpu->nzcv = v & 0xf0000000; return 0;
+    case R(3, 3, 4, 2, 0):
+        cpu->nzcv = v & 0xf0000000;
+        if (hv_apf_on(cpu)) hv_apf_set(cpu, v);
+        return 0;
     case R(3, 3, 4, 2, 1): cpu->daif = v & HV_PSTATE_DAIF; return 0;
     case R(3, 0, 4, 2, 0): hv_sp_switch(cpu, cpu->el, v & 1); return 0;
     case R(3, 0, 4, 2, 3): hv_pstate_set(cpu, (hv_pstate_get(cpu) & ~(1ull << 22)) | (v & (1u << 22))); return 0;
     case R(3, 0, 4, 2, 4): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 23)) | (v & (1u << 23)); return 0;
     case R(3, 3, 4, 2, 5): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 24)) | (v & (1u << 24)); return 0;
     case R(3, 3, 4, 2, 6): cpu->pstate_extra = (cpu->pstate_extra & ~(1ull << 12)) | (v & (1u << 12)); return 0;
-    case R(3, 3, 4, 4, 0): v &= 0x07ff9f00; __asm__ volatile("msr fpcr, %0" ::"r"(v)); return 0;
+    case R(3, 3, 4, 4, 0): v &= 0x07ff9f07; __asm__ volatile("msr fpcr, %0" ::"r"(v)); return 0; /* with FIZ, AH, NEP */
     case R(3, 3, 4, 4, 1): v &= 0xf800009f; __asm__ volatile("msr fpsr, %0" ::"r"(v)); return 0;
     case R(3, 0, 4, 1, 0):
         if (!cpu->spsel) return -1; /* SP_EL0 is not accessible as a sysreg while it is the SP */
@@ -266,6 +294,11 @@ other:
     }
     /* Debug and PMU registers: ignored. */
     if ((reg >> 14) == 2 || (((reg >> 7) & 15) == 9 && (reg >> 14) == 3)) return 0;
+    if (reg == R(3, 6, 15, 8, 3)) { /* Apple's x86 flags, see read_reg */
+        hv_apf_set(cpu, (v & 6) << 25);
+        return 0;
+    }
+    if (reg == R(3, 6, 15, 2, 5)) return 0;
     /* Apple implementation-defined registers (op0 3, CRn 15): ignored, see read_reg. */
     if ((reg >> 14) == 3 && ((reg >> 7) & 15) == 15) {
         if (m->log) fprintf(stderr, "hengevm: write to implementation-defined S3_%u_C15_C%u_%u ignored\n", (reg >> 11) & 7,

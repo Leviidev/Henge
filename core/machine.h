@@ -57,6 +57,11 @@ typedef struct HvBlock {
 #define HV_BLOCK_FPOFF 2u        /* CPACR_EL1.FPEN traps FP/SIMD at this EL */
 #define HV_BLOCK_SPX   4u        /* EL1 with SPSel = 1 (SP_EL1 in use, SP_EL0 banked) */
 #define HV_BLOCK_PAN   8u        /* EL1 with PSTATE.PAN set (selects TLB table 2) */
+#define HV_BLOCK_TSO   16u       /* EL0 with ACTLR_EL1.EnTSO (Rosetta's x86 code): accesses keep TSO order */
+#define HV_BLOCK_APF   32u       /* EL0 with ACTLR_EL1.EnAPFLG: flag-setting arithmetic keeps x86's PF and AF too */
+/* The indirect-branch and return caches are picked with flags & 15, so TSO and APF blocks share the EL0 tables with
+   plain EL0 blocks. That relies on every thread of an address space having the same EnTSO and EnAPFLG, as the threads
+   of a translated process do. */
 
 #define HV_MAX_RAM 8
 #define HV_MAX_MMIO 48

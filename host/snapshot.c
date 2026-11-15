@@ -202,7 +202,7 @@ static int r_section_any(R *r, uint32_t tag, void **d, uint64_t *len, uint64_t m
 static void cpu_get(const HvCpu *c, CpuState *s) {
     memset(s, 0, sizeof *s);
     memcpy(s->x, c->x, sizeof s->x);
-    s->sp = c->sp, s->pc = c->pc, s->nzcv = c->nzcv;
+    s->sp = c->sp, s->pc = c->pc, s->nzcv = hv_nzcv_save(c);
     memcpy(s->v, c->v, sizeof s->v);
     s->fpcr = c->fpcr, s->fpsr = c->fpsr;
     s->tpidr_el0 = c->tpidr_el0, s->tpidrro_el0 = c->tpidrro_el0, s->tpidr_el1 = c->tpidr_el1, s->elr_el1 = c->elr_el1;
@@ -219,7 +219,8 @@ static void cpu_get(const HvCpu *c, CpuState *s) {
 
 static void cpu_put(HvCpu *c, const CpuState *s) {
     memcpy(c->x, s->x, sizeof s->x);
-    c->sp = s->sp, c->pc = s->pc, c->nzcv = s->nzcv;
+    c->sp = s->sp, c->pc = s->pc;
+    hv_nzcv_restore(c, s->nzcv);
     memcpy(c->v, s->v, sizeof s->v);
     c->fpcr = s->fpcr, c->fpsr = s->fpsr;
     c->tpidr_el0 = s->tpidr_el0, c->tpidrro_el0 = s->tpidrro_el0, c->tpidr_el1 = s->tpidr_el1, c->elr_el1 = s->elr_el1;

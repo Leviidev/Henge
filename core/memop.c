@@ -645,7 +645,18 @@ static void pred_stat(HvCpu *cpu, const HvMemOp *op, uint64_t va, uint64_t pc, i
     }
 }
 
+static int mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc);
+
+/* Rosetta's x86 code (ACTLR_EL1.EnTSO at EL0): the C path keeps the order translated accesses keep. */
 int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
+    int tso = !cpu->el && (cpu->actlr_el1 & HV_ACTLR_TSO);
+    if (tso) __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int rc = mem_emulate(cpu, insn, pc);
+    if (tso) __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return rc;
+}
+
+static int mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     cpu->m->access_pc = pc;
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {

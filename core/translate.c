@@ -107,6 +107,9 @@ typedef struct {
     int nogroup;                        /* translating plain (copies, or the retry when they do not fit) */
     int u_live, u_prev;                 /* slot + 1 when x15 holds that group's addend after the last instruction */
     int overflow;
+    const uint32_t *code;               /* the block's guest instructions, code[0] at va, avail of them readable */
+    uint64_t va;
+    uint32_t avail;
 } Emit;
 
 static __thread Emit E; /* each CPU translates on its own thread, outside the translation lock */
@@ -885,6 +888,9 @@ static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
    for x18/x28 operands. A miss goes out of line to hv_mem_emulate, which does
    the whole instruction (writeback included) and comes back to the join. */
 static void translate_mem(Emit *e, uint32_t insn, uint64_t pc);
+#define DMB_ISH   0xd5033bbfu
+#define DMB_ISHLD 0xd50339bfu
+#define DMB_ISHST 0xd5033abfu
 static void put_load_field(Emit *e, int rt, uint32_t off);
 static void put_store_field(Emit *e, int rt, uint32_t off);
 
@@ -955,8 +961,13 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     }
     static int c_excl = -1; /* HV_C_EXCL: keep every exclusive on the C path (debugging) */
     if (c_excl < 0) c_excl = getenv("HV_C_EXCL") != NULL;
+    /* Rosetta's x86 code (HV_BLOCK_TSO): x86 keeps loads in order with loads and stores, and stores with
+       stores; Apple CPUs do that in hardware for such threads, here barriers do it around each access. */
+    int tso = (e->flags & HV_BLOCK_TSO) != 0;
     if (op.kind == HV_MEM_EXCL && op.bytes == 1u << op.size && !e->slow_mem && !c_excl) {
+        if (tso) put(e, DMB_ISH);
         translate_excl(e, insn, pc);
+        if (tso) put(e, DMB_ISH);
         return;
     }
     /* CASP on the host address, as the guest wrote it, when its two pairs are guest registers that live
@@ -1164,7 +1175,9 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         if (rmw) out = (out & ~(0x1fu << 16)) | rs << 16;
         break;
     }
+    if (tso && (op.store || rmw)) put(e, rmw ? DMB_ISH : DMB_ISHST); /* earlier stores (and loads, below) first */
     put(e, out);
+    if (tso && (op.load || rmw)) put(e, rmw ? DMB_ISH : DMB_ISHLD); /* this load before later loads and stores */
 
     if (rmw) {
         if (rs_stolen && op.kind == HV_MEM_CAS) put(e, STR_X(rs, 28, slot_of(op.rs)));
@@ -1326,6 +1339,216 @@ static void put_native_sysreg(Emit *e, uint32_t insn, int read) {
         put(e, (insn & ~0x1fu) | s);
     }
     unspill(e, &s, 1);
+}
+
+
+/* ---- Apple's x86 flags (HV_BLOCK_APF) ----
+
+   What the hardware does with ACTLR_EL1.EnAPFLG, measured through the Mac's own Rosetta 2 on an M4 Max (2026-11-15:
+   the ARM code it made for x86 snippets, and their x86 results): ADDS, SUBS, ADCS and SBCS, in every form (so CMP,
+   CMN, NEGS and NGCS too), set PF from the low byte of the result and AF to bit 4 of Rn ^ operand2 ^ result, as x86's
+   ADD, SUB, ADC and SBB do; ANDS and BICS (TST) set PF and clear AF; CFINV, RMIF, SETF8 and SETF16 keep both; MSR NZCV
+   writes them from bits 26 and 27, MRS NZCV reads them there. Rosetta's UCOMISD and COMISD are FCMP; AXFLAG, and
+   after them PF is "unordered" and AF clear, as on x86, even when a POPF just before set AF (Rosetta leaves out the
+   TST WZR, WZR it otherwise puts first, which is the flags of an XOR before): AXFLAG, which turns FCMP's flags into
+   x86's, sets PF to the V it finds and clears AF. FCMP itself is taken to keep them, as any other instruction.
+
+   The host has the extension off. Blocks of a thread with EnAPFLG keep PF and AF in cpu->apf_p (a byte with an even
+   number of ones when PF is set) and cpu->apf_a (AF in bit 4). An instruction that sets them gets, before it, a copy
+   of itself without S that leaves the result in host x15, and a byte store or two. If they are set again before
+   anything could see them, it gets nothing. That is looked for in the guest's code from there on, through direct
+   branches (B, B.cond, CBZ, TBZ...) to code further on in the readable part of the page, two deep, both ways of a
+   conditional one: x86 code compares and branches all the time, and the code at either end mostly sets the flags
+   anew before it reads them. Anything else that may leave the block (an indirect branch, a call, a system
+   instruction) counts as reading them. A fault in between restarts at the faulting instruction, and the flags are
+   set again before they are read. */
+
+enum { APF_NONE, APF_ADD_IMM, APF_ADD_SHIFT, APF_ADD_EXT, APF_ADC, APF_AND_SHIFT, APF_AND_IMM, APF_AXFLAG,
+       APF_MSR, APF_MRS, APF_STOP, APF_BRANCH };
+enum { APF_PF = 1, APF_AF = 2 };
+
+#define STRB_CPU(t, off) (0x39000000u | (uint32_t)(off) << 10 | 28u << 5 | (uint32_t)(t)) /* strb wt, [x28, #off] */
+#define LDRB_CPU(t, off) (0x39400000u | (uint32_t)(off) << 10 | 28u << 5 | (uint32_t)(t))
+#define EOR_SR(sf, d, n, m, shift, amt) \
+    ((uint32_t)(sf) << 31 | 0x4a000000u | (uint32_t)(shift) << 22 | (uint32_t)(m) << 16 | (uint32_t)(amt) << 10 | (uint32_t)(n) << 5 | (uint32_t)(d))
+#define UBFM_W(d, n, immr, imms) (0x53000000u | (immr) << 16 | (imms) << 10 | (uint32_t)(n) << 5 | (uint32_t)(d))
+#define EOR_X_0X10(d, n) (0xd27c0000u | (uint32_t)(n) << 5 | (uint32_t)(d))  /* eor xd, xn, #0x10 */
+#define EOR_W_1(d, n) (0x52000000u | (uint32_t)(n) << 5 | (uint32_t)(d))      /* eor wd, wn, #1 */
+#define MVN_W(d, m) (0x2a2003e0u | (uint32_t)(m) << 16 | (uint32_t)(d))
+#define CSET_W15_VC 0x1a9f67efu                                               /* cset w15, vc */
+
+static int is_fp_insn(uint32_t insn);
+
+static int apf_kind(uint32_t insn) {
+    switch (hv_classify(insn)) {
+    case HV_INSN_COPY: break;
+    case HV_INSN_PCREL: case HV_INSN_PAC: case HV_INSN_PREFETCH: case HV_INSN_LOAD_LITERAL: case HV_INSN_MEMORY:
+        return APF_NONE;
+    case HV_INSN_SYSREG:
+        if ((insn & 0xffffffe0u) == 0xd51b4200u) return APF_MSR; /* MSR NZCV, Xt */
+        if ((insn & 0xffffffe0u) == 0xd53b4200u) return APF_MRS; /* MRS Xt, NZCV */
+        return APF_STOP;
+    case HV_INSN_BRANCH: /* B, B.cond, BC.cond, CBZ, CBNZ, TBZ, TBNZ: followed (apf_live_from); BL is a call */
+        return (insn & 0xfc000000u) == 0x94000000u ? APF_STOP : APF_BRANCH;
+    default:
+        return APF_STOP;
+    }
+    if ((insn & 0x3f800000u) == 0x31000000u) return APF_ADD_IMM;                                   /* ADDS, SUBS (immediate) */
+    if ((insn & 0x3f200000u) == 0x2b000000u) return ((insn >> 22) & 3) == 3 ? APF_NONE : APF_ADD_SHIFT; /* (shifted register) */
+    if ((insn & 0x3fe00000u) == 0x2b200000u) return ((insn >> 10) & 7) > 4 ? APF_NONE : APF_ADD_EXT;   /* (extended register) */
+    if ((insn & 0x3fe0fc00u) == 0x3a000000u) return APF_ADC;                                       /* ADCS, SBCS */
+    if ((insn & 0x7f000000u) == 0x6a000000u) return APF_AND_SHIFT;                                 /* ANDS, BICS (shifted register) */
+    if ((insn & 0x7f800000u) == 0x72000000u) return APF_AND_IMM;                                   /* ANDS (immediate) */
+    if (insn == 0xd500405fu) return APF_AXFLAG;
+    return APF_NONE;
+}
+
+static int apf_defs(int kind) {
+    return kind == APF_NONE || kind == APF_MRS || kind == APF_STOP || kind == APF_BRANCH ? 0 : APF_PF | APF_AF;
+}
+
+/* Which of `want` may be read before they are set again, running from code[j] on: through direct branches to code
+   at or after code[0] in the readable part of the page, `depth` deep, at most *budget instructions in all. */
+static int apf_live_from(const Emit *e, uint32_t j, int want, int depth, int *budget) {
+    for (; want; j++) {
+        if (j >= e->avail || --*budget < 0) return want;
+        uint64_t pc = e->va + 4ull * j;
+        if (pc == e->m->stop_pc || pc == e->m->stop_pc2) return want;
+        uint32_t insn = e->code[j];
+        if ((e->flags & HV_BLOCK_FPOFF) && is_fp_insn(insn)) return want;
+        int kind = apf_kind(insn);
+        if (kind == APF_MRS || kind == APF_STOP) return want;
+        if (kind == APF_BRANCH) {
+            int64_t off;
+            int cond = 1;
+            if ((insn & 0xfc000000u) == 0x14000000u) off = sext(insn & 0x3ffffff, 26), cond = 0; /* B */
+            else if ((insn & 0x7e000000u) == 0x36000000u) off = sext((insn >> 5) & 0x3fff, 14);  /* TBZ, TBNZ */
+            else {                                                                               /* B.cond, CBZ, CBNZ */
+                off = sext((insn >> 5) & 0x7ffff, 19);
+                if ((insn & 0xff000000u) == 0x54000000u && (insn & 0xe) == 0xe) cond = 0;         /* AL, NV */
+            }
+            int64_t t = (int64_t)j + off;
+            if (!depth || t < 0 || t >= (int64_t)e->avail) return want;
+            int live = apf_live_from(e, (uint32_t)t, want, depth - 1, budget);
+            if (cond && live != want) live |= apf_live_from(e, j + 1, want, depth - 1, budget);
+            return live;
+        }
+        want &= ~apf_defs(kind);
+    }
+    return 0;
+}
+
+/* Which of `want` the instruction being translated sets that may be seen. */
+static int apf_live(const Emit *e, int want) {
+    if (!e->code) return want;
+    int budget = 256;
+    return apf_live_from(e, e->cur_i + 1, want, 2, &budget);
+}
+
+/* A host register holding guest register r: r, or `scratch` loaded from the HvCpu (x6, x7, x15, x18, x28) or copied
+   from SP (r 31 where it means SP). 31 where it means XZR stays 31. */
+static int apf_operand(Emit *e, int r, int is_sp, int scratch) {
+    if (r == 31) {
+        if (!is_sp) return 31;
+        put(e, ADD_SP_TO(scratch));
+        return scratch;
+    }
+    if (is_stolen(r)) {
+        put(e, LDR_X(scratch, 28, slot_of(r)));
+        return scratch;
+    }
+    return r;
+}
+
+/* Before an instruction that sets PF and AF, or AXFLAG: work them out from its operands, as it will. Uses host x6,
+   x7 and x15, which hold no guest register. */
+static void put_apf_before(Emit *e, uint32_t insn, int kind) {
+    int live = apf_live(e, apf_defs(kind));
+    if (!live) return;
+    if (kind == APF_AXFLAG) { /* PF: unordered, the V it is about to clear; AF clear */
+        if (live & APF_PF) {
+            put(e, CSET_W15_VC);
+            put(e, STRB_CPU(15, HV_CPU_APF_P));
+        }
+        if (live & APF_AF) put(e, STRB_CPU(31, HV_CPU_APF_A));
+        return;
+    }
+    int logic = kind == APF_AND_SHIFT || kind == APF_AND_IMM;
+    if (logic && !(live & APF_PF)) {
+        put(e, STRB_CPU(31, HV_CPU_APF_A)); /* AF clear */
+        return;
+    }
+    int sf = (int)(insn >> 31), rn = (insn >> 5) & 31, rm = (insn >> 16) & 31;
+    int two = kind != APF_ADD_IMM && kind != APF_AND_IMM; /* has Rm */
+    int a = apf_operand(e, rn, kind == APF_ADD_IMM || kind == APF_ADD_EXT, 6);
+    int b = !two ? 31 : rm == rn && rn != 31 ? a : apf_operand(e, rm, 0, 7);
+    /* The same operation without S, into x15: ADD, SUB, ADC, SBC, AND or BIC. ADC and SBC read C as it is now. */
+    uint32_t clone = (insn & ~(logic ? 3u << 29 : 1u << 29) & ~0x3ffu) | (uint32_t)a << 5 | 15;
+    if (two) clone = (clone & ~(31u << 16)) | (uint32_t)b << 16;
+    put(e, clone);
+    if (live & APF_PF) put(e, STRB_CPU(15, HV_CPU_APF_P));
+    if (!(live & APF_AF)) return;
+    if (logic) {
+        put(e, STRB_CPU(31, HV_CPU_APF_A));
+        return;
+    }
+    /* AF: bit 4 of Rn ^ operand2 ^ result. Only bit 4 of operand2 matters: an extended register's is bit 4 - shift
+       of Rm whatever the extension (it keeps bits 7..0), a shifted one's comes from an EOR with the same shift. */
+    switch (kind) {
+    case APF_ADD_IMM:
+        put(e, EOR_SR(1, 6, a, 15, 0, 0));
+        if (!((insn >> 22) & 1) && ((insn >> 14) & 1)) put(e, EOR_X_0X10(6, 6)); /* imm12 bit 4, unshifted */
+        break;
+    case APF_ADD_SHIFT:
+        put(e, EOR_SR(sf, 6, a, b, (insn >> 22) & 3, (insn >> 10) & 63));
+        put(e, EOR_SR(1, 6, 6, 15, 0, 0));
+        break;
+    case APF_ADD_EXT:
+        put(e, EOR_SR(1, 6, a, b, 0, (insn >> 10) & 7));
+        put(e, EOR_SR(1, 6, 6, 15, 0, 0));
+        break;
+    default: /* APF_ADC */
+        put(e, EOR_SR(1, 6, a, b, 0, 0));
+        put(e, EOR_SR(1, 6, 6, 15, 0, 0));
+        break;
+    }
+    put(e, STRB_CPU(6, HV_CPU_APF_A));
+}
+
+/* MRS Xt, NZCV: the host's N, Z, C and V, with PF in bit 26 and AF in bit 27. */
+static void put_apf_mrs(Emit *e, uint32_t insn) {
+    int rt = insn & 31;
+    if (rt == 31) return;
+    int d = is_stolen(rt) ? 15 : rt;
+    put(e, (insn & ~31u) | (uint32_t)d);
+    put(e, LDRB_CPU(6, HV_CPU_APF_P));
+    put(e, EOR_SR(0, 6, 6, 6, 1, 4)); /* eor w6, w6, w6, lsr #4 */
+    put(e, EOR_SR(0, 6, 6, 6, 1, 2));
+    put(e, EOR_SR(0, 6, 6, 6, 1, 1)); /* bit 0: an odd number of ones */
+    put(e, MVN_W(6, 6));              /* bit 0: PF */
+    put(e, BFM_X(d, 6, 38, 0));       /* bfi xd, x6, #26, #1 */
+    put(e, LDRB_CPU(7, HV_CPU_APF_A));
+    put(e, UBFM_W(7, 7, 4, 31));      /* lsr w7, w7, #4 */
+    put(e, BFM_X(d, 7, 37, 0));       /* bfi xd, x7, #27, #1 */
+    if (is_stolen(rt)) put(e, STR_X(d, 28, slot_of(rt)));
+}
+
+/* MSR NZCV, Xt: N, Z, C and V to the host, PF and AF from bits 26 and 27. */
+static void put_apf_msr(Emit *e, uint32_t insn) {
+    int rt = insn & 31;
+    int v = rt != 31 && is_stolen(rt) ? 15 : rt;
+    if (v == 15) put(e, LDR_X(15, 28, slot_of(rt)));
+    put(e, (insn & ~31u) | (uint32_t)v);
+    int live = apf_live(e, APF_PF | APF_AF);
+    if (live & APF_PF) {
+        put(e, UBFM_W(6, v, 26, 26)); /* ubfx w6, wv, #26, #1 */
+        put(e, EOR_W_1(6, 6));        /* odd when PF is clear */
+        put(e, STRB_CPU(6, HV_CPU_APF_P));
+    }
+    if (live & APF_AF) {
+        put(e, UBFM_W(7, v, 23, 31)); /* lsr w7, wv, #23: AF to bit 4 */
+        put(e, STRB_CPU(7, HV_CPU_APF_A));
+    }
 }
 
 /* MRS/MSR of a PSTATE bit kept in cpu->pstate_extra at the same position as in the register. */
@@ -1490,6 +1713,11 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         if (!read) return 0;
         return translate_counter(e, insn, pc, reg == SR(3, 3, 14, 0, 1) || reg == SR(3, 3, 14, 0, 5));
     case SR(3, 3, 4, 2, 0): /* NZCV */
+        if (e->flags & HV_BLOCK_APF) {
+            if (read) put_apf_mrs(e, insn);
+            else put_apf_msr(e, insn);
+            return 1;
+        }
         put_native_sysreg(e, insn, read);
         return 1;
     case SR(3, 3, 4, 4, 0): /* FPCR */
@@ -1574,6 +1802,10 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
     }
     switch (kind) {
     case HV_INSN_COPY:
+        if (e->flags & HV_BLOCK_APF) {
+            int k = apf_kind(insn);
+            if (k != APF_NONE) put_apf_before(e, insn, k);
+        }
         translate_copy(e, insn);
         return 0;
     case HV_INSN_PCREL:
@@ -1965,6 +2197,9 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     e->m = m;
     e->nogroup = nogroup;
     e->u_live = e->u_prev = 0;
+    e->code = code;
+    e->va = b->va;
+    e->avail = avail;
 
     /* No prologue: hv_enter, chained exits and the indirect-branch cache all
        enter with guest x0 and x1 live. */

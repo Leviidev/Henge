@@ -87,6 +87,8 @@ static uint32_t block_flags(HvCpu *cpu) {
     if (cpu->el && (cpu->pstate_extra & HV_PSTATE_PAN)) flags |= HV_BLOCK_PAN;
     uint32_t fpen = (cpu->cpacr_el1 >> 20) & 3;
     if (fpen == 0 || fpen == 2 || (fpen == 1 && cpu->el == 0)) flags |= HV_BLOCK_FPOFF;
+    if (!cpu->el && (cpu->actlr_el1 & HV_ACTLR_TSO)) flags |= HV_BLOCK_TSO;
+    if (hv_apf_on(cpu)) flags |= HV_BLOCK_APF;
     return flags;
 }
 
