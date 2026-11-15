@@ -8,7 +8,7 @@ import os
 ///
 /// The problem this solves: QEMU and Henge's own C code write diagnostics with
 /// `fprintf(stderr, ...)`, and on iOS stderr goes nowhere a user can reach. So
-/// before anything else runs, stdout and stderr are redirected into a pipe that a
+/// before anything else runs, stdout and stderr are redirected into a file that an event-driven
 /// reader thread drains, writing every line to three places at once:
 ///
 ///   * `Documents/henge.log`, retrievable over the Files app or the share sheet
@@ -36,11 +36,13 @@ enum HengeLog {
     fileprivate static let crashFrames =
         UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 64)
     private static var pipeWriteFD: Int32 = -1
+    private static var nativeTail: NativeLogTail?
     /// HV_LOG_CONSOLE: a copy of the original stderr, so `devicectl device process launch --console` (and Xcode's
     /// console) can follow the log live. `colorprobe` (any text) mirrors only lines containing it; `all` mirrors everything.
     private static var consoleFD: Int32 = -1
     private static var consoleFilter: String?
     private static var started = false
+    private static var powerObserver: NSObjectProtocol?
     private static let writeLock = NSLock()
     private static let startTime = Date()
 
@@ -53,6 +55,16 @@ enum HengeLog {
     static var logFileURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("henge.log")
+    }
+
+    /// Include the terminated session after a relaunch, not just the new
+    /// startup log. Profiler output is append-only and carries a PID per dump.
+    static var diagnosticFileURLs: [URL] {
+        let directory = logFileURL.deletingLastPathComponent()
+        return ["henge.log", "henge-native.log", "henge-prev.log",
+                "henge-native-prev.log", "hvprof-words.txt"]
+            .map { directory.appendingPathComponent($0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
     static func recentLines(_ n: Int = 400) -> [String] {
@@ -87,6 +99,14 @@ enum HengeLog {
         installCrashHandlers()
         logBanner()
         replayPreviousNativeLog()
+        logPowerState("app-launch")
+        powerObserver = NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange,
+            object: nil, queue: nil) { _ in logPowerState("power-state-changed") }
+    }
+
+    private static func logPowerState(_ reason: String) {
+        let process = ProcessInfo.processInfo
+        log("power", "\(reason): low-power=\(process.isLowPowerModeEnabled ? "on" : "off") thermal-category=\(process.thermalState.rawValue) (OS policy/category; not watts or temperature)")
     }
 
     /// Put the last run's native output into this run's log.
@@ -169,38 +189,8 @@ enum HengeLog {
         dup2(pipeWriteFD, STDOUT_FILENO)
         dup2(pipeWriteFD, STDERR_FILENO)
 
-        let t = Thread {
-            var pending = Data()
-            var buf = [UInt8](repeating: 0, count: 16 * 1024)
-            while true {
-                let n = read(pipeReadFD, &buf, buf.count)
-                if n < 0 {
-                    if errno == EINTR { continue }
-                    break
-                }
-                // End of file, not end of stream: the writer is still open and
-                // more will arrive. A pipe blocked here; a file returns 0, so
-                // this is where the tail waits.
-                if n == 0 {
-                    usleep(40_000)
-                    continue
-                }
-                pending.append(contentsOf: buf[0..<n])
-
-                // Emit complete lines only, so a partial write never splits a
-                // message across two log entries.
-                while let nl = pending.firstIndex(of: 0x0A) {
-                    let lineData = pending.subdata(in: pending.startIndex..<nl)
-                    pending.removeSubrange(pending.startIndex...nl)
-                    if let line = String(data: lineData, encoding: .utf8) {
-                        emit(line, fromStream: true)
-                    }
-                }
-            }
-        }
-        t.name = "com.henge.log.reader"
-        t.qualityOfService = .userInitiated
-        t.start()
+        nativeTail = NativeLogTail(fd: pipeReadFD) { emit($0, fromStream: true) }
+        log("boot", "native log mirror: filesystem write notifications, utility queue, no polling timer")
     }
 
     /// Turn "the app vanished with no crash log" into a labelled last line.
@@ -346,6 +336,7 @@ enum HengeLog {
 
         log("boot", "================ Henge starting ================")
         log("boot", "device      : \(model)")
+        log("boot", "host chip   : \(HostScheduling.chip); cores \(HostScheduling.layout); source \(HostScheduling.layoutSource)")
         log("boot", "system      : \(d.systemName) \(d.systemVersion)")
         log("boot", "physical RAM: \(mem) MiB")
         log("boot", "processors  : \(ProcessInfo.processInfo.processorCount) "
@@ -363,6 +354,16 @@ enum HengeLog {
         let commit  = info["HengeBuildCommit"] as? String ?? "unstamped"
         let built   = info["HengeBuildDate"] as? String ?? "?"
         log("boot", "build       : \(version) (\(build)) \(commit) built \(built)")
+        if let upstream = info["HengeUpstreamCommit"] as? String {
+            log("boot", "upstream main: \(upstream)")
+        }
+        log("boot", "performance revision: Duo-aware scheduling; inline EL1 TCR/PAR/PAN/TTBR/UAO; tagged multiwindow Fast Memory; checked RAM span reuse; deadline-aware secondary kicks; cursor damage/coalescing; pressure cache cleanup; full branch publication; grouped memory, superblocks and TLB preload experimental")
+        log("boot", "Link protocol: 2, decoder-consumption credit window=3; local discovery and opt-in Keychain pairing; three-finger viewer controls; update both devices")
+        log("boot", "cache lifecycle: JIT translations and kernel read lookups are RAM-only; no cross-launch executable cache")
+        if let source = info["HengeCustomSourceCommit"] as? String {
+            let prs = info["HengeCustomPullRequests"] as? [Int] ?? []
+            log("boot", "custom source: \(source); PRs \(prs.map { String($0) }.joined(separator: ", "))")
+        }
         log("boot", "pid         : \(getpid())")
         log("boot", "log file    : \(logFileURL.path)")
         // Every iOS 27 device except iPad8,11/8,12 enforces TXM, which is what makes
