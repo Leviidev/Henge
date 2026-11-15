@@ -93,6 +93,11 @@ struct KeyboardCatcher: UIViewRepresentable {
 
         override var inputAccessoryView: UIView? { row.view }
         var hasText: Bool { true }
+        /// Key presses go to the Mac one by one (Keys.type), so only a Latin layout can type: a Chinese, Japanese or
+        /// Korean keyboard composes in iOS and hands over characters the Mac's keyboard has no keys for, which were
+        /// dropped, so typing looked dead. Ask for a Latin layout; such text is typed with the Mac's own input method
+        /// (the globe key in the row above switches it).
+        var keyboardType: UIKeyboardType = .asciiCapable
         var autocorrectionType: UITextAutocorrectionType = .no
         var autocapitalizationType: UITextAutocapitalizationType = .none
         var spellCheckingType: UITextSpellCheckingType = .no
@@ -203,6 +208,14 @@ struct ModifierRow: View {
         HStack(spacing: 5) {
             HeldKey(label: "esc", code: Keys.escape)
             HeldKey(label: "tab", code: Keys.tab)
+            Button(action: switchInputSource) {
+                Image(systemName: "globe")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Desk.text)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Desk.raised, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            }
+            .accessibilityLabel("Switch the Mac's input source")
             modifier("⌃", Keys.control, "Control")
             modifier("⌥", Keys.option, "Option")
             modifier("⌘", Keys.command, "Command")
@@ -222,6 +235,15 @@ struct ModifierRow: View {
         .padding(.horizontal, 6)
         .padding(.vertical, 6)
         .frame(height: 56)
+    }
+
+    /// The Mac's own input source switch, Control-Space (macOS's default shortcut for the previous input source). The
+    /// iOS keyboard here is Latin only (CatcherView), so Chinese, Japanese or Korean is typed with the Mac's input
+    /// method, as with the globe key on a Mac keyboard.
+    private func switchInputSource() {
+        StickyKeys.shared.releaseAll()
+        Keys.chord(Keys.control, " ")
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     private func modifier(_ symbol: String, _ code: UInt16, _ name: String) -> some View {
