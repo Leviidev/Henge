@@ -100,14 +100,8 @@ static void notify(HvVirtio *v, int q) {
 void hv_virtio_input_send(HvVirtioInput *d, uint16_t type, uint16_t code, int32_t value) {
     if (!d) return;
     pthread_mutex_lock(&d->mu);
-    if (d->tail - d->head == HV_VINPUT_RING) {
-        d->head++; /* full: lose the oldest */
-        d->dropped++;
-    }
-    uint32_t i = d->tail++ % HV_VINPUT_RING;
-    d->ring[i].type = type;
-    d->ring[i].code = code;
-    d->ring[i].value = (uint32_t)value;
+    hv_input_enqueue(d->ring, &d->head, &d->tail, &d->producer_buttons,
+                     &d->dropped, d->kind == HV_VINPUT_MOUSE, type, code, value);
     pthread_mutex_unlock(&d->mu);
     hv_machine_wake(d->vio.m);
 }

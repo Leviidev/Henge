@@ -4,17 +4,17 @@
 #include <pthread.h>
 
 #include "pcie.h"
+#include "gamepad.h"
 
 /* An xHCI USB host controller (xHCI 1.0, one interrupter, 32-byte contexts,
-   INTx) with two USB HID devices: a boot keyboard on port 1 and a Magic
-   Trackpad 2 on port 2: what Virtualization.framework gives a macOS guest as
-   its "Virtual USB Keyboard", plus Apple's multitouch pad, so the guest's
+   INTx) with a boot keyboard on port 1, Magic Trackpad 2 on port 2,
+   optional gamepad on port 3 and deferred USB touchscreen on port 4. The guest's
    own gesture engine sees a real trackpad. Changes come from the host UI on
    any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
    (hv_xhci_poll). */
 #define HV_XHCI_SLOTS 8
-#define HV_XHCI_PORTS 2
-#define HV_XHCI_DEVICES 2
+#define HV_XHCI_PORTS 4
+#define HV_XHCI_DEVICES 4
 #define HV_XHCI_INTRS 4
 #define HV_XHCI_EPS 32 /* device context index 1..31 */
 #define HV_XHCI_REPORTS 256
@@ -23,6 +23,11 @@
    hv_xhci_touch takes coordinates in these ranges. */
 #define HV_TP_SENSOR_X 8134
 #define HV_TP_SENSOR_Y 5206
+/* USB touchscreen on port 4. The sharing helper binds its display identity
+   before attachment; HV_USB_TOUCHSCREEN=0 disables this optional device. */
+#define HV_TS_FINGERS 5
+#define HV_TS_REPORT_LEN 32
+#define HV_TS_REPORTS 64
 #define HV_TP_FINGERS 10
 #define HV_TP_REPORTS 64
 #define HV_TP_REPORT_LEN (12 + 9 * HV_TP_FINGERS) /* report ID 2: 12-byte prefix, N x 9-byte fingers */
@@ -52,7 +57,7 @@ typedef struct HvXhci {
     /* device slots: -1 until the device on the slot's port is addressed */
     int slot_used[HV_XHCI_SLOTS + 1];
     struct HvXhciSlot {
-        int dev;         /* 0 keyboard, 1 trackpad, -1 none */
+        int dev; /* 0 keyboard, 1 trackpad, 2 gamepad, 3 touchscreen, -1 none */
         int configured;
         HvXhciRing ep[HV_XHCI_EPS];
         int ep_running[HV_XHCI_EPS];
@@ -63,6 +68,7 @@ typedef struct HvXhci {
     uint32_t rhead, rtail;
     uint8_t state[8];      /* modifiers, reserved, six keys: the current report */
     uint64_t delivered;
+    uint8_t key_owners[256]; /* physical, remote keyboard, mapped gamepad, local gamepad touchpad */
     /* Magic Trackpad 2: the fingers on the pad and their reports (Apple
        multitouch format, report ID 2: 12-byte prefix plus 9 bytes a finger). */
     struct HvTpFinger {
@@ -83,11 +89,36 @@ typedef struct HvXhci {
     uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
     uint8_t tp_f1[8];   /* feature report 1: the header for the selected sensor register */
     int tp_f1_len;
+    /* Port 3 stays disconnected until requested. Producers use mu; only the
+       CPU/device thread publishes port status and xHCI completion events. */
+    int gp_desired, gp_online;
+    uint8_t gp_state[HV_GAMEPAD_BYTES], gp_reports[64][HV_GAMEPAD_BYTES];
+    uint8_t gp_profile, gp_requests; /* former zero padding: profile and bounded setup log */
+    uint32_t gp_head, gp_tail;
+    uint64_t gp_delivered, gp_coalesced, gp_overflow;
+    int ts_enabled;
+    int ts_connected, ts_wanted, ts_connection_pending;
+    int ts_mapped, ts_unmanaged;
+    uint32_t ts_ep0_waiting;
+    uint64_t ts_deadline_ns;
+    uint64_t ts_release_at_ns, ts_release_limit_ns;
+    int ts_release_phase;
+    uint8_t ts_reports[HV_TS_REPORTS][HV_TS_REPORT_LEN];
+    uint8_t ts_state[HV_TS_REPORT_LEN];
+    uint8_t ts_device_state[HV_TS_REPORT_LEN];
+    uint32_t ts_rhead, ts_rtail, ts_reqs;
+    uint64_t ts_delivered;
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
 /* Any thread: a key went down or up (HID usage page 7 usage, e.g. 4 = A; 0xe0-0xe7 are modifiers). */
 void hv_xhci_key(HvXhci *x, uint8_t usage, int down);
+void hv_xhci_key_source(HvXhci *x,uint8_t usage,int down,unsigned source);
+void hv_xhci_release_source(HvXhci *x,unsigned source);
+/* Session interruption: discard pending downs and queue authoritative release reports. */
+void hv_xhci_release_input(HvXhci *x);
+void hv_xhci_gamepad(HvXhci *x, int connected, uint16_t buttons, unsigned hat,
+                     const int16_t axes[4], uint8_t left, uint8_t right);
 /* The same, by Linux input key code (what the host UI produces). */
 void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down);
 /* Any thread: a Magic Trackpad 2 touch. phase: 0 down, 1 move, 2 up. id: a
@@ -102,6 +133,17 @@ void hv_xhci_touch(HvXhci *x, int id, int phase, int px, int py, uint32_t ts_ms)
 void hv_xhci_touch_frame(HvXhci *x, uint32_t ts_ms);
 /* Any thread: the pad's full press (a click), down or up. */
 void hv_xhci_touch_button(HvXhci *x, int down);
+/* Queue one complete touchscreen report. Returns 0 if absent, malformed,
+   stopping or overflowed. Overflow releases input and disconnects the device. */
+int hv_xhci_touchscreen_report(HvXhci *x, const uint8_t report[HV_TS_REPORT_LEN]);
+/* Any thread: change the optional touchscreen's presence. The CPU thread
+   publishes the port change and releases queued state. */
+int hv_xhci_touchscreen_connect(HvXhci *x, int connected);
+int hv_xhci_touchscreen_connected(HvXhci *x);
+/* Healthy guest/helper and sender heartbeats keep stationary contacts held. */
+void hv_xhci_touchscreen_keepalive(HvXhci *x);
+/* Complete HID initialization after the helper has written the display UUID. */
+int hv_xhci_touchscreen_mapped(HvXhci *x);
 /* CPU thread: hand waiting reports to the guest. */
 void hv_xhci_poll(HvXhci *x);
 

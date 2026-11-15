@@ -4,6 +4,7 @@
 #include <pthread.h>
 
 #include "virtio.h"
+#include "input_ring.h"
 
 /* virtio-input (device type 18), Linux input event codes, as macOS's
    AppleVirtIOInput drivers expect: it calls a device with relative X/Y a
@@ -24,13 +25,13 @@ enum { HV_VINPUT_KEYBOARD, HV_VINPUT_MOUSE };
 #define HV_BTN_RIGHT 0x111
 #define HV_BTN_MIDDLE 0x112
 
-#define HV_VINPUT_RING 4096
 
 typedef struct HvVirtioInput {
     HvVirtio vio;
     int kind;
     pthread_mutex_t mu;
-    struct { uint16_t type, code; uint32_t value; } ring[HV_VINPUT_RING];
+    HvInputEvent ring[HV_VINPUT_RING];
+    uint8_t producer_buttons;
     uint32_t head, tail; /* under mu */
     uint64_t delivered, dropped;
 } HvVirtioInput;
