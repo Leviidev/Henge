@@ -309,7 +309,7 @@ $(B)/bench_stack_groups_reference: tests/bench_stack_groups.c tests/mem_programs
 $(B)/test_exc_register_reference: tests/test_exc.c tests/exc_programs.S tests/harness.S $(ENGINE_REGISTER_REFERENCE)
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(B)/bench_interleaved_groups: tests/bench_interleaved_groups.c tests/mem_programs.S $(ENGINE)
+$(B)/bench_interleaved_groups: tests/bench_interleaved_groups.c tests/mem_programs.S tests/harness.S $(ENGINE)
 	$(CC) $(CFLAGS) $^ -o $@
 
 $(B)/bench_jit_retention: tests/bench_jit_retention.c $(ENGINE)
