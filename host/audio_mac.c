@@ -3,8 +3,12 @@
    is set to the stream's own format, and CoreAudio converts to the device. */
 #include "audio_mac.h"
 
+#ifdef HENGE_AUDIO_TEST
+#include "../tests/audio_test_api.h"
+#else
 #include <AudioToolbox/AudioToolbox.h>
 #include <TargetConditionals.h>
+#endif
 
 /* The Mac's default output device, or the iOS app's own output (the app sets its audio session to playback). */
 #if TARGET_OS_IPHONE
@@ -16,6 +20,7 @@
 
 static AudioComponentInstance unit;
 static int unit_running;
+static int detached, interrupted;
 static unsigned cur_channels, cur_format, cur_rate;
 
 static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus,
@@ -28,6 +33,7 @@ static OSStatus render(void *ref, AudioUnitRenderActionFlags *flags, const Audio
 }
 
 static int start(void *opaque, unsigned channels, unsigned format, unsigned rate_hz) {
+    if (detached || interrupted) return -1;
     HvVirtioSnd *d = opaque;
     if (unit && (channels != cur_channels || format != cur_format || rate_hz != cur_rate)) {
         AudioOutputUnitStop(unit);
@@ -73,16 +79,37 @@ static void stop(void *opaque) {
 }
 
 void hv_audio_attach(HvVirtioSnd *d) {
+    detached = 0;interrupted=0;
     d->backend = (HvVirtioSndBackend){start, stop, d};
 }
 
-void hv_audio_detach(void) {
+static void dispose_output(void) {
+    detached = 1;
+    stop(NULL); /* AudioOutputUnitStop waits for an in-flight render callback. */
     if (unit) {
-        AudioOutputUnitStop(unit);
         AudioUnitUninitialize(unit);
         AudioComponentInstanceDispose(unit);
         unit = NULL;
+        fprintf(stderr, "hengevm: sound: output stopped and AudioUnit disposed after guest exit\n");
     }
-    unit_running = 0;
     cur_channels = cur_format = cur_rate = 0;
+}
+void hv_audio_pause(HvVirtioSnd *d) {
+    dispose_output(); /* Preserve guest running/prepared state for snapshots. */
+    if(d)d->backend.start=NULL; /* Detached audio must not restart while the VM is paused. */
+}
+void hv_audio_detach(HvVirtioSnd *d) {
+    dispose_output();if(d)d->running=0;
+}
+void hv_audio_interrupt(HvVirtioSnd *d) {
+    interrupted=1;stop(NULL);
+    if(d){d->backend.start=NULL;hv_virtio_snd_resume(d);}
+}
+int hv_audio_recover(HvVirtioSnd *d) {
+    if(!d || detached)return -1;
+    /* Restore even a backend.start cleared after a transient AudioUnit failure.
+       Recreate the unit after route/media-service changes, retaining PCM state. */
+    dispose_output();hv_audio_attach(d);
+    hv_virtio_snd_resume(d);
+    return !d->running || d->backend.start ? 0 : -1;
 }

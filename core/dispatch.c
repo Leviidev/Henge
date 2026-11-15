@@ -3,6 +3,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <dlfcn.h>
@@ -14,8 +15,17 @@
 #include "mmu.h"
 #include "sysreg.h"
 #include "translate.h"
+#include "reclaim_pages.h"
+
+static int poison_on(void) {
+    static int poison = -1;
+    if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
+    return poison;
+}
 
 void hv_flush_blocks(HvMachine *m) {
+    size_t retired_bytes = (size_t)m->nblocks * sizeof *m->blocks;
+    size_t retired_slots = m->nslots < m->max_slots ? m->nslots : m->max_slots;
     /* Every other CPU is parked (stop_the_world): the one moment the TLB layout can change. */
     if ((hv_knob[HV_K_TLBT] != 0) != hv_tlb_tmajor) {
         hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
@@ -36,21 +46,185 @@ void hv_flush_blocks(HvMachine *m) {
         }
     memset(m->hash, 0, sizeof m->hash);
     m->nblocks = 0;
+    m->blocks_wrap = 0;
+    if(m->jit_page_heads)memset(m->jit_page_heads,0,m->jit_page_count*sizeof *m->jit_page_heads);
     m->nslots = 0;
+    m->nslot_free = m->slot_take = 0;
     m->nxchained = 0;
-    for (int i = 0; i < m->nram; i++) memset(m->ram[i].xhead, 0, m->ram[i].npages * sizeof *m->ram[i].xhead); /* slots restart from 0 */
-    hv_jit_reset(&m->jit);
-    m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
-    /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
-    static int poison = -1;
-    if (poison < 0) poison = getenv("HV_JIT_POISON") != NULL;
-    m->gen_checks = poison;
-    if (poison) {
-        size_t bytes = (size_t)m->jit.capacity * 4;
-        uint32_t *rw = (uint32_t *)((uint8_t *)m->jit.base + m->jit.rw_diff);
-        for (size_t i = 0; i < bytes / 4; i++) rw[i] = 0;
-        hv_jit_finish(&m->jit, m->jit.base, m->jit.capacity);
+    memset(m->xchain_heads, 0, sizeof m->xchain_heads);
+    /* The global barrier has retired every reference. Keep address space and
+       ownership; future publication overwrites complete block/exit records. */
+    if (retired_bytes >= (1u << 16)) {
+        if (hv_self) hv_fp_leave(hv_self);
+        /* The optional asynchronous profiler can inspect translation metadata.
+           Its diagnostic run keeps the old payload resident until teardown. */
+        const char *profile = getenv("HV_PROF_IOS");
+        if (!profile || !strcmp(profile, "0")) {
+            m->stats.metadata_reclaim_bytes += hv_reclaim_retired_pages(m->blocks, retired_bytes);
+#define RECLAIM_SLOTS(member) m->stats.metadata_reclaim_bytes += hv_reclaim_retired_pages(m->member, retired_slots * sizeof *m->member)
+            RECLAIM_SLOTS(slots); RECLAIM_SLOTS(slot_site); RECLAIM_SLOTS(slot_stub);
+            RECLAIM_SLOTS(slot_cond); RECLAIM_SLOTS(slot_xa); RECLAIM_SLOTS(slot_xpa); RECLAIM_SLOTS(xchained); RECLAIM_SLOTS(slot_free);
+#undef RECLAIM_SLOTS
+        }
+        if (hv_self) hv_fp_enter(hv_self);
     }
+    hv_jit_reset(&m->jit);
+    __atomic_store_n(&m->jit.limit,hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0,__ATOMIC_RELAXED); /* MB of it to use (testing) */
+    hv_jit_ring(&m->jit, hv_knob[HV_K_JITSEGS] ? (uint32_t)hv_knob[HV_K_JITSEGS] : 8); /* after the limit: segments of what is used */
+    for(int i=0;i<m->ncpus;i++)if(m->cpus[i])hv_ijc_evict_index(m->cpus[i]);
+    /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
+    m->gen_checks = poison_on();
+    if (m->gen_checks) hv_jit_poison(&m->jit, m->jit.base, m->jit.capacity);
+}
+
+/* Segmented code cache: when it fills, only one segment's blocks go, not every block. A full flush made
+   the guest translate its whole working set again at once (a macOS 27 boot on a phone filled 1.5 GB in about three
+   minutes, and every flush after that started the storm over); the blocks kept are mostly the hot ones, and the ones
+   that went come back one by one as they are run.
+
+   What can lead into the segment, and how it stops: the hash and the per-CPU front caches (rebuilt and emptied),
+   the indirect-branch caches (victim targets pruned) and return predictions (emptied), exits chained into its blocks from
+   blocks elsewhere (sent back to their stubs, as hv_invalidate_code does for a page), and a CPU's chunk of space there
+   (seg_epoch). Exits whose own code was there free their slots for new blocks. */
+static int code_address_order(const void *a,const void *b) {
+    uintptr_t x=(uintptr_t)*(uint32_t *const *)a,y=(uintptr_t)*(uint32_t *const *)b;
+    return (x>y)-(x<y);
+}
+
+void hv_evict_blocks(HvMachine *m) {
+    HvJitRegion *r = &m->jit;
+    if (!r->seg_words || __atomic_load_n(&r->too_big, __ATOMIC_RELAXED)) {
+        m->stats.flush_full++;
+        hv_flush_blocks(m);
+        return;
+    }
+    uint64_t t0 = mach_absolute_time();
+    uint64_t seen=0;
+    for(int i=0;i<m->ncpus;i++){seen|=m->percpu[i].jit_seen;m->percpu[i].jit_seen=0;}
+    uint32_t seg = hv_jit_evict_policy(r,seen,m->jit_retention);
+    const uint32_t *lo = r->base + (size_t)seg * r->seg_words, *hi = lo + r->seg_words;
+#define GONE(p) ((uintptr_t)(p) >= (uintptr_t)lo && (uintptr_t)(p) < (uintptr_t)hi)
+    m->stats.evictions++;
+    size_t removed_count=0;int full_branch_reset=getenv("HV_EVICT_FULL_BRANCH_RESET")&&atoi(getenv("HV_EVICT_FULL_BRANCH_RESET"));
+    /* Blocks: keep the others in the order they were made (blocks whose page's code changed since go too: nothing
+       can look them up again), and hash them anew. The ones made before the ring came round to here first. */
+    int n = 0, wrap = 0;
+    const uint32_t *end = r->base + r->end;
+    /* All CPUs are quiesced. Build the same ascending survivor hash while
+       compacting, reusing the descriptor already in cache instead of scanning
+       millions of survivors a second time. No hash pointer may be consumed
+       until the existing publication barrier completes. */
+    memset(m->hash, 0, sizeof m->hash);
+    if(m->jit_page_heads)memset(m->jit_page_heads,0,m->jit_page_count*sizeof *m->jit_page_heads);
+    for (int i = 0; i < m->nblocks; i++) {
+        HvBlock *b = &m->blocks[i];
+        if (GONE(b->code) || __atomic_load_n(&b->ram->page_gen[b->pg], __ATOMIC_RELAXED) != b->gen) {
+            if(!GONE(b->code)&&!full_branch_reset) {
+                if(removed_count>=65536)full_branch_reset=1;
+                else {
+                    if(removed_count==m->evict_words_cap){size_t cap=m->evict_words_cap?m->evict_words_cap*2:256;uint32_t **v=realloc(m->evict_words,cap*sizeof *v);if(v){m->evict_words=v;m->evict_words_cap=cap;}else full_branch_reset=1;}
+                    if(!full_branch_reset)m->evict_words[removed_count++]=b->code;
+                }
+            }
+            continue;
+        }
+        if (n != i) m->blocks[n] = *b;
+        if (m->blocks[n].code >= end && wrap == n) wrap = n + 1;
+        HvBlock *survivor = &m->blocks[n];
+        uint32_t h = hv_block_hash(survivor->va, survivor->pa, survivor->flags);
+        hv_block_index_add(m,(uint32_t)n);
+        survivor->next = m->hash[h];
+        m->hash[h] = survivor;
+        n++;
+    }
+    m->stats.evict_blocks += (uint64_t)(m->nblocks - n);
+    m->nblocks = n;
+    m->blocks_wrap = (uint32_t)wrap;
+    if(removed_count>1)qsort(m->evict_words,removed_count,sizeof *m->evict_words,code_address_order);
+    for(int i=0;i<m->ncpus;i++)if(m->cpus[i]) {
+        HvCpu *cpu=m->cpus[i];
+        if(full_branch_reset||hv_ijc_evict_range(cpu,lo,hi,m->evict_words,removed_count)) {
+            hv_ijc_reset(cpu,0);hv_ijc_reset(cpu,1);
+        }
+        /* Return entries can point inside code; descriptor pointers move
+           during compaction. Retain their proven whole-clear fallback. */
+        hv_ret_clear(cpu);memset(m->percpu[i].jc,0,sizeof m->percpu[i].jc);
+    }
+    uint64_t t1 = mach_absolute_time();
+    m->stats.evict_phase[0] += t1 - t0;
+    /* The words rewritten below, for one instruction-cache pass at the end. */
+    uint32_t **words = m->evict_words;
+    size_t nwords_cap = m->evict_words_cap;
+    size_t nwords = 0;
+    /* Slots: free those whose exit was in the segment (or never placed), unchain those leading into it, and list the
+       chained exits to other pages again by target page (some on the lists went, and the lists run through them). */
+    memset(m->xchain_heads, 0, sizeof m->xchain_heads);
+    m->nxchained = 0;
+    uint32_t nslots = m->nslots < m->max_slots ? m->nslots : m->max_slots, nfree = 0;
+    for (uint32_t idx = 0; idx < nslots; idx++) {
+        uint32_t *site = m->slot_site[idx];
+        if (!site || GONE(site)) {
+            m->slots[idx] = 0;
+            m->slot_site[idx] = NULL;
+            m->slot_cond[idx] = NULL;
+            m->slot_xpa[idx] = 0;
+            m->xchained[idx] = 0;
+            m->slot_free[nfree++] = idx;
+            continue;
+        }
+        m->xchained[idx] = 0;
+        uint64_t to = m->slots[idx];
+        if (to && GONE(to)) {
+            m->slots[idx] = 0;
+            m->slot_xpa[idx] = 0;
+            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
+            if (nwords + 2 > nwords_cap) {
+                size_t cap = nwords_cap ? nwords_cap * 2 : 65536;
+                uint32_t **w = realloc(words, cap * sizeof *w);
+                if (w) { words = m->evict_words = w; nwords_cap = m->evict_words_cap = cap; }
+            }
+            hv_jit_write(r, site, &insn, 4);
+            if (nwords < nwords_cap) words[nwords++] = site;
+            else hv_jit_finish(r, site, 1);
+            uint32_t *cond = m->slot_cond[idx];
+            if (cond) { /* the hot part's conditional branch went to the exit's B before it was chained */
+                insn = *cond;
+                if (hv_branch_retarget(&insn, site - cond)) {
+                    hv_jit_write(r, cond, &insn, 4);
+                    if (nwords < nwords_cap) words[nwords++] = cond;
+                    else hv_jit_finish(r, cond, 1);
+                }
+            }
+            m->stats.evict_unchained++;
+            continue;
+        }
+        uint64_t xpa = m->slot_xpa[idx];
+        if (xpa) {
+            uint32_t bucket = hv_xchain_bucket(xpa & ~1ull);
+            m->xchained[idx] = m->xchain_heads[bucket];
+            m->xchain_heads[bucket] = idx + 1;
+            m->nxchained++;
+        }
+    }
+    m->nslot_free = nfree;
+    m->slot_take = 0;
+    uint64_t t2 = mach_absolute_time();
+    m->stats.evict_phase[1] += t2 - t1;
+    hv_jit_finish_words(r, words, nwords);
+    m->stats.evict_phase[2] += mach_absolute_time() - t2;
+    if (poison_on()) { /* HV_JIT_POISON: anything still leading into the segment faults there */
+        m->gen_checks = 1;
+        hv_jit_poison(r, (uint32_t *)lo, r->seg_words);
+    }
+#undef GONE
+    m->stats.evict_ticks += mach_absolute_time() - t0;
+}
+
+/* Ask for room: an eviction, unless something wants (or the ring needs) a full flush. */
+static void request_evict(HvMachine *m) {
+    int none = 0;
+    __atomic_compare_exchange_n(&m->flush_pending, &none, m->jit.seg_words ? HV_FLUSH_EVICT : 1, 0, __ATOMIC_SEQ_CST,
+                                __ATOMIC_SEQ_CST);
 }
 
 /* Parked: not running guest code, nor using its TLB, so other CPUs need not
@@ -59,6 +233,7 @@ static void park(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     __atomic_store_n(&p->tlb_live, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&p->active, 0, __ATOMIC_SEQ_CST);
+    hv_quiesce_notify(&cpu->m->quiesce);
     hv_cpu_ack_wake(cpu); /* a CPU asleep waiting for this one's acknowledgement need not wait any more */
 }
 
@@ -73,11 +248,13 @@ static void unpark(HvCpu *cpu) {
         __atomic_store_n(&p->active, 1, __ATOMIC_SEQ_CST);
         if (!__atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) break;
         __atomic_store_n(&p->active, 0, __ATOMIC_SEQ_CST);
+        hv_quiesce_notify(&m->quiesce);
         pthread_mutex_lock(&m->stw_mu);
         while (m->stw_active) pthread_cond_wait(&m->stw_cv, &m->stw_mu);
         pthread_mutex_unlock(&m->stw_mu);
     }
     __atomic_store_n(&p->tlb_live, 1, __ATOMIC_SEQ_CST);
+    if (m->notify_cpu_active) m->notify_cpu_active(m->activity_opaque);
     hv_cpu_process_requests(cpu); /* what came in while it was parked */
 }
 
@@ -93,7 +270,7 @@ static uint32_t block_flags(HvCpu *cpu) {
 
 /* Finding a block is lock-free (blocks are only ever added, with a release
    store, until a flush, which stops every CPU); making one takes the
-   translation lock. Returns NULL if the translations must all be dropped first
+   translation lock. Returns NULL if translations must be dropped first
    (m->flush_pending is set: the dispatcher does that, then tries again). */
 #define hash_of hv_block_hash
 #define find hv_block_find
@@ -125,17 +302,23 @@ static void block_dump(const HvBlock *b, const uint32_t *code) {
 
 static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, const uint32_t *code, uint32_t avail) {
     HvMachine *m = cpu->m;
+    int failed = 0;
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     __typeof__(cpu->pc_state->jc[0]) *jc = cpu->pc_state->jc;
     HvBlock *c = jc[j].va == va ? jc[j].b : NULL;
-    if (c && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
+    if (c && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) {
+        hv_jit_note_execution(cpu,c->code);
+        return c;
+    }
     uint32_t h = hash_of(va, pa, flags);
     HvRam *ram = hv_ram_lookup(m, pa);
     uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
     uint32_t gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
+    HvBlock *head_before = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE);
     HvBlock *b = find(m, h, va, pa, flags, gen);
     if (b) {
         jc[j].va = va, jc[j].b = b;
+        hv_jit_note_execution(cpu,b->code);
         return b;
     }
 
@@ -154,21 +337,34 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     /* Translate without the lock, into this thread's buffer... */
     HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
-    uint8_t phase0 = cpu->pc_state ? cpu->pc_state->phase : 0;
-    if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_TRANSLATE, __ATOMIC_RELAXED);
-    int failed = hv_translate_emit(m, &nb, code, avail) != 0;
-    if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, phase0, __ATOMIC_RELAXED);
+    uint8_t phase0 = cpu->pc_state ? __atomic_load_n(&cpu->pc_state->phase, __ATOMIC_RELAXED) : 0;
+    if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_TRANSLATE, __ATOMIC_RELAXED);
+    failed = hv_translate_emit(m, &nb, code, avail) != 0;
+    if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, phase0, __ATOMIC_RELAXED);
     if (failed) goto flush_unlocked;
     if (m->stats_interval) {
         m->stats.translate_ticks += mach_absolute_time() - t0;
         m->stats.translated_insns += nb.ninsns;
     }
+    /* Another CPU may have published this block while we emitted it. Check
+       before consuming executable space or doing instruction-cache maintenance.
+       Publication is acquire/release; the final locked check below still handles
+       a winner arriving after this check. Do not serialize parallel emitters. */
+    b = head_before != __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE)
+        ? find(m, h, va, pa, flags, gen) : NULL;
+    if (b) {
+        __atomic_fetch_add(&m->stats.duplicate_place_avoided, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&m->stats.duplicate_bytes_avoided,
+                           (uint64_t)hv_translate_pending_words() * 4, __ATOMIC_RELAXED);
+        jc[j].va = va, jc[j].b = b;
+        return b;
+    }
     /* ...and place it in the region (space is reserved atomically, so no lock either)... */
-    size_t used0 = m->jit.used;
-    if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
+    if (hv_translate_place(m, &nb) != 0) { /* JIT region full: make room */
         pthread_mutex_lock(&m->tr_mu);
-        m->stats.flush_full++;
-        goto flush;
+        m->stats.flush_capacity++;
+        if (!m->jit.seg_words) m->stats.flush_full++;
+        goto evict;
     }
     if (m->gen_checks && nb.jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST))
         fprintf(stderr, "hengevm: cpu %u translated across a flush: gen %u to %u, placed at rx+%llx, used %llx, active %d\n", cpu->index, nb.jit_gen, m->jit_gen, (unsigned long long)(nb.code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, cpu->pc_state->active);
@@ -182,21 +378,24 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
             m->stats.tr_wait_ticks += mach_absolute_time() - w0;
         }
     }
-    b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until a flush) */
+    b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until its segment is taken back) */
     if (b) {
+        __atomic_fetch_add(&m->stats.duplicate_place_late, 1, __ATOMIC_RELAXED);
         pthread_mutex_unlock(&m->tr_mu);
         jc[j].va = va, jc[j].b = b;
         return b;
     }
-    if ((uint32_t)m->nblocks >= m->max_blocks || m->flush_pending) {
-        m->stats.flush_full++;
-        goto flush;
+    if (m->flush_pending) goto flush;
+    if ((uint32_t)m->nblocks >= m->max_blocks) {
+        if (!m->jit.seg_words) m->stats.flush_full++;
+        m->stats.flush_block_limit++;
+        goto evict;
     }
     b = &m->blocks[m->nblocks];
     *b = nb;
     m->stats.translations++;
     if (m->stats_interval) {
-        m->stats.translated_words += m->jit.used - used0;
+        m->stats.translated_words += hv_translate_pending_words();
         static uint64_t seen_va[1 << 18], seen_vapa[1 << 18]; /* was this code translated before? (hashed, so approximate) */
         uint32_t hv = (uint32_t)(((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull >> 40);
         uint32_t hp = (uint32_t)((((va >> 2) ^ flags) * 0x9e3779b97f4a7c15ull ^ pa * 0xc2b2ae3d27d4eb4full) >> 40);
@@ -205,15 +404,19 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         seen_va[hv >> 6] |= 1ull << (hv & 63);
         seen_vapa[hp >> 6] |= 1ull << (hp & 63);
     }
+    hv_block_index_add(m,(uint32_t)m->nblocks);
     m->nblocks++;
     b->next = m->hash[h];
     __atomic_store_n(&m->hash[h], b, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&m->tr_mu);
     return b;
+evict:
+    request_evict(m);
+    goto flush;
 flush_unlocked:
     pthread_mutex_lock(&m->tr_mu);
+    if (failed) __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);
 flush:
-    __atomic_store_n(&m->flush_pending, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&m->tr_mu);
     hv_machine_kick_all(m);
     return NULL;
@@ -236,6 +439,7 @@ static uint32_t wfe(HvCpu *cpu) {
     uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     if (spin || va == ~0ull || (size != 1 && size != 2 && size != 4 && size != 8) || (va & (size - 1)) ||
         e->read_tag == HV_TLB_INVALID || e->read_tag + HV_TLB_ADJ != page) {
+        if (cpu->m->stats_interval) __atomic_fetch_add(&cpu->pc_state->wfe_dispatches, 1, __ATOMIC_RELAXED);
         __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED); /* let another CPU run: the dispatcher's way */
         return 0;
     }
@@ -250,7 +454,8 @@ static uint32_t wfe(HvCpu *cpu) {
         __asm__ volatile("wfe" ::: "memory");
         sleep_ok = mach_absolute_time() - t0 < 24 * 20;
     }
-    uint64_t deadline = mach_absolute_time() + 24 * 50; /* 50 us at 24 MHz */
+    uint64_t begin = mach_absolute_time();
+    uint64_t deadline = begin + 24 * 50; /* 50 us at 24 MHz */
     if (cpu->m->stats_interval) cpu->m->stats.wfe_waits++;
     for (;;) {
         uint64_t v;
@@ -262,6 +467,7 @@ static uint32_t wfe(HvCpu *cpu) {
         }
         if (v != want || __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break;
         if (mach_absolute_time() >= deadline) {
+            if (cpu->m->stats_interval) __atomic_fetch_add(&cpu->pc_state->wfe_timeouts, 1, __ATOMIC_RELAXED);
             __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
             break;
         }
@@ -269,6 +475,7 @@ static uint32_t wfe(HvCpu *cpu) {
         else __asm__ volatile("yield" ::: "memory");
     }
     __asm__ volatile("clrex" ::: "memory");
+    if (cpu->m->stats_interval) __atomic_fetch_add(&cpu->pc_state->wfe_ticks, mach_absolute_time() - begin, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -336,10 +543,12 @@ static int tlbi_may_hit(HvCpu *cpu, uint32_t insn, uint64_t pc) {
 static uint32_t helper(HvCpu *cpu, const HvHelperInfo *info_in);
 
 uint32_t hv_helper(HvCpu *cpu, const HvHelperInfo *info_in) {
+    if(cpu->m->jit_retention && (++cpu->pc_state->jit_sample_count&255u)==0)
+        hv_jit_note_execution(cpu,(const uint32_t *)(uintptr_t)cpu->helper_ret);
     HvPerCpu *pcs = cpu->pc_state;
-    if (pcs) __atomic_store_n(&pcs->phase, HV_PHASE_HELPER, __ATOMIC_RELAXED);
+    if (cpu->m->wait_stats && pcs) __atomic_store_n(&pcs->phase, HV_PHASE_HELPER, __ATOMIC_RELAXED);
     uint32_t r = helper(cpu, info_in);
-    if (pcs) __atomic_store_n(&pcs->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
+    if (cpu->m->wait_stats && pcs) __atomic_store_n(&pcs->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
     /* An exception just taken (an abort, an undefined instruction, a trap): its
        vector's block, as after an SVC. */
     if (r && cpu->exit_reason == HV_EXIT_EXCEPTION) {
@@ -416,13 +625,8 @@ void hv_debug_el0_in_kernel(HvCpu *cpu, const char *what) {
         {
             HvMachine *m = cpu->m;
             uint32_t *host = (uint32_t *)(uintptr_t)cpu->helper_ret; /* the block's blr into hv_helper_entry */
-            int lo = 0, hi = m->nblocks - 1;
-            while (lo < hi) {
-                int mid = (lo + hi + 1) / 2;
-                if (m->blocks[mid].code <= host) lo = mid;
-                else hi = mid - 1;
-            }
-            HvBlock *b = m->nblocks ? &m->blocks[lo] : NULL;
+            HvBlock *b = hv_block_at(m, host);
+            int lo = b ? (int)(b - m->blocks) : 0;
             fprintf(stderr, "hengevm: el0 runs kernel code: block %llx flags %u (index %d of %d), flushes %llu, last stub %llx, "
                             "miss site %llx\n  recent:", b ? (unsigned long long)b->va : 0ull, b ? b->flags : 0, lo, m->nblocks,
                     (unsigned long long)m->stats.block_flushes, (unsigned long long)cpu->last_stub,
@@ -496,9 +700,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
     return 0;
 }
 
-/* --profile: which guest blocks the sampled host PCs were in. Blocks are laid
-   out in the JIT region in the order they were made, so a binary search over
-   m->blocks finds the one holding a PC. */
+/* --profile: which guest blocks the sampled host PCs were in (hv_block_at). */
 static void print_profile(HvMachine *m) {
     enum { SLOTS = 4096 };
     static struct { uint64_t va; uint32_t flags, n, ninsns; } top[SLOTS];
@@ -512,7 +714,8 @@ static void print_profile(HvMachine *m) {
     for (; m->prof_tail != head; m->prof_tail++) {
         uint32_t *pc = (uint32_t *)(uintptr_t)m->prof[m->prof_tail & (HV_PROF_RING - 1)];
         total++;
-        if (pc < m->jit.base || pc >= m->jit.base + m->jit.used || !m->nblocks) {
+        HvBlock *b = pc >= m->jit.base && pc < m->jit.base + hv_jit_extent(&m->jit) ? hv_block_at(m, pc) : NULL;
+        if (!b) {
             outside++;
             Dl_info di;
             const char *name = dladdr(pc, &di) && di.dli_sname ? di.dli_sname : "?";
@@ -531,13 +734,6 @@ static void print_profile(HvMachine *m) {
             if (k < nfn) fn[k].n++;
             continue;
         }
-        int lo = 0, hi = m->nblocks - 1;
-        while (lo < hi) {
-            int mid = (lo + hi + 1) / 2;
-            if (m->blocks[mid].code <= pc) lo = mid;
-            else hi = mid - 1;
-        }
-        HvBlock *b = &m->blocks[lo];
         uint32_t h = (uint32_t)((b->va >> 2) ^ b->flags) & (SLOTS - 1);
         int probes = 0;
         while (top[h].n && (top[h].va != b->va || top[h].flags != b->flags) && ++probes < 64) h = (h + 1) & (SLOTS - 1);
@@ -578,55 +774,89 @@ static void print_profile(HvMachine *m) {
     }
 }
 
+/* A new CPU0 thread (Continue) and a new hv_run on the same host thread both
+   need fresh wall, CPU-time and counter baselines. No process-global history. */
+static _Thread_local int stats_new_run;
+static double stats_thread_seconds(void) {
+    thread_basic_info_data_t ti;
+    mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
+    mach_port_t self = mach_thread_self();
+    kern_return_t result = thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&ti, &cnt);
+    mach_port_deallocate(mach_task_self(), self);
+    if (result != KERN_SUCCESS) return -1;
+    return ti.user_time.seconds + ti.user_time.microseconds / 1e6 +
+           ti.system_time.seconds + ti.system_time.microseconds / 1e6;
+}
+
 static void print_stats(HvCpu *cpu, int force) {
-    static uint64_t last_t, start_t;
+    static _Thread_local uint64_t last_t, start_t, last_busy_wall;
+    static _Thread_local double last_busy, seconds_per_tick;
+    static _Thread_local int hash_diagnostics;
     /* This uses floating point, and the host FP registers hold the guest's state. */
     hv_fp_leave(cpu);
     uint64_t zero = 0;
     __asm__ volatile("msr fpcr, %0" ::"r"(zero));
-    static HvStats last;
+    static _Thread_local HvStats last;
     HvMachine *m = cpu->m;
     uint64_t now = mach_absolute_time();
-    if (!start_t) start_t = last_t = now;
-    if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
+    if (stats_new_run || !start_t) {
+        stats_new_run = 0;
+        start_t = last_t = now;
+        last = m->stats;
+        last_busy = stats_thread_seconds();
+        last_busy_wall = mach_absolute_time();
+        mach_timebase_info_data_t timebase;
+        seconds_per_tick = mach_timebase_info(&timebase) == KERN_SUCCESS && timebase.denom
+            ? (double)timebase.numer / timebase.denom / 1e9 : 1.0 / 24e6;
+        const char *hash = getenv("HV_STATS_HASH");
+        hash_diagnostics = hash && !strcmp(hash, "1");
         hv_fp_enter(cpu);
         return;
     }
-    double dt = (double)(now - last_t) / 24e6;
+    if (now <= last_t || (!force && (now - last_t) * seconds_per_tick < m->stats_interval)) {
+        hv_fp_enter(cpu);
+        return;
+    }
+    double dt = (now - last_t) * seconds_per_tick;
+    /* Pair CPU time with its own wall sample BEFORE formatting or writing.
+       Sampling CPU time after fprintf counted this report's CPU work against
+       an interval ending before it, which could report >100% under log I/O
+       pressure or when a forced report follows a periodic one closely. */
+    double busy = stats_thread_seconds();
+    uint64_t busy_wall = mach_absolute_time();
+    double busy_dt = (busy_wall - last_busy_wall) * seconds_per_tick;
     HvStats *s = &m->stats;
 #define RATE(f) ((double)(s->f - last.f) / dt)
+    fprintf(stderr, "memory-reuse: cached_read_spans=%.0f/s retired_metadata_advised=%.1fMiB (advisory reclaim after full quiescence; not executable memory)\n",
+            RATE(vmem_read_reuses), (double)s->metadata_reclaim_bytes / (1 << 20));
     fprintf(stderr,
             "stats %5.0fs: blocks %.2fM/s, translated %.0f/s (again: va %.0f%% va+pa %.0f%%; %.0f%% of time, %.1f insns, %.1fx), slow mem %.0fK/s, mrs %.0fK/s msr %.0fK/s sys %.0fK/s, "
-            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
-            (double)(now - start_t) / 24e6, RATE(blocks) / 1e6, RATE(translations), 100.0 * RATE(retrans_va) / (RATE(translations) + 1e-9), 100.0 * RATE(retrans_vapa) / (RATE(translations) + 1e-9), 100.0 * (double)(s->translate_ticks - last.translate_ticks) / (double)(now - last_t), RATE(translated_insns) / (RATE(translations) + 1e-9), RATE(translated_words) / (RATE(translated_insns) + 1e-9), RATE(helper[HV_OP_MEM]) / 1e3,
+            "exc %.0f/s irq %.0f/s, tlb flush %.0f/s, fetch walks %.0fK/s, wfi %.0f/s (%.0f%% idle), flushes %.0f/s (smc %.0f ic %.0f full %.0f), blocks held %d (%.0f MB, %llu full flushes, %llu evictions: %.0f ms (blocks %.0f, exits %.0f, icache %.0f), %.0fK blocks dropped, %.0fK exits unchained), chained %.0f/s ijc fills %.0fK/s resets %.0f/s, el%u pc %llx\n",
+            (now - start_t) * seconds_per_tick, RATE(blocks) / 1e6, RATE(translations), 100.0 * RATE(retrans_va) / (RATE(translations) + 1e-9), 100.0 * RATE(retrans_vapa) / (RATE(translations) + 1e-9), 100.0 * (double)(s->translate_ticks - last.translate_ticks) / (double)(now - last_t), RATE(translated_insns) / (RATE(translations) + 1e-9), RATE(translated_words) / (RATE(translated_insns) + 1e-9), RATE(helper[HV_OP_MEM]) / 1e3,
             RATE(helper[HV_OP_MRS]) / 1e3, RATE(helper[HV_OP_MSR]) / 1e3, RATE(helper[HV_OP_SYS]) / 1e3,
             RATE(exceptions), RATE(interrupts), RATE(tlb_flushes), RATE(fetch_walks) / 1e3, RATE(wfi),
             100.0 * (double)(s->wfi_ticks - last.wfi_ticks) / (double)(now - last_t), RATE(block_flushes), RATE(flush_smc),
-            RATE(flush_ic), RATE(flush_full), m->nblocks, (double)m->jit.used * 4 / (1 << 20), (unsigned long long)s->flush_full, RATE(chained), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
+            RATE(flush_ic), RATE(flush_full), m->nblocks, (double)hv_jit_extent(&m->jit) * 4 / (1 << 20), (unsigned long long)s->flush_full,
+            (unsigned long long)s->evictions, (double)s->evict_ticks / 24e3, (double)s->evict_phase[0] / 24e3, (double)s->evict_phase[1] / 24e3, (double)s->evict_phase[2] / 24e3, (double)s->evict_blocks / 1e3, (double)s->evict_unchained / 1e3, RATE(chained), RATE(ijc_fills) / 1e3, RATE(ijc_resets), cpu->el,
             (unsigned long long)cpu->pc);
     {
         double tot = 0;
         for (int k = 0; k < 6; k++) tot += RATE(why[k]);
         /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
-        static double last_busy;
-        thread_basic_info_data_t ti;
-        mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
-        mach_port_t self = mach_thread_self();
-        if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&ti, &cnt) == KERN_SUCCESS) {
-            double busy = ti.user_time.seconds + ti.user_time.microseconds / 1e6 + ti.system_time.seconds +
-                          ti.system_time.microseconds / 1e6;
-            fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / dt);
-            if (m->ncpus > 1) {
-                fprintf(stderr, "  cpus:");
-                for (int i = 0; i < m->ncpus; i++)
-                    if (m->cpus[i])
-                        fprintf(stderr, " [%d] %s el%u pc %llx", i, m->cpus[i]->off ? "off" : "on", m->cpus[i]->el,
-                                (unsigned long long)m->cpus[i]->pc);
-                fprintf(stderr, "\n");
-            }
-            last_busy = busy;
+        if (busy >= 0 && last_busy >= 0 && busy >= last_busy && busy_dt > 0)
+            fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / busy_dt);
+        else
+            fprintf(stderr, "  cpu thread timing unavailable (new baseline)\n");
+        last_busy = busy;
+        last_busy_wall = busy_wall;
+        if (m->ncpus > 1) {
+            fprintf(stderr, "  cpus:");
+            for (int i = 0; i < m->ncpus; i++)
+                if (m->cpus[i])
+                    fprintf(stderr, " [%d] %s el%u pc %llx", i, m->cpus[i]->off ? "off" : "on", m->cpus[i]->el,
+                            (unsigned long long)m->cpus[i]->pc);
+            fprintf(stderr, "\n");
         }
-        mach_port_deallocate(mach_task_self(), self);
         fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                 RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                 RATE(flush_why[6]), RATE(flush_why[7]));
@@ -640,7 +870,9 @@ static void print_stats(HvCpu *cpu, int force) {
                     RATE(flush_checked), RATE(flush_check_entries), RATE(flush_check_bad), RATE(flush_check_af));
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
-        { /* block hash health: chain lengths and how much of it is stale */
+        /* Walking millions of blocks is a diagnostic, not routine telemetry.
+           Keep it explicitly opt-in; ordinary rate counters do not need it. */
+        if (hash_diagnostics) { /* block hash health: chain lengths and stale entries */
             uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
             uint32_t worst = 0;
             for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {
@@ -771,7 +1003,7 @@ static void print_stats(HvCpu *cpu, int force) {
    jump gets a block that just wrote its own page back to the dispatcher. */
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     uint32_t idx = (uint32_t)(slot - m->slots);
-    if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
+    if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= hv_jit_extent(&m->jit))))
         fprintf(stderr, "hengevm: chain slot %u site %p to rx+%llx va %llx: block gen %u now %u\n", idx, (void *)m->slot_site[idx], (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen);
     uint64_t xa = m->slot_xa[idx];
     if (xa) {
@@ -786,8 +1018,9 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             return;
         }
         m->slot_xpa[idx] = page_pa | 1;
-        m->slot_xnext[idx] = b->ram->xhead[b->pg]; /* on the target page's list (hv_invalidate_code) */
-        b->ram->xhead[b->pg] = idx + 1;
+        uint32_t bucket = hv_xchain_bucket(page_pa);
+        m->xchained[idx] = m->xchain_heads[bucket];
+        m->xchain_heads[bucket] = idx + 1;
         m->nxchained++;
         __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
         uint32_t *site = m->slot_site[idx];
@@ -849,6 +1082,14 @@ static void wait_while_off(HvCpu *cpu) {
     hv_big_lock(m);
 }
 
+static int quiesce_busy(void *opaque) {
+    HvCpu *cpu=opaque;HvMachine *m=cpu->m;HvPerCpu *self=cpu->pc_state;
+    if(__atomic_load_n(&self->req_seq,__ATOMIC_SEQ_CST)!=__atomic_load_n(&self->ack_seq,__ATOMIC_SEQ_CST))return 0;
+    for(int i=0;i<m->ncpus;i++)
+        if(m->cpus[i] && m->cpus[i]!=cpu && __atomic_load_n(&m->cpus[i]->pc_state->active,__ATOMIC_SEQ_CST))return 1;
+    return 0;
+}
+
 /* Dropping every translation: the CPU that finds a flush pending waits until
    all the others have parked (at this barrier, asleep or off), flushes, and
    lets them go. Nobody holds a lock while waiting here. */
@@ -857,23 +1098,27 @@ static void stop_the_world(HvCpu *cpu) {
     pthread_mutex_lock(&m->stw_mu);
     if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) && !m->stw_active) {
         __atomic_store_n(&m->stw_active, 1, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&m->flush_pending, 0, __ATOMIC_SEQ_CST);
+        int kind = __atomic_exchange_n(&m->flush_pending, 0, __ATOMIC_SEQ_CST);
         pthread_mutex_unlock(&m->stw_mu);
         hv_machine_kick_all(m);
-        if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_FLUSH, __ATOMIC_RELAXED);
+        if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_FLUSH, __ATOMIC_RELAXED);
         for (uint32_t spins = 0;; spins++) {
             int busy = 0;
             for (int i = 0; i < m->ncpus; i++)
                 if (m->cpus[i] && m->cpus[i] != cpu && __atomic_load_n(&m->cpus[i]->pc_state->active, __ATOMIC_SEQ_CST)) busy = 1;
             if (!busy) break;
             hv_cpu_process_requests(cpu); /* one of them may be waiting on a TLBI of ours */
-            if (spins > 100) sched_yield();
+            if (m->quiesce_enabled && spins >= 64) {
+                int rc=hv_quiesce_wait(&m->quiesce,quiesce_busy,cpu);
+                if(rc && rc!=ETIMEDOUT && rc!=EINTR)sched_yield();
+            } else if (spins > 100) sched_yield();
         }
         if (m->gen_checks) for (int i = 0; i < m->ncpus; i++) if (m->cpus[i] && m->cpus[i] != cpu && m->cpus[i]->pc_state->active) fprintf(stderr, "hengevm: flush while cpu %d is active\n", i);
         pthread_mutex_lock(&m->tr_mu);
-        hv_flush_blocks(m);
+        if (kind == HV_FLUSH_EVICT) hv_evict_blocks(m);
+        else hv_flush_blocks(m);
         pthread_mutex_unlock(&m->tr_mu);
-        if (cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
+        if (m->wait_stats && cpu->pc_state) __atomic_store_n(&cpu->pc_state->phase, HV_PHASE_RUN, __ATOMIC_RELAXED);
         pthread_mutex_lock(&m->stw_mu);
         __atomic_store_n(&m->stw_active, 0, __ATOMIC_SEQ_CST);
         pthread_cond_broadcast(&m->stw_cv);
@@ -888,8 +1133,21 @@ static void stop_the_world(HvCpu *cpu) {
     }
 }
 
+void hv_dispatch_log_stats(HvCpu *cpu) { print_stats(cpu, 1); }
+
 int hv_run(HvCpu *cpu) {
-    if (cpu->pc_state) cpu->pc_state->thread = mach_thread_self();
+    if (cpu->index == 0) stats_new_run = 1;
+    if (cpu->pc_state) {
+        /* Continue creates new host threads. Replace the owned send right on
+           each run instead of retaining a dead thread's identity indefinitely.
+           Keep it even with regular statistics off: bounded, opt-in captures
+           use this identity too. No thread_info calls enter the dispatch loop. */
+        mach_port_t thread = mach_thread_self();
+        pthread_mutex_lock(&cpu->pc_state->req_mu);
+        mach_port_t previous = __atomic_exchange_n(&cpu->pc_state->thread, thread, __ATOMIC_ACQ_REL);
+        if (previous) mach_port_deallocate(mach_task_self(), previous);
+        pthread_mutex_unlock(&cpu->pc_state->req_mu);
+    }
     hv_big_lock(cpu->m);
     hv_fp_enter(cpu);
     int r = run(cpu, 0);
@@ -966,6 +1224,7 @@ static int run_loop(HvCpu *cpu, int one) {
         /* Ticks take the device lock, so not every few blocks: on a kick (the 1 ms
            kicker, a device with work for CPU 0, an interrupt raised for this
            CPU) or once this CPU's own timer is due. */
+        next_due = cpu->timer_due;
         if (m->tick && (kicked || (++since_tick >= 64 && (since_tick = 0, next_due && mach_absolute_time() >= next_due)))) {
             since_tick = 0;
             next_due = m->tick(m, cpu);
@@ -1017,15 +1276,15 @@ static int run_loop(HvCpu *cpu, int one) {
             continue;
         }
         last_fault = ~0ull;
-        uint64_t flushes = m->stats.block_flushes;
+        uint64_t flushes = m->stats.block_flushes + m->stats.evictions;
         HvBlock *b = lookup(cpu, cpu->pc, pa, block_flags(cpu), code, avail);
-        /* A full flush while translating freed the slot the last exit came through,
-           and new blocks may have it now: chaining it would rewrite one of theirs. */
-        if (m->stats.block_flushes != flushes) pending_chain = NULL;
+        /* A flush or eviction while translating may have freed the slot the last exit came
+           through, and new blocks may have it now: chaining it would rewrite one of theirs. */
+        if (m->stats.block_flushes + m->stats.evictions != flushes) pending_chain = NULL;
         if (!b) {
             /* Everything is about to be dropped, or just was (another CPU may have
                done the flush this lookup asked for): try again after. */
-            if (m->flush_pending || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST) || m->stats.block_flushes != flushes) continue;
+            if (m->flush_pending || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST) || m->stats.block_flushes + m->stats.evictions != flushes) continue;
             fprintf(stderr, "hengevm: cannot translate block at %llx\n", (unsigned long long)cpu->pc);
             park(cpu);
             return HV_EXIT_UNSUPPORTED;
@@ -1118,7 +1377,7 @@ static int run_loop(HvCpu *cpu, int one) {
         cpu->icount++;
         m->stats.blocks++;
         if (m->stats_interval && cpu->index == 0 && (m->stats.blocks & 0xffff) == 0) print_stats(cpu, 0);
-        if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= m->jit.used || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
+        if (m->gen_checks && ((uint64_t)(b->code - m->jit.base) >= hv_jit_extent(&m->jit) || b->jit_gen != __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)))
             fprintf(stderr, "hengevm: cpu %u entering %p (rx+%llx, used %llx) for va %llx: block gen %u, now %u, maker %u\n", cpu->index, (void *)b->code, (unsigned long long)(b->code - m->jit.base) * 4, (unsigned long long)m->jit.used * 4, (unsigned long long)b->va, b->jit_gen, m->jit_gen, b->maker);
         hv_enter(cpu, b->code);
 

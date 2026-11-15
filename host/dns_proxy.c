@@ -12,6 +12,7 @@
 #include "machine.h"
 
 #include <dns_sd.h>
+#include <errno.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -25,7 +26,10 @@
 #define MAX_ANSWERS 64
 #define MAX_RDATA 1024
 #define MAX_INFLIGHT 64
-#define TIMEOUT_MS 4000
+#ifndef HV_DNS_TIMEOUT_MS
+#define HV_DNS_TIMEOUT_MS 4000
+#endif
+#define TIMEOUT_MS HV_DNS_TIMEOUT_MS
 
 typedef struct {
     uint16_t type, rclass, rdlen;
@@ -42,10 +46,10 @@ typedef struct {
     int edns;
     char name[1025];
     Answer ans[MAX_ANSWERS];
-    int nans, nodata, failed, done;
+    int nans, nodata, failed, done, rcode;
 } Query;
 
-static atomic_int inflight, unanswered_in_a_row;
+static atomic_int inflight, unanswered_in_a_row, resolver_backoff;
 static atomic_ullong answered, handed_back, timed_out;
 #define GIVE_UP 8 /* lookups in a row the resolver took but never answered: back to libslirp for the session */
 static atomic_int stopping;
@@ -66,6 +70,7 @@ void hv_dns_proxy_start(void) {
     atomic_store(&handed_back, 0);
     atomic_store(&timed_out, 0);
     atomic_store(&unanswered_in_a_row, 0);
+    atomic_store(&resolver_backoff, 0);
     pthread_mutex_unlock(&lifecycle_mu);
 }
 
@@ -122,7 +127,8 @@ static void DNSSD_API on_record(DNSServiceRef ref, DNSServiceFlags flags, uint32
     Query *q = ctx;
     int more = (flags & kDNSServiceFlagsMoreComing) != 0;
     if (err == kDNSServiceErr_NoSuchRecord || err == kDNSServiceErr_NoSuchName) {
-        q->nodata = 1; /* no such name, or nothing of this type: either way an empty answer */
+        q->nodata = 1;
+        q->rcode = err == kDNSServiceErr_NoSuchName ? 3 : 0; /* NXDOMAIN versus NODATA */
     } else if (err) {
         q->failed = 1;
         q->done = 1;
@@ -232,30 +238,36 @@ static void *lookup(void *arg) {
         }
     } else {
         int fd = DNSServiceRefSockFD(ref);
+        if (fd < 0) q->failed = q->done = 1;
         int64_t end = now_ms() + TIMEOUT_MS;
         while (!q->done && !atomic_load(&stopping)) {
             int64_t left = end - now_ms();
             if (left <= 0) break;
             struct pollfd p = {fd, POLLIN, 0};
             int r = poll(&p, 1, (int)(left < 100 ? left : 100));
-            if (r > 0 && DNSServiceProcessResult(ref) != kDNSServiceErr_NoError) {
-                q->failed = 1;
-                break;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                q->failed = 1; break;
+            }
+            if (r > 0 && (!(p.revents & POLLIN) || DNSServiceProcessResult(ref) != kDNSServiceErr_NoError)) {
+                q->failed = 1; break;
             }
         }
         DNSServiceRefDeallocate(ref);
         if (!atomic_load(&stopping)) {
             if (!q->done || q->failed) {
                 atomic_fetch_add(&timed_out, 1);
-                if (atomic_fetch_add(&unanswered_in_a_row, 1) + 1 == GIVE_UP && hv_knob[HV_K_DNSPROXY]) {
-                    hv_knob[HV_K_DNSPROXY] = 0; /* not hv_knob_set: no translation depends on it */
-                    fprintf(stderr, "hengevm: dns: %d lookups in a row unanswered by the system resolver: libslirp answers from now on\n", GIVE_UP);
+                if (atomic_fetch_add(&unanswered_in_a_row, 1) + 1 == GIVE_UP) {
+                    atomic_store(&resolver_backoff, 1);
+                    fprintf(stderr, "hengevm: dns: system resolver unanswered; falling back to libslirp\n");
                 }
+                q->send(q->frame, q->len, 0);
+                atomic_fetch_add(&handed_back, 1);
             } else {
                 atomic_store(&unanswered_in_a_row, 0);
+                reply(q, q->rcode);
+                atomic_fetch_add(&answered, 1);
             }
-            reply(q, q->done && !q->failed ? 0 : 2); /* SERVFAIL when nothing came */
-            atomic_fetch_add(&answered, 1);
         }
     }
     free(q);
@@ -263,8 +275,13 @@ static void *lookup(void *arg) {
     return NULL;
 }
 
+void hv_dns_proxy_reset(void) {
+    atomic_store(&resolver_backoff, 0);
+    atomic_store(&unanswered_in_a_row, 0);
+}
+
 int hv_dns_proxy_on(void) {
-    return hv_knob[HV_K_DNSPROXY] != 0; /* HV_DNS_PROXY, on unless 0 (machine.c) */
+    return hv_knob[HV_K_DNSPROXY] != 0 && !atomic_load(&resolver_backoff); /* HV_DNS_PROXY, on unless 0 (machine.c) */
 }
 
 int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
@@ -275,7 +292,8 @@ int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
     if (ip[16] != 10 || ip[17] != 0 || ip[18] != 2 || ip[19] != 3) return 0; /* to 10.0.2.3 */
     if ((rd16(ip + 6) & 0x3fff) != 0) return 0;                            /* fragments: libslirp's */
     uint32_t iplen = rd16(ip + 2);
-    if (iplen > len - 14 || iplen < ihl + 8 + 12) return 0;
+    if (iplen > len - 14 || iplen < ihl + 8 + 12 ||
+        iplen > sizeof(((Query *)0)->frame) - 14) return 0;
     const uint8_t *udp = ip + ihl;
     if (rd16(udp + 2) != 53) return 0;
     uint32_t udplen = rd16(udp + 4);
@@ -300,10 +318,12 @@ int hv_dns_proxy_take(const uint8_t *p, uint32_t len, HvDnsSend send) {
             free(q);
             return 0;
         }
+        if (qend + 11 + rd16(dns + qend + 9) != dlen) { free(q); return 0; }
         q->edns = 1;
         uint32_t size = rd16(dns + qend + 3);
         q->udp_max = (uint16_t)(size < 512 ? 512 : size > 1472 ? 1472 : size); /* one unfragmented frame */
     }
+    else if (qend != dlen) { free(q); return 0; }
     if (q->qclass != 1 || q->qtype == 0 || q->qtype == 252 || q->qtype == 251) { /* IN only; no zone transfers */
         free(q);
         return 0;

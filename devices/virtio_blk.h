@@ -23,6 +23,7 @@ typedef struct HvVblkReq {
     uint32_t written;
     int done;            /* a worker finished it (CPU thread pushes it) */
     int pushed;          /* in the used ring (the slot is free once all before it are too) */
+    uint64_t queued_us;
 } HvVblkReq;
 
 #define HV_VBLK_WORKERS 4 /* requests in flight at once: the guest queues many, and each waits on the host disk */
@@ -34,6 +35,11 @@ typedef struct HvVirtioBlk {
     HvVblkReq *ring;
     uint32_t submitted;  /* CPU thread: requests handed to the worker */
     uint32_t completed;  /* workers: requests done (in any order) */
+    int completion_pending; /* atomic: ready completions not yet claimed by a CPU poll */
+    unsigned capture_epoch; /* atomic: odd while an explicit bounded capture is active */
+    int log_stats;
+    uint64_t io_shape[3]; /* atomic, diagnostics only: single-span attempts, scatter attempts, scatter vectors */
+    uint64_t timing[6]; /* mu: completed requests, service us, queued us, flush us, max service us, flush count */
     uint32_t claimed;    /* workers: requests taken (under mu) */
     int inflight;        /* taken, not done */
     int fence;           /* a flush or barrier waits for everything before it: nothing else is taken meanwhile */
@@ -48,6 +54,9 @@ typedef struct HvVirtioBlk {
 HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int apple_variant);
 /* CPU thread: publish finished requests and raise the interrupt. */
 void hv_virtio_blk_poll(HvVirtioBlk *b);
+/* Reuse worker-owned I/O statistics during a bounded capture; no polling timer. */
+void hv_virtio_blk_capture_timing(HvVirtioBlk *b, int enabled);
+int hv_virtio_blk_read_timing(HvVirtioBlk *b,uint64_t out[6]);
 /* Tests: wait for the worker to finish everything submitted, then publish it. */
 void hv_virtio_blk_drain(HvVirtioBlk *b);
 /* After CPUs stop: finish submitted DMA and join workers before disk flush/free. */
