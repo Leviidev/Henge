@@ -6,6 +6,11 @@
 DECLARE_PROGRAM(p_svc);
 DECLARE_PROGRAM(p_brk_undef);
 DECLARE_PROGRAM(p_dabt);
+DECLARE_PROGRAM(p_group_fault);
+DECLARE_PROGRAM(p_group_interleaved_fault);
+DECLARE_PROGRAM(p_group_interleaved_store_fault);
+DECLARE_PROGRAM(p_group_writeback_fault);
+DECLARE_PROGRAM(p_group_writeback_store_fault);
 DECLARE_PROGRAM(p_el0);
 DECLARE_PROGRAM(p_sysregs);
 DECLARE_PROGRAM(p_irq);
@@ -85,6 +90,69 @@ int main(void) {
         check("dabt", "store FAR", c.x[6], 0x10010);
         check("dabt", "no writeback on a fault", c.x[10], 0x10000);
     }
+
+    static const TestProgram grouped_fault = TEST_PROGRAM(p_group_fault);
+    *(uint64_t *)(stack+65536-16)=7;*(uint64_t *)(stack+65536-8)=11;
+    if (!run(&grouped_fault,&c,ADDR(stack)+65536-16)) {
+        check("grouped fault","first completed load",c.x[1],7);
+        check("grouped fault","second completed load",c.x[2],11);
+        check("grouped fault","exact fault PC",c.x[22],c.x[4]);
+        check("grouped fault","exact fault address",c.x[21],ADDR(stack)+65536);
+        check("grouped fault","single exception",c.x[24],1);
+    }
+
+    static const TestProgram interleaved_fault=TEST_PROGRAM(p_group_interleaved_fault);
+    static const TestProgram interleaved_store_fault=TEST_PROGRAM(p_group_interleaved_store_fault);
+    for(int grouped=0;grouped<=2;grouped+=2) {
+        hv_knob[HV_K_GROUPS]=grouped;hv_flush_blocks(&m);
+        *(uint64_t *)(stack+65536-16)=11;
+        *(uint64_t *)(stack+65536-272)=7;*(uint64_t *)(stack+65536-264)=13;*(uint64_t *)(stack+65536-256)=17;
+        if(!run(&interleaved_fault,&c,ADDR(stack)+65536-16)) {
+            check("interleaved fault","earlier group load",c.x[1],7);
+            check("interleaved fault","later group load",c.x[2],11);
+            check("interleaved fault","completed older group load",c.x[3],13);
+            check("interleaved fault","older group after fault",c.x[6],17);
+            check("interleaved fault","precise PC",c.x[22],c.x[4]);
+            check("interleaved fault","precise FAR",c.x[21],ADDR(stack)+65536);
+            check("interleaved fault","one exception",c.x[24],1);
+        }
+        memset(stack+65536-272,0,272);
+        if(!run(&interleaved_store_fault,&c,ADDR(stack)+65536-16)) {
+            check("interleaved store fault","first store",*(uint64_t *)(stack+65536-272),19);
+            check("interleaved store fault","second base store",*(uint64_t *)(stack+65536-16),23);
+            check("interleaved store fault","completed older store",*(uint64_t *)(stack+65536-264),19);
+            check("interleaved store fault","load after fault",c.x[6],19);
+            check("interleaved store fault","precise PC",c.x[22],c.x[4]);
+            check("interleaved store fault","precise FAR",c.x[21],ADDR(stack)+65536);
+            check("interleaved store fault","WnR",c.x[20]&64,64);
+            check("interleaved store fault","one exception",c.x[24],1);
+        }
+    }
+    static const TestProgram writeback_fault=TEST_PROGRAM(p_group_writeback_fault);
+    static const TestProgram writeback_store_fault=TEST_PROGRAM(p_group_writeback_store_fault);
+    int saved_groups=hv_knob[HV_K_GROUPS];
+    for(int grouped=0;grouped<=2;grouped+=2) {
+        hv_knob[HV_K_GROUPS]=grouped;hv_flush_blocks(&m);
+        *(uint64_t *)(stack+65536-16)=7;*(uint64_t *)(stack+65536-8)=11;
+        if(!run(&writeback_fault,&c,ADDR(stack)+65536-16)) {
+            check("writeback fault","first completed load",c.x[1],7);
+            check("writeback fault","second completed load",c.x[2],11);
+            check("writeback fault","exact fault PC",c.x[22],c.x[4]);
+            check("writeback fault","exact fault address",c.x[21],ADDR(stack)+65536+8);
+            check("writeback fault","completed updates only",c.x[9],ADDR(stack)+65536);
+            check("writeback fault","single exception",c.x[24],1);
+        }
+        if(!run(&writeback_store_fault,&c,ADDR(stack)+65536-16)) {
+            check("writeback store fault","first completed store",*(uint64_t *)(stack+65536-16),13);
+            check("writeback store fault","second completed store",*(uint64_t *)(stack+65536-8),17);
+            check("writeback store fault","exact fault PC",c.x[22],c.x[4]);
+            check("writeback store fault","exact fault address",c.x[21],ADDR(stack)+65536+8);
+            check("writeback store fault","completed updates only",c.x[9],ADDR(stack)+65536);
+            check("writeback store fault","store abort",(c.x[20]>>6)&1,1);
+            check("writeback store fault","single exception",c.x[24],1);
+        }
+    }
+    hv_knob[HV_K_GROUPS]=saved_groups;hv_flush_blocks(&m);
 
     static const TestProgram el0 = TEST_PROGRAM(p_el0);
     uint64_t sp0 = ADDR(stack) + 8192;
