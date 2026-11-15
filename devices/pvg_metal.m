@@ -16,6 +16,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #include <string.h>
 #include <sys/utsname.h>
+#include <sys/sysctl.h>
 
 /* 1080p shrunk onto a phone would make a normal pointer a few dots across; an iPad's screen needs less. */
 static int cursor_scale(void) {
@@ -174,6 +175,18 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
     id<MTLRenderPipelineState> screen_pipe, linear_pipe, cursor_pipe;
     id<MTLFunction> stand_in; /* computeStandIn */
+    /* Compiled pipelines kept across sessions (pipelineState:descriptor:). iOS clears its own shader cache between
+       launches, so without this every boot compiles each of macOS's pipelines again, about half a second apiece. */
+    id<MTLBinaryArchive> archive; /* being filled */
+    NSArray<id<MTLBinaryArchive>> *archives; /* saved: earlier boots' files, and this session's saves */
+    NSURL *archive_dir;
+    NSString *archive_prefix;
+    int archive_next; /* the next file's number */
+    unsigned long long archive_bytes;
+    BOOL archive_dirty, archive_full;
+    uint32_t archive_save_seq; /* the save scheduled last: earlier ones see a newer one and leave it to that */
+    uint64_t pipes_hit, pipes_compiled, pipes_unsaved, pipes_unsaveable;
+    double compile_ms, hit_ms;
     id<MTLTexture> cursor_tex;
     id<MTLSamplerState> screen_sampler, cursor_sampler;
     uint64_t on_screen; /* the mapping showing */
@@ -411,10 +424,18 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
 - (void)resetFailureState { failure = nil; }
 - (BOOL)hadLookupFailure { return failure != nil; }
 - (NSString *)firstFailureReason { return failure; }
+/* As Apple's host does: ref 0 is no function (not a failure), and only an object-list entry of type 6 is one. Any other
+   object handed to Metal as a function is read as one by the GPU driver. A compute pipeline still gets the stand-in, as
+   Metal's deserializer aborts on a nil compute function. */
 - (id)functionWithFunctionRef:(unsigned long long)ref {
+    if (!ref) {
+        if (standIn && !failure) failure = @"function ref 0 in a compute pipeline";
+        return standIn;
+    }
     HvObject *o = [replay object:(uint32_t)ref task:task];
-    if (!o || !o->object) {
-        if (!failure) failure = [NSString stringWithFormat:@"function %llu", ref];
+    if (!o || !o->object || (o->entry[0] & 0xff) != OBJ_FUNCTION) {
+        if (!failure) failure = o && o->object ? [NSString stringWithFormat:@"function %llu is an object of type %u", ref, o->entry[0] & 0xff]
+                                               : [NSString stringWithFormat:@"function %llu", ref];
         return standIn;
     }
     return o->object;
@@ -450,6 +471,10 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     }
     struct __attribute__((packed)) { uint64_t off; uint32_t len; uint32_t tag, size; } h;
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return nil;
+    if (h.tag != 0xf) { /* Apple's host takes only this record as a function */
+        [self complain:[NSString stringWithFormat:@"function record tag %u, not 15", h.tag]];
+        return nil;
+    }
     NSMutableData *lib = [NSMutableData dataWithLength:h.len];
     if (hv_pvg_lite_task_read(lite, task, h.off, lib.mutableBytes, h.len)) return nil;
     /* iOS 17 refuses macOS's libraries as they are (a macOS 15 build, AIR 2.7): relabelled as iOS 17 ones
@@ -507,7 +532,211 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
             [lib writeToFile:[dir stringByAppendingPathComponent:name] atomically:NO];
         }
     }
+    if (library.functionNames.count != 1) { /* Apple's host: "Unexpected function count in library" */
+        [self complain:[NSString stringWithFormat:@"library with %lu functions", (unsigned long)library.functionNames.count]];
+        return nil;
+    }
     return [library newFunctionWithName:library.functionNames.firstObject];
+}
+
+/* A pipeline's descriptor from the guest's serialized form, as Apple's host makes it: a failed function lookup or a
+   missing vertex, tile or compute function and there is no pipeline. */
+- (id)pipelineDescriptor:(uint32_t)tag data:(NSData *)all task:(uint32_t)task {
+    const uint32_t *w = all.bytes;
+    id<HvMetalSPI> spi = (id)device;
+    HvContext *ctx = [HvContext new];
+    ctx->replay = self, ctx->task = task;
+    if (tag == 0xb) ctx->standIn = [self computeStandIn];
+    dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    id descriptor = tag == 0xe ? [spi newRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
+                  : tag == 0x33 ? [spi newTileRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
+                                : [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
+    if (!descriptor || ctx->failure) {
+        [self complain:[NSString stringWithFormat:@"%@ descriptor %u: %@", tag == 0xb ? @"compute" : @"pipeline", tag, ctx->failure]];
+        return nil;
+    }
+    id function = tag == 0xe ? [(MTLRenderPipelineDescriptor *)descriptor vertexFunction]
+                : tag == 0x33 ? [(MTLTileRenderPipelineDescriptor *)descriptor tileFunction]
+                              : [(MTLComputePipelineDescriptor *)descriptor computeFunction];
+    if (!function) {
+        [self complain:[NSString stringWithFormat:@"pipeline %u without its %s function", tag, tag == 0xe ? "vertex" : tag == 0x33 ? "tile" : "compute"]];
+        return nil;
+    }
+    return descriptor;
+}
+
+/* Saved pipelines. iOS empties its own Metal shader cache between launches, so every boot compiled each of macOS's
+   pipelines again (420 to 550 ms apiece on the Duo). They are kept in binary archives instead, in Application Support
+   (iOS purges Caches), named for the OS build and GPU: a compiled pipeline is only good for the compiler and GPU that
+   made it, and archives from another build are removed rather than loaded.
+   Each save writes a new file holding only the pipelines added since the last save, and every file is loaded at start:
+   on the Duo, serializing an archive that was loaded from a file wrote only what had been added to it, so one file
+   rewritten in place kept losing the earlier boots' pipelines. Past 32 files or the size cap nothing more is added.
+   HV_PVG_ARCHIVE=0: none (for A/B); HV_PVG_ARCHIVE=reset: start again. HV_PVG_ARCHIVE_MB: the cap (default 768). */
+static unsigned long long archive_cap(void) {
+    const char *mb = getenv("HV_PVG_ARCHIVE_MB");
+    return (mb && atoi(mb) > 0 ? (unsigned long long)atoi(mb) : 768ull) << 20;
+}
+
+- (id<MTLBinaryArchive>)emptyArchive {
+    NSError *err = nil;
+    id<MTLBinaryArchive> a = [device newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&err];
+    if (!a) fprintf(stderr, "hengevm: pvg-metal: saved pipelines unavailable: %s\n", err.localizedDescription.UTF8String ?: "?");
+    return a;
+}
+
+- (void)openArchive {
+    const char *opt = getenv("HV_PVG_ARCHIVE");
+    if (opt && !strcmp(opt, "0")) {
+        fprintf(stderr, "hengevm: pvg-metal: saved pipelines off (HV_PVG_ARCHIVE=0)\n");
+        return;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *dir = [[fm URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject
+        URLByAppendingPathComponent:@"Henge/Pipelines" isDirectory:YES];
+    NSError *err = nil;
+    if (!dir || ![fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:&err]) {
+        fprintf(stderr, "hengevm: pvg-metal: saved pipelines: no folder: %s\n", err.localizedDescription.UTF8String ?: "?");
+        return;
+    }
+    [dir setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil]; /* rebuilt by any boot: not worth a backup */
+    char build[64] = "unknown";
+    size_t len = sizeof build;
+    sysctlbyname("kern.osversion", build, &len, NULL, 0);
+    NSString *gpu = [[device.name componentsSeparatedByCharactersInSet:NSCharacterSet.alphanumericCharacterSet.invertedSet]
+        componentsJoinedByString:@"-"];
+    archive_dir = dir;
+    archive_prefix = [NSString stringWithFormat:@"pipelines-%s-%@-", build, gpu];
+    NSMutableArray<id<MTLBinaryArchive>> *loaded = [NSMutableArray new];
+    unsigned long long bytes = 0;
+    unsigned unreadable = 0;
+    NSArray<NSURL *> *files = [[fm contentsOfDirectoryAtURL:dir includingPropertiesForKeys:nil options:0 error:nil]
+        sortedArrayUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) { return [a.lastPathComponent compare:b.lastPathComponent options:NSNumericSearch]; }];
+    for (NSURL *u in files) {
+        NSString *name = u.lastPathComponent;
+        int n = 0;
+        BOOL ours = [name hasPrefix:archive_prefix] && [name hasSuffix:@".bin"] &&
+                    sscanf(name.UTF8String + archive_prefix.length, "%d.bin", &n) == 1 && !(opt && !strcmp(opt, "reset"));
+        if (!ours) { /* another build, an unfinished save, or a reset */
+            [fm removeItemAtURL:u error:nil];
+            continue;
+        }
+        MTLBinaryArchiveDescriptor *d = [MTLBinaryArchiveDescriptor new];
+        d.url = u;
+        err = nil;
+        id<MTLBinaryArchive> a = [device newBinaryArchiveWithDescriptor:d error:&err];
+        if (!a) {
+            fprintf(stderr, "hengevm: pvg-metal: saved pipelines: %s unreadable, removed: %s\n", name.UTF8String, err.localizedDescription.UTF8String ?: "?");
+            [fm removeItemAtURL:u error:nil];
+            unreadable++;
+            continue;
+        }
+        [loaded addObject:a];
+        bytes += [[fm attributesOfItemAtPath:u.path error:nil] fileSize];
+        if (n >= archive_next) archive_next = n + 1;
+    }
+    archive = [self emptyArchive];
+    if (!archive) return;
+    archives = loaded;
+    archive_bytes = bytes;
+    archive_full = loaded.count >= 32 || bytes > archive_cap();
+    fprintf(stderr, "hengevm: pvg-metal: saved pipelines: %lu files, %.1f MB%s%s\n", (unsigned long)loaded.count, bytes / 1048576.0,
+            unreadable ? " (some unreadable, removed)" : "", archive_full ? " (full: nothing more is added)" : "");
+}
+
+- (id)newState:(uint32_t)tag descriptor:(id)descriptor options:(MTLPipelineOption)options error:(NSError **)err {
+    if (tag == 0xe) return [device newRenderPipelineStateWithDescriptor:descriptor options:options reflection:nil error:err];
+    if (tag == 0x33) return [device newRenderPipelineStateWithTileDescriptor:descriptor options:options reflection:nil error:err];
+    return [device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:err];
+}
+
+/* A render (0xe), tile (0x33) or compute (0xb) pipeline. Looked up in the saved archives first; on a miss it is
+   compiled into the archive being filled and then made from it, so the next boot finds it. A render pipeline with no
+   fragment function (depth only, or rasterization off) is made but not saved: Metal refuses to add one ("expecting
+   'fragment' stage"). */
+- (id)pipelineState:(uint32_t)tag descriptor:(id)descriptor error:(NSError **)err {
+    double t0 = now_seconds();
+    if (archive) {
+        [descriptor setBinaryArchives:[archives arrayByAddingObject:archive]];
+        id state = [self newState:tag descriptor:descriptor options:MTLPipelineOptionFailOnBinaryArchiveMiss error:nil];
+        if (state) {
+            pipes_hit++;
+            hit_ms += (now_seconds() - t0) * 1e3;
+            return state;
+        }
+        if (tag == 0xe && ![(MTLRenderPipelineDescriptor *)descriptor fragmentFunction]) {
+            pipes_unsaveable++;
+        } else if (!archive_full) {
+            NSError *e = nil;
+            BOOL added = tag == 0xe    ? [archive addRenderPipelineFunctionsWithDescriptor:descriptor error:&e]
+                         : tag == 0x33 ? [archive addTileRenderPipelineFunctionsWithDescriptor:descriptor error:&e]
+                                       : [archive addComputePipelineFunctionsWithDescriptor:descriptor error:&e];
+            if (added) {
+                archive_dirty = YES;
+                pipes_unsaved++;
+                [self scheduleArchiveSave];
+            } else {
+                pipes_unsaveable++;
+                [self complain:[NSString stringWithFormat:@"saved pipelines: pipeline %u not added: %@", tag, e.localizedDescription]];
+            }
+        }
+    }
+    id state = [self newState:tag descriptor:descriptor options:MTLPipelineOptionNone error:err];
+    if (state) {
+        pipes_compiled++;
+        compile_ms += (now_seconds() - t0) * 1e3;
+        if (pipes_compiled == 1 || pipes_compiled % 100 == 0)
+            fprintf(stderr, "hengevm: pvg-metal: pipelines: %llu compiled (%.0f ms each), %llu from the saved archives (%.1f ms each), %llu not saveable\n",
+                    pipes_compiled, compile_ms / pipes_compiled, pipes_hit, pipes_hit ? hit_ms / pipes_hit : 0.0, pipes_unsaveable);
+    }
+    return state;
+}
+
+/* Written once compiling has been quiet for a few seconds (a boot or an app launch compiles in bursts), or after 400
+   new ones in a long burst, and when the Mac stops or is suspended. On the worker queue, as the archive is added to
+   there. */
+- (void)scheduleArchiveSave {
+    if (pipes_unsaved >= 400) {
+        [self saveArchive];
+        return;
+    }
+    uint32_t seq = ++archive_save_seq;
+    HvReplay *__weak weak = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * (int64_t)NSEC_PER_SEC), worker, ^{
+        HvReplay *r = weak;
+        if (r && r->archive_save_seq == seq && !atomic_load(&r->stopping)) [r saveArchive];
+    });
+}
+
+/* The archive being filled goes to a new file of its own, then joins the saved ones and an empty one takes its place. */
+- (void)saveArchive {
+    if (!archive || !archive_dirty) return;
+    double t0 = now_seconds();
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *to = [archive_dir URLByAppendingPathComponent:[NSString stringWithFormat:@"%@%d.bin", archive_prefix, archive_next]];
+    NSURL *tmp = [to URLByAppendingPathExtension:@"new"];
+    [fm removeItemAtURL:tmp error:nil];
+    NSError *err = nil;
+    if (![archive serializeToURL:tmp error:&err] || rename(tmp.fileSystemRepresentation, to.fileSystemRepresentation) != 0) {
+        [self complain:[NSString stringWithFormat:@"saved pipelines: not written: %@", err ? err.localizedDescription : @(strerror(errno))]];
+        [fm removeItemAtURL:tmp error:nil];
+        return;
+    }
+    id<MTLBinaryArchive> next = [self emptyArchive];
+    if (!next) return; /* keeps filling the same one, and a later save writes it again in full under a new number */
+    unsigned long long bytes = [[fm attributesOfItemAtPath:to.path error:nil] fileSize];
+    archive_next++;
+    archive_bytes += bytes;
+    archives = [archives arrayByAddingObject:archive];
+    archive = next;
+    archive_dirty = NO;
+    if (archives.count >= 32 || archive_bytes > archive_cap()) archive_full = YES;
+    fprintf(stderr, "hengevm: pvg-metal: saved pipelines: %llu added in file %d (%.1f MB, %.1f MB in %lu files) in %.0f ms%s; this session %llu from the "
+                    "archives (%.1f ms each), %llu compiled (%.0f ms each), %llu not saveable\n",
+            pipes_unsaved, archive_next - 1, bytes / 1048576.0, archive_bytes / 1048576.0, (unsigned long)archives.count,
+            (now_seconds() - t0) * 1e3, archive_full ? " (now full)" : "", pipes_hit, pipes_hit ? hit_ms / pipes_hit : 0.0,
+            pipes_compiled, pipes_compiled ? compile_ms / pipes_compiled : 0.0, pipes_unsaveable);
+    pipes_unsaved = 0;
 }
 
 - (id)makeSerialized:(uint64_t)at length:(uint32_t)size task:(uint32_t)task {
@@ -515,20 +744,15 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (hv_pvg_lite_task_read(lite, task, at, all.mutableBytes, size)) return nil;
     const uint32_t *w = all.bytes;
     uint32_t tag = w[0];
+    if ((tag == 0xe || tag == 0x33 || tag == 0xb) && (size < 16 || w[3] > size - 16)) { /* Apple's host checks this too */
+        [self complain:[NSString stringWithFormat:@"pipeline %u: %u bytes of data in a %u-byte record", tag, size >= 16 ? w[3] : 0, size]];
+        return nil;
+    }
     if (tag == 0xe || tag == 0x33) { /* render or tile pipeline: {tag, size, ref, length, data} */
-        id<HvMetalSPI> spi = (id)device;
-        HvContext *ctx = [HvContext new];
-        ctx->replay = self, ctx->task = task;
-        dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-        id descriptor = tag == 0xe ? [spi newRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx]
-                                   : [spi newTileRenderPipelineDescriptorWithSerializedData:data deserializationContext:ctx];
-        if (!descriptor || ctx->failure) {
-            [self complain:[NSString stringWithFormat:@"pipeline descriptor %u: %@", tag, ctx->failure]];
-            return nil;
-        }
+        id descriptor = [self pipelineDescriptor:tag data:all task:task];
+        if (!descriptor) return nil;
         NSError *err = nil;
-        id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
-                              : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
+        id state = [self pipelineState:tag descriptor:descriptor error:&err];
         if (!state) [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
         if (tag == 0xe && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) { /* m4 fork: blend state as this iOS read it */
             MTLRenderPipelineDescriptor *rp = descriptor;
@@ -549,18 +773,10 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         return state;
     }
     if (tag == 0xb) { /* compute pipeline: {tag, size, ref, length, data} */
-        id<HvMetalSPI> spi = (id)device;
-        HvContext *ctx = [HvContext new];
-        ctx->replay = self, ctx->task = task;
-        dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-        ctx->standIn = [self computeStandIn];
-        id descriptor = [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
-        if (!descriptor || ctx->failure) {
-            [self complain:[NSString stringWithFormat:@"compute descriptor: %@", ctx->failure]];
-            return nil;
-        }
+        id descriptor = [self pipelineDescriptor:tag data:all task:task];
+        if (!descriptor) return nil;
         NSError *err = nil;
-        id state = [device newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
+        id state = [self pipelineState:tag descriptor:descriptor error:&err];
         if (!state) [self complain:[NSString stringWithFormat:@"compute pipeline: %@", err.localizedDescription]];
         else objc_setAssociatedObject(state, "hvname", [NSString stringWithFormat:@"compute %@", [[descriptor computeFunction] name]], OBJC_ASSOCIATION_RETAIN);
         return state;
@@ -2693,6 +2909,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->complaints = [NSMutableSet new];
         r->shot = getenv("HV_PVG_SHOT");
         cp_start(r);
+        [r openArchive];
 #if !TARGET_OS_IPHONE
         if (getenv("HV_PVG_GPU_TEST")) r->layer = [CAMetalLayer layer];
 #endif
@@ -2734,6 +2951,7 @@ void hv_pvg_metal_destroy(HvPvgMetal *m) {
         dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
         /* GPU completions may have enqueued a final readback on the worker. */
         dispatch_sync(r->worker, ^{
+            [r saveArchive];
             r->lite = NULL;
             r->tasks = nil;
             r->surfaces = nil;
@@ -2790,7 +3008,11 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                        until the system needs the memory. Here they just stay. */
                 } else if (op == 0x20 && n >= 4) {
-                    [r->tasks removeObjectForKey:@(args[0] >> 1)];
+                    /* Delete task: the id as every other command names it. Only define task (0x38) sends it shifted left with a
+                       flag in bit 0 (Apple's host: -[PGFIFO CmdDeleteTask] passes p[0] to deleteTaskID: as it is). Shifted here,
+                       an ended process kept its objects and the next one given its id got its functions wherever an object-list
+                       entry read the same: a vertex function in a fragment slot, and the GPU driver died (issue 102). */
+                    [r->tasks removeObjectForKey:@(args[0])];
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
@@ -2940,6 +3162,7 @@ void hv_pvg_metal_quiesce(HvPvgMetal *m) {
         dispatch_sync(r->worker, ^{});
         dispatch_group_wait(r->completions, DISPATCH_TIME_FOREVER);
         dispatch_sync(r->worker, ^{
+            [r saveArchive]; /* a suspended app may not come back */
             id<MTLCommandBuffer> cb = nil;
             id<MTLBlitCommandEncoder> blit = nil;
             unsigned copied = 0;
