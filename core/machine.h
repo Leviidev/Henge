@@ -76,6 +76,8 @@ typedef struct HvStats {
     uint64_t syncs, sync_ticks;        /* TLBI acks waited for, and host ticks spent waiting */
     uint64_t sync_len[4], sync_len_ticks[4]; /* those waits by length: under 10 us, 100 us, 1 ms, longer */
     uint64_t sync_probe[4];            /* a wait 100 us long looks at the other CPU: thread off a core, on one, mid walk, mid cache fill */
+    uint64_t sync_phase[6];            /* a wait 1 ms long: the other CPU running (guest code or dispatcher), translating, in a helper,
+                                          waiting for acks itself, at the flush barrier; or its thread off a core */
     uint64_t dev_waits, dev_wait_ticks; /* device lock taken while another CPU held it */
     uint64_t tr_waits, tr_wait_ticks;   /* translation lock likewise */
     uint64_t words_inline, words_ool, words_pool; /* translated code size by part */
@@ -204,14 +206,17 @@ typedef struct HvPerCpu {
     uint64_t walk_page[8];       /* the page walk k (walk_seq 2k -> 2k+1) fills, at [k % 8]; HV_WALK_ANY: a process switch */
     uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
     uint32_t thread;             /* its host thread (mach_port_t), for --stats: is a CPU waited for running at all */
+    uint8_t phase;               /* for --stats, what a CPU others wait on is doing: HV_PHASE_* */
     HvTlbStash stash[HV_STASHES];
     uint64_t stash_clock;
 } HvPerCpu;
 
+enum { HV_PHASE_RUN, HV_PHASE_TRANSLATE, HV_PHASE_HELPER, HV_PHASE_SYNC, HV_PHASE_FLUSH };
 #define HV_REQ_TLB_ALL 1u   /* drop the whole TLB and branch cache */
 #define HV_REQ_IJC_RESET 2u /* drop the branch cache (code changed) */
 
 typedef struct HvMachine {
+    int locks_initialized;
     HvRam ram[HV_MAX_RAM];
     int nram;
     HvRam *main_ram;     /* the largest region: guest RAM */
@@ -283,6 +288,11 @@ typedef struct HvMachine {
     /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
     uint64_t *prof;
     uint32_t prof_head, prof_tail;
+    /* The host counter when the machine started: every CPU's CNTVOFF, so the guest's virtual counter (its
+       mach_absolute_time) starts near 0 as on a Mac or under Virtualization.framework. With the host's own
+       count (days of uptime) macOS 12 took the user as idle for that long and put itself to sleep while
+       still starting up: its window server never drew. */
+    uint64_t cntvoff;
 } HvMachine;
 
 static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
@@ -355,6 +365,9 @@ void hv_big_unlock(HvMachine *m);
 void hv_big_yield(HvMachine *m);
 /* Make every CPU leave its block at the next exit. */
 void hv_machine_kick_all(HvMachine *m);
+/* Publish a terminal reason, then wake all CPUs, including CPU_OFF waits.
+   A later host stop must not overwrite the guest's shutdown/panic reason. */
+void hv_machine_halt(HvMachine *m, enum HvHaltReason reason);
 /* Wake one CPU out of WFI (and make it leave its block). */
 void hv_cpu_wake(HvCpu *cpu);
 /* Make it leave its block at the next checked exit, without waking it from WFI. */
