@@ -355,6 +355,87 @@ PROGRAM groups
     ldr x12, [x12, #-8]
 END groups
 
+PROGRAM groups_increment
+    // Warm via a non-groupable base, so the increment group's hot check runs.
+    mov x15, x0
+    ldr x15, [x15]
+    // Ordinary address increments retain one validated same-page translation.
+    add x23, x0, #0x200
+    ldr x19, [x23]
+    add x23, x23, #16
+    ldr w20, [x23]
+    sub x23, x23, #8
+    ldp x21, x22, [x23]
+    str x19, [x23, #24]
+    // The same pattern across a page boundary must use the plain fallback.
+    add x23, x0, #0x4000
+    sub x23, x23, #8
+    ldr x19, [x23]
+    add x23, x23, #8
+    ldr x20, [x23]
+END groups_increment
+
+PROGRAM groups_shared
+    // Three interleaved groups with the same extended fallback endpoint.
+    // The first set is same-page; the next set straddles page boundaries so
+    // each group may enter the shared plain suffix at a different instruction.
+    add x1, x0, #0x200
+    add x2, x0, #0x400
+    add x3, x0, #0x600
+    ldr x4, [x1]
+    ldr x5, [x2]
+    ldr x6, [x3]
+    str x5, [x1, #8]
+    str x6, [x2, #8]
+    str x4, [x3, #8]
+    ldr x7, [x1, #8]
+    ldr x8, [x2, #8]
+    ldr x9, [x3, #8]
+    // Redefining the bases closes the first groups, preserving their values.
+    add x1, x0, #0x4000
+    sub x1, x1, #8
+    add x2, x0, #0x8000
+    sub x2, x2, #8
+    add x3, x0, #0xc000
+    sub x3, x3, #8
+    ldr x10, [x1]
+    ldr x11, [x2]
+    ldr x12, [x3]
+    str x11, [x1, #8]
+    str x12, [x2, #8]
+    str x10, [x3, #8]
+    ldr x19, [x1, #8]
+    ldr x20, [x2, #8]
+    ldr x21, [x3, #8]
+END groups_shared
+
+// Mode2 retains a host address across raw ALU, stolen data operands and pairs.
+PROGRAM groups_register
+    mov x15, x0
+    ldr x15, [x15] // warm without opening a candidate group
+    add x23, x0, #0x200
+    ldr x1, [x23]
+    add x24, x24, #1
+    ldr x6, [x23, #8]
+    ldp x7, x15, [x23, #16]
+    str x6, [x23, #32]
+    ldp x18, x28, [x23, #16]
+    // A range crossing the page must take the original instruction sequence.
+    add x23, x0, #0x4000
+    sub x23, x23, #16
+    ldr x1, [x23]
+    ldr x2, [x23, #8]
+    ldr x3, [x23, #16]
+    str x4, [x23, #24]
+    // This copied instruction renames guest x6; it must reject register reuse.
+    add x23, x0, #0x600
+    ldr x1, [x23]
+    add x6, x6, #17
+    ldr x2, [x23, #8]
+    ldr x3, [x23, #16]
+    str x4, [x23, #24]
+END groups_register
+
 PROGRAM mmio
     str w1, [x0]
     ldr w2, [x0, #4]
@@ -367,6 +448,140 @@ PROGRAM mmio
     str x18, [x18]
     ldr x28, [x18, #8]
 END mmio
+
+    .p2align 14
+// Two-field groups, stack accesses and a range crossing a16KB page boundary.
+PROGRAM groups_two
+    ldr x1,[x0]
+    add x2,x1,#3
+    ldr x3,[x0,#8]
+    add x4,x2,x3
+    str x1,[sp,#-16]
+    str x3,[sp,#-8]
+    ldp x5,x6,[sp,#-16]
+    add x20,x0,#4,lsl#12
+    sub x20,x20,#8
+    ldr x9,[x20]
+    ldr x10,[x20,#8]
+    str x4,[x0,#24]
+END groups_two
+
+// Stack-frame translation reuse: pre-indexed allocation, fixed fields,
+// then post-indexed restoration. The original instruction sequence is the
+// native reference; no test-specific memory implementation is involved.
+PROGRAM groups_stack_frame
+    stp x29,x30,[sp,#-64]!
+    stp x20,x19,[sp,#16]
+    stp x22,x21,[sp,#32]
+    ldp x20,x19,[sp,#16]
+    ldp x22,x21,[sp,#32]
+    ldp x29,x30,[sp],#64
+END groups_stack_frame
+
+PROGRAM groups_writeback_cross
+    add x13,x0,#4,lsl#12
+    add x13,x13,#8
+    stp x1,x2,[x13,#-16]!
+    stp x3,x4,[x13,#16]
+    ldp x8,x9,[x13],#16
+END groups_writeback_cross
+
+PROGRAM groups_writeback_negative
+    add x13,x0,#128
+    str x1,[x13,#-8]!
+    str x2,[x13,#-8]!
+    str x3,[x13,#-8]!
+    ldr x8,[x13],#8
+    ldr x9,[x13],#8
+    ldr x10,[x13],#8
+END groups_writeback_negative
+
+PROGRAM groups_writeback_scratch
+    mov x13,x0
+    stp x1,x2,[x13,#16]!
+    mov x6,#0x5432
+    stp x3,x4,[x13,#16]
+    ldp x8,x9,[x13],#32
+    str x6,[x0]
+END groups_writeback_scratch
+
+// Interleaved bases need independent checked slots, including a scratch clobber.
+PROGRAM groups_interleaved
+    add x12,x0,#512
+    add x13,x0,#1024
+    ldr x1,[x12]
+    ldr x2,[x13]
+    add x6,x6,#17
+    ldr x3,[x12,#8]
+    ldr x4,[x13,#8]
+    str x3,[x12,#16]
+    str x4,[x13,#16]
+    ldr x5,[x12,#16]
+    ldr x7,[x13,#16]
+END groups_interleaved
+
+// The later group's guard crosses a page. Its plain suffix must also cover
+// the older group's later accesses, rather than reusing state after a helper.
+PROGRAM groups_interleaved_cross
+    add x12,x0,#512
+    add x13,x0,#4,lsl#12
+    sub x13,x13,#8
+    ldr x1,[x12]
+    ldr x2,[x13]
+    ldr x3,[x12,#8]
+    ldr x4,[x13,#8]
+    str x3,[x12,#16]
+    ldr x5,[x12,#16]
+END groups_interleaved_cross
+
+// Five simultaneous candidates exceed four cached addend slots. Any span
+// crossing the unselected fifth access must stay on the checked plain path.
+PROGRAM groups_slot_pressure
+    add x12,x0,#512
+    add x13,x0,#1024
+    add x14,x0,#1536
+    add x16,x0,#2048
+    add x17,x0,#2560
+    ldr x1,[x12]
+    ldr x2,[x13]
+    ldr x3,[x14]
+    ldr x4,[x16]
+    ldr x5,[x17]
+    str x2,[x12,#8]
+    str x3,[x13,#8]
+    str x4,[x14,#8]
+    str x5,[x16,#8]
+    str x1,[x17,#8]
+END groups_slot_pressure
+
+PROGRAM bench_interleaved_groups
+    add x12,x0,#512
+    add x13,x0,#1024
+Lbench_interleaved_loop:
+    ldr x1,[x12]
+    ldr x2,[x13]
+    ldr x3,[x12,#8]
+    ldr x4,[x13,#8]
+    ldr x5,[x12,#16]
+    ldr x7,[x13,#16]
+    add x10,x10,x1
+    add x10,x10,x4
+    subs x24,x24,#1
+    b.ne Lbench_interleaved_loop
+END bench_interleaved_groups
+
+// Standalone benchmark body; test_mem selects only the programs above.
+PROGRAM bench_stack_groups
+Lbench_stack_groups_loop:
+    stp x29,x30,[sp,#-64]!
+    stp x20,x19,[sp,#16]
+    stp x22,x21,[sp,#32]
+    ldp x20,x19,[sp,#16]
+    ldp x22,x21,[sp,#32]
+    ldp x29,x30,[sp],#64
+    subs x2,x2,#1
+    b.ne Lbench_stack_groups_loop
+END bench_stack_groups
 
     .p2align 14
 _mem_programs_finish:

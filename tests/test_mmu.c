@@ -7,6 +7,8 @@
 #include "machine.h"
 #include "mmu.h"
 #include "sysreg.h"
+#include "memop.h"
+#include <assert.h>
 
 #define PT_PA 0x80000000ull
 #define PT_SIZE (1u << 20)
@@ -145,6 +147,41 @@ int main(void) {
         printf("  FAIL TLB filled for non-RAM\n");
         failures++;
     }
+
+    /* Exercise the real read helper, with mappings filled by the real walker.
+       Cached reads must respect page ends, remaps and separate PAN rights. */
+    uint8_t *span_ram = aligned_alloc(16384, 32768); assert(span_ram);
+    memset(span_ram, 0x35, 16384); memset(span_ram + 16384, 0x6a, 16384);
+    assert(!hv_machine_add_ram(&m, 0x50000000, 32768, span_ram, 0));
+    const uint64_t span_va = 0x100020000ull;
+    uint64_t *span_leaf = map(r0, 14, 48, span_va, 3, 0x50000000 | PAGE | AF | AP(1), 0);
+    map(r0, 14, 48, span_va + 16384, 3, 0x50004000 | PAGE | AF | AP(1), 0);
+    hv_tlb_flush(&cpu);
+    assert(!hv_mmu_access(&cpu, span_va, HV_ACC_READ, 1, &pa));
+    assert(hv_tlb_read_span(&cpu, span_va + 16380, 4, 1));
+    assert(!hv_tlb_read_span(&cpu, span_va + 16380, 8, 1));
+    uint8_t readback[8];
+    int saved_stats = m.stats_interval; m.stats_interval = 1;
+    uint64_t reused = m.stats.vmem_read_reuses;
+    uint8_t coalesced[12288];
+    assert(!hv_vmem_xfer(&cpu, span_va + 4090, coalesced, sizeof coalesced, 0, 1, 0));
+    assert(m.stats.vmem_read_reuses == reused + 1);
+    for (unsigned i=0; i<sizeof coalesced; i++) assert(coalesced[i] == 0x35);
+    reused = m.stats.vmem_read_reuses;
+    assert(!hv_vmem_xfer(&cpu, span_va + 16380, readback, 8, 0, 1, 0));
+    assert(m.stats.vmem_read_reuses > reused);
+    assert(readback[0] == 0x35 && readback[3] == 0x35 && readback[4] == 0x6a && readback[7] == 0x6a);
+    *span_leaf = 0x50004000 | PAGE | AF | AP(1);
+    hv_tlb_flush_va_page(&cpu, span_va, -1);
+    assert(!hv_tlb_read_span(&cpu, span_va, 8, 1));
+    assert(!hv_vmem_xfer(&cpu, span_va, readback, 8, 0, 1, 0) && readback[0] == 0x6a);
+    cpu.pstate_extra |= HV_PSTATE_PAN;
+    assert(!hv_tlb_read_span(&cpu, span_va, 8, 1));
+    assert(hv_mmu_access(&cpu, span_va, HV_ACC_READ, 1, &pa) == HV_FSC_PERMISSION(3));
+    cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+    m.stats_interval = saved_stats;
+    checks += 9;
+    puts("  real cached helper: coalesced 16K spans, page crossing, remap and PAN views passed");
 
     /* 4 KB granule, 39-bit TTBR0 (levels 1-3): pages, 2 MB and 1 GB blocks. */
     pt_next = 2 * 65536;
@@ -349,35 +386,44 @@ int main(void) {
         hv_self = self;
     }
 
-    /* A code change unchains the exits from other pages chained into its page, and only those: each page's are a list
-       (HvRam.xhead through slot_xnext), as chain() in dispatch.c makes it. */
+    /* Real checked fills note physical-page aliases, and posted code-page
+       drops preserve unrelated targets. An overflowing queue must reset all. */
     {
+        static HvCpu target;
+        hv_cpu_reset_index(&target, &m, 1);
+        target.tcr_el1 = 0; target.ttbr0_el1 = 7ull << 48;
+        hv_ijc_switch(&target);
         HvRam *r = &m.ram[0];
-        uint32_t base = m.nslots + 16, pages[4] = {10, 11, 10, 10}, n0 = m.nxchained;
-        for (uint32_t i = 0; i < 4; i++) {
-            uint32_t idx = base + i, pg = pages[i];
-            m.slots[idx] = 0x1000 + i;
-            m.slot_site[idx] = NULL;
-            m.slot_xpa[idx] = (r->pa + ((uint64_t)pg << 14)) | 1;
-            m.slot_xnext[idx] = r->xhead[pg];
-            r->xhead[pg] = idx + 1;
-            m.nxchained++;
+        const uint64_t va[3] = {0x100004000ull, 0x100008000ull, 0x100014000ull};
+        const unsigned pg[3] = {10, 11, 10};
+        HvBlock block[3]; uint64_t *entry[3];
+        r->ijc_va[10] = r->ijc_va[11] = 0;
+        for (int i=0;i<3;i++) {
+            uint64_t pa=r->pa+((uint64_t)pg[i]<<14);
+            int64_t addend=(int64_t)(uintptr_t)(r->host+(pa-r->pa))-(int64_t)va[i];
+            HvTlbEntry *t=hv_tlb_ent(&target,(va[i]>>14)&(HV_TLB_SIZE-1),0);
+            *t=(HvTlbEntry){.read_tag=HV_TLB_INVALID,.write_tag=HV_TLB_INVALID,
+                .exec_tag=hv_exec_key(va[i],addend),.addend=addend};
+            block[i]=(HvBlock){.va=va[i],.pa=pa,.ram=r,.pg=pg[i],.gen=r->page_gen[pg[i]],.code=(uint32_t *)(uintptr_t)0x1234};
+            checks++; if(!hv_ijc_fill_checked(&target,&block[i]))printf("  FAIL checked IJC fill %d\n",i),failures++;
+            entry[i]=target.pc_state->ijc+(size_t)hv_ijc_index(va[i]^target.ijc_salt[0])*2;
         }
-        r->code_pages[10] = 1;
-        hv_invalidate_code(&m, r->pa + (10ull << 14) + 0x40);
-        for (uint32_t i = 0; i < 4; i++) {
-            int gone = m.slots[base + i] == 0 && m.slot_xpa[base + i] == 0;
-            checks++;
-            if (gone != (pages[i] == 10)) printf("  FAIL code change %s an exit chained into page %u\n", gone ? "unchained" : "kept", pages[i]), failures++;
-        }
-        checks += 3;
-        if (r->xhead[10]) printf("  FAIL the changed page's list is not empty\n"), failures++;
-        if (r->xhead[11] != base + 2) printf("  FAIL the other page's list changed\n"), failures++;
-        if (m.nxchained != n0 + 1) printf("  FAIL chained count %u, want %u\n", m.nxchained, n0 + 1), failures++;
-        r->code_pages[11] = 1;
-        hv_invalidate_code(&m, r->pa + (11ull << 14));
-        checks++;
-        if (m.slots[base + 1] || r->xhead[11] || m.nxchained != n0) printf("  FAIL the second page's exit stayed chained\n"), failures++;
+        checks++;if(r->ijc_va[10]!=~0ull)printf("  FAIL physical-page aliases did not require full invalidation\n"),failures++;
+        uint64_t salt=target.ijc_salt[0];
+        hv_cpu_post_ijc_page(&target,va[0]|2);
+        hv_cpu_process_requests(&target);
+        checks+=3;
+        if(entry[0][0]==(va[0]^salt))printf("  FAIL posted page kept affected target\n"),failures++;
+        if(entry[1][0]!=(va[1]^salt))printf("  FAIL posted page dropped unrelated target\n"),failures++;
+        if(target.pc_state->ack_seq!=target.pc_state->req_seq)printf("  FAIL posted page not acknowledged\n"),failures++;
+        // The generation check rejects a block after its physical code changed.
+        block[0].gen=r->page_gen[10]-1;
+        checks++;if(hv_ijc_fill_checked(&target,&block[0]))printf("  FAIL stale block entered IJC\n"),failures++;
+        for(int i=0;i<17;i++)hv_cpu_post_ijc_page(&target,va[0]+((uint64_t)i<<14)|2);
+        checks++;if(!(target.pc_state->req_flags&HV_REQ_IJC_RESET))printf("  FAIL overflowing page queue lacks reset fallback\n"),failures++;
+        hv_cpu_process_requests(&target);
+        checks++;if(entry[1][0]==(va[1]^target.ijc_salt[0]))printf("  FAIL overflowing page queue retained a target\n"),failures++;
+        printf("  checked IJC aliases, stale generation, posted selective drop, acknowledgement and queue-overflow fallback exercised\n");
     }
 
     /* Another CPU's big range TLBI (64 user pages of ASID 5: over the 32 done from here by default). With HV_RANGE_DROP it is done from here in one pass:

@@ -10,6 +10,7 @@
    when the guest has posted receive buffers. */
 #include "net_slirp.h"
 #include "dns_proxy.h"
+#include "scheduling.h"
 #include "share.h"
 
 #include <arpa/inet.h>
@@ -67,11 +68,13 @@ void hv_net_set_share_socket(const char *path) {
 }
 
 static int push(Queue *q, const uint8_t *data, uint32_t len) {
+    if (!data || !len || len > MAX_FRAME) return 0;
     pthread_mutex_lock(&q->mu);
     int ok = q->tail - q->head < QUEUE;
     if (ok) {
         Frame *f = &q->f[q->tail % QUEUE];
         f->data = malloc(len);
+        if (!f->data) { pthread_mutex_unlock(&q->mu); return 0; }
         memcpy(f->data, data, len);
         f->len = len;
         q->tail++;
@@ -201,6 +204,7 @@ static const SlirpCb callbacks = {
 
 static void *net_thread(void *unused) {
     (void)unused;
+    hv_schedule_aux_start(HV_ROLE_NETWORK);
     while (!atomic_load(&stopping)) {
         uint32_t timeout = 1000;
         int64_t now = now_ms();
@@ -264,18 +268,27 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
 
 void hv_net_poll(void) {
     if (!net) return;
+    enum { BATCH=32 };
     for (;;) {
+        const uint8_t *frames[BATCH];
+        uint32_t lengths[BATCH];
+        unsigned count=0;
         pthread_mutex_lock(&to_guest.mu);
-        Frame f = {0, NULL};
-        if (to_guest.head != to_guest.tail) f = to_guest.f[to_guest.head % QUEUE];
+        uint32_t head=to_guest.head,tail=to_guest.tail;
+        while(head!=tail&&count<BATCH) {
+            Frame f=to_guest.f[head++ % QUEUE];
+            frames[count]=f.data;lengths[count++]=f.len;
+        }
         pthread_mutex_unlock(&to_guest.mu);
-        if (!f.data) return;
-        if (!hv_virtio_net_receive(net, f.data, f.len)) return; /* no buffer posted yet: try again later */
-        hv_net_rx_frames++;
+        if(!count)return;
+        int consumed=hv_virtio_net_receive_batch(net,frames,lengths,(int)count);
+        if(!consumed)return; /* no receive buffers: preserve the complete queue */
+        hv_net_rx_frames+=(uint32_t)consumed;
         pthread_mutex_lock(&to_guest.mu);
-        to_guest.head++;
+        to_guest.head+=(uint32_t)consumed;
         pthread_mutex_unlock(&to_guest.mu);
-        free(f.data);
+        for(int i=0;i<consumed;i++)free((void *)frames[i]);
+        if((unsigned)consumed<count)return;
     }
 }
 
@@ -285,6 +298,8 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     atomic_store(&stopping, 0);
     hv_dns_proxy_start();
     hv_net_tx_frames = hv_net_rx_frames = 0;
+    hv_dns_proxy_reset();
+    fprintf(stderr, "hengevm: dns: host resolver=%s; bounded IPv4/UDP/DNS parser; failed queries fall back to libslirp; query names are not logged\n", hv_dns_proxy_on() ? "on" : "off");
     pthread_mutex_init(&to_guest.mu, NULL);
     pthread_mutex_init(&to_host.mu, NULL);
     queues_initialized = 1;

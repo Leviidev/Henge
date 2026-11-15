@@ -35,20 +35,22 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 #include "pvg_lite.h"
+#include "pvg_link.h"
+#include "trace_gate.h"
 #include <mach/mach_time.h>
 
+#include <stdlib.h>
+
 int hv_pvg_trace_on(void) {
-    static const char *tf;
-    static int read, on;
-    static _Atomic uint64_t next;
-    if (!read) read = 1, tf = getenv("HV_PVG_TRACE_FILE");
-    if (!tf) return 0;
-    uint64_t now = mach_absolute_time();
-    if (now >= atomic_load_explicit(&next, memory_order_relaxed)) {
-        on = access(tf, F_OK) == 0;
-        atomic_store_explicit(&next, now + 2400000, memory_order_relaxed); /* 100 ms of 24 MHz ticks */
-    }
-    return on;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static HvTraceGate gate;
+    static const char *path;
+    static int initialized;
+    os_unfair_lock_lock(&lock);
+    if (!initialized) { path = getenv("HV_PVG_TRACE_FILE"); initialized = 1; }
+    int enabled = hv_trace_file_enabled(&gate, path, (double)mach_absolute_time() / 24000000.0);
+    os_unfair_lock_unlock(&lock);
+    return enabled;
 }
 
 #include <stdio.h>
@@ -68,8 +70,8 @@ struct HvPvgLite {
     uint64_t io_regs[0x40 / 8];
     uint32_t root_rp, status, chan_pending;
     int root_pending, iosfc_pending;
-    uint64_t display_pa;
-    uint64_t swaps;
+    HvPvgDisplayState displays[HV_PVG_DISPLAY_PORTS];
+    uint32_t display_count, display_pending;
     /* The last stamp handed to the worker per channel, and who is being drained. */
     uint32_t submitted[MAX_CHANNELS];
     uint32_t draining;
@@ -156,77 +158,91 @@ static void ring_read(HvPvgLite *p, const uint32_t *table, uint32_t size, uint32
     }
 }
 
-/* The one mode the display offers. macOS takes the size it is given at boot. */
-static uint32_t display_w = 1920, display_h = 1080;
-/* The panel's real size, when known: macOS works out the pixel density from it and
-   picks HiDPI (2x) for a Retina-dense panel, as on a real Mac. 0 = the old 400 mm. */
-static uint32_t display_mm_w, display_mm_h;
-
-void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm) {
-    display_mm_w = width_mm;
-    display_mm_h = height_mm;
+/* Configuration is copied into the board at creation; it is not changed by a
+   network callback while a guest is running. Port zero remains the default. */
+static HvPvgDisplayMode display_modes[HV_PVG_DISPLAY_PORTS]={{1920,1080,0,0,60},{0}};
+static uint32_t configured_displays=1;
+void hv_pvg_lite_set_size_mm(uint32_t w,uint32_t h){display_modes[0].width_mm=w;display_modes[0].height_mm=h;}
+void hv_pvg_lite_set_mode(uint32_t w,uint32_t h){display_modes[0].width=w;display_modes[0].height=h;}
+int hv_pvg_lite_set_link_mode(uint32_t w,uint32_t h,uint32_t mmw,uint32_t mmh,uint32_t hz){
+    if(!w&&!h){configured_displays=1;memset(&display_modes[1],0,sizeof display_modes[1]);return 0;}
+    HvPvgDisplayMode mode={w,h,mmw,mmh,hz};if(!hv_pvg_mode_valid(mode))return -1;
+    display_modes[1]=mode;configured_displays=2;return 0;
+}
+int hv_pvg_lite_port_mode(HvPvgLite *p,uint32_t port,HvPvgDisplayMode *out){
+    if(!p || !out || port>=p->display_count)return -1;
+    *out=p->displays[port].mode;return 0;
+}
+uint8_t *hv_pvg_lite_display_page_for_port(HvPvgLite *p,uint32_t port){
+    if(!p||port>=p->display_count)return NULL;
+    uint64_t pa=__atomic_load_n(&p->displays[port].page,__ATOMIC_ACQUIRE);return pa ? hv_phys_ptr(p->m,pa,0x4000) : NULL;
+}
+void hv_pvg_lite_mode(uint32_t *width, uint32_t *height) {
+    *width = display_modes[0].width;
+    *height = display_modes[0].height;
 }
 
-void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
-    display_w = width;
-    display_h = height;
+static void display_set_page(HvPvgLite *p,uint32_t port,uint64_t pa){
+    if(port>=p->display_count)return;
+    uint8_t *d=hv_phys_ptr(p->m,pa,0x4000);if(!d)return;
+    p->displays[port].port=port;
+    if(port==0)p->displays[port].sequence=0; /* retain the original primary-port sequence contract */
+    hv_pvg_display_publish(&p->displays[port],d);__atomic_store_n(&p->displays[port].page,pa,__ATOMIC_RELEASE);
+    fprintf(stderr,"henge-link: port=%u mode=%ux%u hz=%u state-page-ready header-port=%u\n",port,p->displays[port].mode.width,p->displays[port].mode.height,p->displays[port].mode.hz,p->displays[port].port);
+}
+static void display_ack(HvPvgLite *p,uint32_t port,uint32_t seq){
+    uint8_t *d=hv_pvg_lite_display_page_for_port(p,port);if(!d)return;
+    if(port && seq!=p->displays[port].sequence)return;
+    if(port==1)fprintf(stderr,"henge-link: port=1 guest acknowledged mode sequence=%u\n",seq);
+    memcpy(d+0xfbc,&seq,4);d[0xfa9]=0;uint32_t state=p->displays[port].connected ? 2 : 0;memcpy(d+0xfc0,&state,4);
+}
+void hv_pvg_lite_apply_link_connected(HvPvgLite *p,int connected){
+    if(!p||p->display_count<2||p->displays[1].connected==!!connected)return;
+    p->displays[1].connected=!!connected;
+    uint8_t *d=hv_pvg_lite_display_page_for_port(p,1);
+    if(d){hv_pvg_display_publish(&p->displays[1],d);__atomic_fetch_or(&p->display_pending,2,__ATOMIC_ACQ_REL);hv_gicv3_pend(p->gic,p->gfx_irq);}
+    fprintf(stderr,"henge-link: port=1 connected=%d mode-change=%u\n",!!connected,p->displays[1].sequence);
+}
+void hv_pvg_lite_mirror_refresh(HvPvgLite *p){
+    if(p&&p->metal)hv_pvg_metal_mirror_refresh(p->metal);
+}
+void hv_pvg_lite_link_connected(HvPvgLite *p,int connected){
+    if(p&&p->metal)hv_pvg_metal_link_connected(p->metal,connected);
+}
+void hv_pvg_lite_trim_memory(HvPvgLite *p) {
+    if (p && p->metal) hv_pvg_metal_trim_memory(p->metal);
+}
+void hv_pvg_lite_set_display_paused(HvPvgLite *p, int paused) {
+    if (!p) return;
+    HvPvgMetal *metal = atomic_load_explicit(&p->metal, memory_order_acquire);
+    if (metal) hv_pvg_metal_set_display_paused(metal, paused);
 }
 
-static void display_set_page(HvPvgLite *p, uint64_t pa) {
-    uint8_t *d = hv_phys_ptr(p->m, pa, 0x4000);
-    if (!d) return;
-    p->display_pa = pa;
-#define PUT32(off, v) (*(uint32_t *)(d + (off)) = (uint32_t)(v))
-#define PUTF(off, v) (*(float *)(d + (off)) = (v))
-    PUT32(0x00, 1);
-    uint32_t width_mm = 400, height_mm = 400 * display_h / display_w; /* the same pixel density at any shape */
-    if (display_mm_w && display_mm_h) width_mm = display_mm_w, height_mm = display_mm_h;
-    PUT32(0x14, height_mm << 16 | width_mm);
-    PUT32(0x18, 0x01000100);
-    PUT32(0x1c, 0x400);
-    PUT32(0x20, 3);
-    PUTF(0x24, (float)width_mm);
-    PUTF(0x28, (float)height_mm);
-    PUT32(0x208, 1); /* one mode: */
-    PUT32(0x210, display_h << 16 | display_w);
-    {   /* m4 fork: 120 Hz on ProMotion (HV_HZ), so WindowServer animates at the panel's rate */
-        const char *hz = getenv("HV_HZ");
-        uint32_t r = hz && atoi(hz) > 0 ? (uint32_t)atoi(hz) : 60;
-        PUT32(0x214, r << 16);
-    }
-    PUTF(0xa10, 1.0f); /* identity colour matrix */
-    PUTF(0xa24, 1.0f);
-    PUTF(0xa38, 1.0f);
-    d[0xa73] = 1;
-    PUT32(0x200, 1); /* the mode list's sequence number, which the guest acks */
-    d[0xfa9] = 1;    /* ack pending */
-    PUT32(0xfc0, 1); /* state: told the guest, waiting for the ack */
-    __atomic_store_n((uint32_t *)(d + 0x100), 4, __ATOMIC_RELEASE); /* mode change: read when the guest sets its mask */
-#undef PUT32
-#undef PUTF
+int hv_pvg_lite_capture_timing(HvPvgLite *p,int capture,uint64_t out[4]) {
+    HvPvgMetal *metal=p ? atomic_load_explicit(&p->metal,memory_order_acquire):NULL;
+    return metal ? hv_pvg_metal_capture_timing(metal,capture,out):0;
+}
+int hv_pvg_lite_gpu_snapshot(HvPvgLite *p,uint64_t out[4]) {
+    HvPvgMetal *metal=p?p->metal:NULL;
+    return hv_pvg_metal_gpu_snapshot(metal,out);
 }
 
-static void display_ack(HvPvgLite *p, uint32_t seq) {
-    uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
-    if (!d) return;
-    *(uint32_t *)(d + 0xfbc) = seq;
-    d[0xfa9] = 0;
-    *(uint32_t *)(d + 0xfc0) = 2;
-}
 
 static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n);
 static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
-    uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
-    if (!d) return;
+    uint32_t port=args[0];
+    uint8_t *d=hv_pvg_lite_display_page_for_port(p,port);
+    if(!d)return;
+    HvPvgDisplayState *display=&p->displays[port];
     memcpy(d + 0xf80, args + 4, 16); /* gamma table offset, length */
     memcpy(d + 0xf90, args + 8, 8);  /* gamma entries, sum */
     {   /* m4 fork: say what the gamma table is whenever it changes (colour is washed out without it) */
-        static uint32_t last[6];
-        if (memcmp(last, args + 4, sizeof last)) {
-            memcpy(last, args + 4, sizeof last);
+        static uint32_t last[HV_PVG_DISPLAY_PORTS][6];
+        if (memcmp(last[port], args + 4, sizeof last[port])) {
+            memcpy(last[port], args + 4, sizeof last[port]);
             uint64_t off = (uint64_t)args[5] << 32 | args[4], len = (uint64_t)args[7] << 32 | args[6];
             fprintf(stderr, "hvgamma: swap %llu port %u w1 %#x off %#llx len %#llx count %u sum %#x\n",
-                    (unsigned long long)p->swaps, args[0], args[1], (unsigned long long)off, (unsigned long long)len, args[8], args[9]);
+                    (unsigned long long)display->swaps, args[0], args[1], (unsigned long long)off, (unsigned long long)len, args[8], args[9]);
             fprintf(stderr, "hvgamma: args");
             for (int i = 0; i < 10; i++) fprintf(stderr, " %08x", args[i]);
             fprintf(stderr, "\n");
@@ -265,11 +281,12 @@ static void display_swap(HvPvgLite *p, uint64_t mapping, const uint32_t *args) {
             fprintf(stderr, "\n");
         }
     }
-    p->swaps++;
-    *(uint32_t *)(d + 0xf98) = (uint32_t)p->swaps;
+    if(port==1 && !display->swaps)fprintf(stderr,"henge-link: port=1 first independent swap mapping=%llu\n",(unsigned long long)mapping);
+    display->swaps++;
+    *(uint32_t *)(d + 0xf98) = (uint32_t)display->swaps;
     *(uint32_t *)(d + 0xfb0) = (uint32_t)mapping;
     __atomic_fetch_or((uint32_t *)(d + 0x100), 2, __ATOMIC_RELEASE);
-    if (p->log) fprintf(stderr, "hengevm: pvg-lite: swap %llu: mapping %llu\n", (unsigned long long)p->swaps, (unsigned long long)mapping);
+    if (p->log) fprintf(stderr, "hengevm: pvg-lite: swap %llu: mapping %llu\n", (unsigned long long)display->swaps, (unsigned long long)mapping);
 }
 
 /* Task memory: the root page holds {table page, depth}; each level has 4096
@@ -282,6 +299,7 @@ static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *av
     uint32_t page = root[0], depth = root[1];
     if (depth < 1 || depth > 3) return NULL;
     uint64_t vpn = off >> 14;
+    if (vpn >= (1ull << (12 * depth))) return NULL;
     for (int level = (int)depth - 1; level >= 0; level--) {
         uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
         if (!t) return NULL;
@@ -294,14 +312,15 @@ static uint8_t *task_ptr(HvPvgLite *p, uint32_t task, uint64_t off, uint32_t *av
 }
 
 static int task_read(HvPvgLite *p, uint32_t task, uint64_t off, void *to, uint32_t n) {
+    if (n && off > UINT64_MAX - (n - 1)) return -1;
     uint8_t *d = to;
     while (n) {
         uint32_t avail = 0;
         uint8_t *q = task_ptr(p, task, off, &avail);
         if (!q) return -1;
         uint32_t c = n < avail ? n : avail;
-        memcpy(d, q, c);
-        d += c, off += c, n -= c;
+        if (d) { memcpy(d, q, c); d += c; }
+        off += c, n -= c;
     }
     return 0;
 }
@@ -317,6 +336,7 @@ uint32_t hv_pvg_lite_task_page(HvPvgLite *p, uint32_t task, uint64_t offset) {
     uint32_t page = root[0], depth = root[1];
     if (depth < 1 || depth > 3) return 0;
     uint64_t vpn = offset >> 14;
+    if (vpn >= (1ull << (12 * depth))) return 0;
     for (int level = (int)depth - 1; level >= 0; level--) {
         uint32_t *t = page ? hv_phys_ptr(p->m, (uint64_t)page << 14, 0x4000) : NULL;
         if (!t) return 0;
@@ -333,6 +353,9 @@ void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_
     if (!root) return;
     uint32_t top = root[0], depth = root[1];
     if (depth < 1 || depth > 3) return;
+    uint64_t limit = 1ull << (12 * depth);
+    if (first >= limit) return;
+    if (n > limit - first) n = limit - first;
     for (uint64_t i = 0; i < n;) {
         uint64_t vpn = first + i;
         uint32_t page = top;
@@ -553,8 +576,8 @@ static void channel_command(HvPvgLite *p, const uint32_t *table, uint32_t size, 
     if (op != 1 && op != 2 && op != 8) return;
     memset(args, 0, sizeof args);
     ring_read(p, table, size, rd + 12 + skip, args, n);
-    if (op == 1) display_set_page(p, (uint64_t)args[1] << 14);
-    else if (op == 2) display_ack(p, args[1]);
+    if (op == 1) display_set_page(p, args[0], (uint64_t)args[1] << 14);
+    else if (op == 2) display_ack(p, args[0], args[1]);
     else display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
 }
 
@@ -570,16 +593,20 @@ const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t mapping) {
 }
 
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) {
-    return p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
+    return hv_pvg_lite_display_page_for_port(p,0);
 }
 
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *cmd, uint32_t len) {
     uint32_t op = cmd[0] & 0xffff, skip = (cmd[0] >> 16) * 8;
     uint32_t n = len > 12 + skip ? len - 12 - skip : 0;
     const uint32_t *args = (const uint32_t *)((const uint8_t *)cmd + 12 + skip);
-    if (op == 1 && n >= 8) display_set_page(p, (uint64_t)args[1] << 14);
-    else if (op == 2 && n >= 8) display_ack(p, args[1]);
-    else if (op == 8 && n >= 16) display_swap(p, (uint64_t)args[3] << 32 | args[2], args);
+    if (op == 1 && n >= 8) display_set_page(p, args[0], (uint64_t)args[1] << 14);
+    else if (op == 2 && n >= 8) display_ack(p, args[0], args[1]);
+    else if (op == 8 && n >= 16) {
+        uint32_t bounded[10]={0};
+        memcpy(bounded,args,n < sizeof bounded ? n : sizeof bounded);
+        display_swap(p,(uint64_t)bounded[3]<<32|bounded[2],bounded);
+    }
 }
 
 /* The Metal side, made the first time the guest's GPU work needs it. */
@@ -595,6 +622,7 @@ static void ensure_metal(HvPvgLite *p) {
 }
 
 static void do_channel(HvPvgLite *p, uint32_t ch) {
+
     uint64_t root = (uint64_t)reg(p, 0x101c) << 14, buf = (uint64_t)reg(p, 0x1030) << 14;
     if (!root || !buf || !ch) return;
     uint32_t *rec = hv_phys_ptr(p->m, root + 0x400 + 0x14 * (ch - 1), 0x14);
@@ -720,8 +748,8 @@ static void vblank(HvPvgLite *p) {
         uint64_t r = hz && atoi(hz) > 0 ? (uint64_t)atoi(hz) : 60;
         period = 24000000ull / r; /* host counter ticks (24 MHz) */
     }
-    if (!on || !p->display_pa) return;
-    uint8_t *d = hv_phys_ptr(p->m, p->display_pa, 0x4000);
+    if (!on) return;
+    uint8_t *d = hv_pvg_lite_display_page_for_port(p, 0);
     if (!d || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
     uint64_t now = mach_absolute_time();
     if (now < next) return;
@@ -733,6 +761,7 @@ static void vblank(HvPvgLite *p) {
 
 void hv_pvg_lite_poll(HvPvgLite *p) {
     if (!p) return;
+
     vblank(p);
     uint32_t chans = p->chan_pending;
     if (chans) {
@@ -748,13 +777,14 @@ static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
     uint64_t v = 0;
     switch (off) {
     case 0x100c:
-        do_root(p); /* the driver spins on this waiting for ring space */
+        do_root(p); /* the driver's normal ring backpressure */
         v = p->root_rp;
         break;
     case 0x1018:
         v = __atomic_exchange_n(&p->status, 0, __ATOMIC_ACQ_REL);
         break;
-    case 0x122c: v = 1; break;
+    case 0x1014: v = p->display_count==1 ? p->regs[0x14/4] : __atomic_exchange_n(&p->display_pending,0,__ATOMIC_ACQ_REL); break;
+    case 0x122c: v = p->display_count; break;
     default:
         if (off >= 0x1000 && off < 0x2000) v = p->regs[(off - 0x1000) / 4];
         break;
@@ -767,6 +797,7 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvPvgLite *p = opaque;
     (void)size;
     if (off >= 0x1000 && off < 0x2000) p->regs[(off - 0x1000) / 4] = (uint32_t)v;
+
     /* Doorbells are answered here, on the CPU that rang: no waiting for CPU 0 to come by. */
     if (off == 0x1008) {
         do_root(p);
@@ -777,7 +808,10 @@ static void gfx_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     } else if (p->log && off != 0x1020) {
         fprintf(stderr, "hengevm: pvg-lite: write +%llx = %llx\n", (unsigned long long)off, (unsigned long long)v);
     }
-    if (off == 0x1220 && p->metal) hv_pvg_metal_cursor_moved(p->metal); /* the display's doorbell: the pointer moved */
+    if (off == 0x1220 && p->metal) {
+        hv_pvg_metal_cursor_moved(p->metal);
+        if(p->display_count>1)hv_pvg_metal_link_cursor_moved(p->metal);
+    } /* the display's doorbell: the pointer moved */
 }
 
 static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
@@ -802,12 +836,17 @@ HvPvgLite *hv_pvg_lite_create(HvMachine *m, HvGic *gic, uint64_t gfx_pa, uint64_
     p->gic = gic;
     p->gfx_irq = gfx_irq;
     p->iosfc_irq = iosfc_irq;
+    p->display_count=configured_displays;
+    const char *hz=getenv("HV_HZ");if(hz&&atoi(hz)>0)display_modes[0].hz=(uint32_t)atoi(hz);
+    for(uint32_t i=0;i<p->display_count;i++){p->displays[i].mode=display_modes[i];p->displays[i].connected=1;p->displays[i].port=i;}
     p->log = getenv("HV_PVG_LITE_LOG") != NULL;
     p->tally = getenv("HV_PVG_TALLY") != NULL;
     hv_machine_add_mmio(m, gfx_pa, 0x10000, p, gfx_read, gfx_write, "gfx");
     hv_machine_add_mmio(m, iosfc_pa, 0x10000, p, iosfc_read, iosfc_write, "iosurface");
     return p;
 }
+
+void hv_pvg_lite_log_metrics(HvPvgLite *p) { if (p && p->metal) hv_pvg_metal_log_metrics(p->metal); }
 
 void hv_pvg_lite_destroy(HvPvgLite *p) {
     if (!p) return;
@@ -823,7 +862,8 @@ typedef struct PvgState {
     uint64_t io_regs[0x40 / 8];
     uint32_t root_rp, status, chan_pending, draining, stamps_pending;
     int root_pending, iosfc_pending, old_driver;
-    uint64_t display_pa, swaps;
+    HvPvgDisplayState displays[HV_PVG_DISPLAY_PORTS];
+    uint32_t display_count, display_pending;
     uint32_t submitted[MAX_CHANNELS], barrier_waits[MAX_CHANNELS];
     uint32_t task_root[512];
     uint64_t task_objects[512], task_placement[512];
@@ -838,7 +878,9 @@ size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap) {
     s->root_rp = p->root_rp, s->status = __atomic_load_n(&p->status, __ATOMIC_ACQUIRE), s->chan_pending = p->chan_pending;
     s->draining = p->draining, s->stamps_pending = p->stamps_pending;
     s->root_pending = p->root_pending, s->iosfc_pending = p->iosfc_pending, s->old_driver = p->old_driver;
-    s->display_pa = p->display_pa, s->swaps = p->swaps;
+    memcpy(s->displays, p->displays, sizeof s->displays);
+    s->display_count = p->display_count;
+    s->display_pending = p->display_pending;
     memcpy(s->submitted, p->submitted, sizeof s->submitted);
     memcpy(s->barrier_waits, p->barrier_waits, sizeof s->barrier_waits);
     memcpy(s->task_root, p->task_root, sizeof s->task_root);
@@ -850,12 +892,17 @@ size_t hv_pvg_lite_state(HvPvgLite *p, void *out, size_t cap) {
 int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
     if (len != sizeof(PvgState)) return -1;
     const PvgState *s = in;
+    if (!s->display_count || s->display_count > HV_PVG_DISPLAY_PORTS) return -1;
     memcpy(p->regs, s->regs, sizeof s->regs);
     memcpy(p->io_regs, s->io_regs, sizeof s->io_regs);
     p->root_rp = s->root_rp, p->status = s->status, p->chan_pending = s->chan_pending;
     p->draining = s->draining, p->stamps_pending = s->stamps_pending;
     p->root_pending = s->root_pending, p->iosfc_pending = s->iosfc_pending, p->old_driver = s->old_driver;
-    p->display_pa = s->display_pa, p->swaps = s->swaps;
+    memcpy(p->displays, s->displays, sizeof p->displays);
+    p->display_count = s->display_count;
+    p->display_pending = s->display_pending;
+    /* Never resurrect a stale network viewer after restoring guest RAM. */
+    if (p->display_count > 1) p->displays[1].connected = 0;
     memcpy(p->submitted, s->submitted, sizeof s->submitted);
     memcpy(p->barrier_waits, s->barrier_waits, sizeof s->barrier_waits);
     memcpy(p->task_root, s->task_root, sizeof s->task_root);
@@ -865,9 +912,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
 }
 
 /* CPUs stopped: the GPU's queued work done, and what only it holds copied into guest memory. */
-void hv_pvg_lite_quiesce(HvPvgLite *p) {
+int hv_pvg_lite_quiesce(HvPvgLite *p) {
     HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
-    if (metal) hv_pvg_metal_quiesce(metal);
+    return metal ? hv_pvg_metal_quiesce(metal) : 0;
 }
 
 size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
@@ -876,11 +923,11 @@ size_t hv_pvg_lite_display_state(HvPvgLite *p, void *out, size_t cap) {
 }
 
 /* After hv_pvg_lite_set_state: the screen and the pointer as they were, before the guest draws again. */
-void hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len) {
-    if (!p || !len) return;
+int hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len) {
+    if (!p || !len) return -1;
     ensure_metal(p);
     HvPvgMetal *metal = atomic_load_explicit(&p->metal, memory_order_acquire);
-    if (metal) hv_pvg_metal_set_display_state(metal, in, len);
+    return metal ? hv_pvg_metal_set_display_state(metal, in, len) : -1;
 }
 
 /* Debugging (the Mac runner's devstate): each channel's ring and stamps, to tell work never taken from work never
@@ -888,7 +935,7 @@ void hv_pvg_lite_set_display_state(HvPvgLite *p, const void *in, size_t len) {
 void hv_pvg_lite_debug(HvPvgLite *p, FILE *f) {
     if (!p) return;
     uint64_t root = (uint64_t)reg(p, 0x101c) << 14, buf = (uint64_t)reg(p, 0x1030) << 14;
-    const uint8_t *d = p->display_pa ? hv_phys_ptr(p->m, p->display_pa, 0x4000) : NULL;
+    const uint8_t *d = hv_pvg_lite_display_page_for_port(p, 0);
     if (d) fprintf(f, "devstate pvg display: +100 %x +104 %x +108 %x +10c %x +f98 %x +fb0 %x +fa9 %x +fbc %x +fc0 %x\n",
                    *(const uint32_t *)(d + 0x100), *(const uint32_t *)(d + 0x104), *(const uint32_t *)(d + 0x108),
                    *(const uint32_t *)(d + 0x10c), *(const uint32_t *)(d + 0xf98), *(const uint32_t *)(d + 0xfb0), d[0xfa9],
@@ -896,7 +943,7 @@ void hv_pvg_lite_debug(HvPvgLite *p, FILE *f) {
     fprintf(f, "devstate pvg: vblanks %llu\n", (unsigned long long)p->vblanks);
     fprintf(f, "devstate pvg: status %x chan_pending %x draining %x stamps_pending %x root_rp %x metal %p swaps %llu\n",
             __atomic_load_n(&p->status, __ATOMIC_ACQUIRE), p->chan_pending, p->draining, p->stamps_pending, p->root_rp,
-            (void *)atomic_load(&p->metal), (unsigned long long)p->swaps);
+            (void *)atomic_load(&p->metal), (unsigned long long)p->displays[0].swaps);
     for (uint32_t ch = 1; root && buf && ch < MAX_CHANNELS; ch++) {
         uint32_t *rec = hv_phys_ptr(p->m, root + 0x400 + 0x14 * (ch - 1), 0x14);
         uint32_t *stamp = guest32(p, buf + 4 * ch);

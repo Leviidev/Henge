@@ -25,7 +25,12 @@
    segments of one direction, skipping `off` bytes of them, `len` bytes in all.
    Returns 0, or -1 on a host error or a buffer outside guest RAM. */
 static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t off, uint64_t disk_off, uint32_t len) {
-    for (int s = 0; s < e->nseg && len; s++) {
+    if (e->nseg < 0 || e->nseg > HV_VIRTQ_MAX_SEGS || disk_off > b->disk->size || len > b->disk->size - disk_off) return -1;
+    struct iovec iov[HV_VIRTQ_MAX_SEGS];
+    uint64_t address[HV_VIRTQ_MAX_SEGS];
+    int count = 0;
+    uint32_t remaining = len;
+    for (int s = 0; s < e->nseg && remaining; s++) {
         const HvVirtqSeg *g = &e->seg[s];
         if (g->write != writable) continue;
         if (off >= g->len) {
@@ -33,17 +38,43 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
             continue;
         }
         uint32_t n = g->len - off;
-        if (n > len) n = len;
-        void *p = hv_phys_ptr(b->vio.m, g->addr + off, n);
+        if (n > remaining) n = remaining;
+        if (g->addr > UINT64_MAX - off) return -1;
+        uint64_t addr = g->addr + off;
+        void *p = hv_phys_ptr(b->vio.m, addr, n);
         if (!p) return -1;
-        int r = writable ? hv_disk_read(b->disk, disk_off, p, n) : hv_disk_write(b->disk, disk_off, p, n);
-        if (writable && r == 0) hv_dma_written(b->vio.m, g->addr + off, n);
-        if (r != 0) return -1;
-        disk_off += n;
-        len -= n;
+        /* Adjacent descriptors often describe pages of one guest buffer. One
+           syscall can transfer them directly without a staging copy. Do not
+           cross request/direction boundaries or the final status byte. Validate
+           the combined RAM span; separate RAM regions retain the old path. */
+        while (n < remaining && s + 1 < e->nseg) {
+            const HvVirtqSeg *next = &e->seg[s + 1];
+            if (next->write != writable || addr > UINT64_MAX - n || next->addr != addr + n) break;
+            uint32_t extra = next->len < remaining - n ? next->len : remaining - n;
+            if (extra && !hv_phys_ptr(b->vio.m, addr, (uint64_t)n + extra)) break;
+            n += extra;
+            s++;
+        }
+        if (n) { iov[count] = (struct iovec){p,n}; address[count++] = addr; }
+        remaining -= n;
         off = 0;
     }
-    return len ? -1 : 0;
+    /* Validate the ENTIRE chain before allowing I/O. Keep disjoint guest/RAM
+       mappings as separate vectors, but transfer their consecutive file bytes
+       together. The status descriptor is excluded by the caller's length. */
+    if (remaining) return -1;
+    if (!count) return 0;
+    if (b->log_stats || (__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED)&1)) {
+        __atomic_fetch_add(&b->io_shape[count==1?0:1],1,__ATOMIC_RELAXED);
+        if(count>1)__atomic_fetch_add(&b->io_shape[2],(uint64_t)count,__ATOMIC_RELAXED);
+    }
+    int result = count == 1 ? (writable ? hv_disk_read(b->disk, disk_off, iov[0].iov_base, len) :
+                                        hv_disk_write(b->disk, disk_off, iov[0].iov_base, len)) :
+                             (writable ? hv_disk_readv(b->disk, disk_off, iov, count) : hv_disk_writev(b->disk, disk_off, iov, count));
+    /* A failed/short read may already have modified part of guest RAM. Drop
+       affected translations even then; a failed DMA must not leave stale code. */
+    if (writable) for (int i = 0; i < count; i++) hv_dma_written(b->vio.m, address[i], iov[i].iov_len);
+    return result;
 }
 
 static uint32_t readable(const HvVirtqElem *e) {
@@ -57,19 +88,26 @@ static uint32_t readable(const HvVirtqElem *e) {
 static int handle(HvVirtioBlk *b, HvVirtqElem *e, uint32_t *written) {
     HvVirtio *v = &b->vio;
     struct { uint32_t type, reserved; uint64_t sector; } hdr;
-    uint32_t wlen = hv_virtq_writable(e);
     *written = 0;
+    if (e->nseg < 0 || e->nseg > HV_VIRTQ_MAX_SEGS) return -1;
+    uint64_t readable_bytes = 0, writable_bytes = 0;
+    for (int i = 0; i < e->nseg; i++) {
+        if (e->seg[i].write) writable_bytes += e->seg[i].len;
+        else readable_bytes += e->seg[i].len;
+    }
+    if (readable_bytes > UINT32_MAX || writable_bytes > UINT32_MAX) return -1;
+    uint32_t wlen = (uint32_t)writable_bytes;
     if (wlen < 1 || hv_virtq_read(v, e, 0, &hdr, sizeof hdr) != sizeof hdr) return -1;
     uint32_t data = wlen - 1; /* the status byte is the last writable one */
     uint8_t status = S_OK;
     switch (hdr.type) {
     case T_IN:
-        if (seg_io(b, e, 1, 0, hdr.sector * 512, data) != 0) status = S_IOERR;
+        if (hdr.sector > UINT64_MAX / 512 || seg_io(b, e, 1, 0, hdr.sector * 512, data) != 0) status = S_IOERR;
         else *written = data;
         break;
     case T_OUT: {
         uint32_t rlen = readable(e);
-        if (rlen < sizeof hdr || seg_io(b, e, 0, sizeof hdr, hdr.sector * 512, rlen - (uint32_t)sizeof hdr) != 0)
+        if (hdr.sector > UINT64_MAX / 512 || rlen < sizeof hdr || seg_io(b, e, 0, sizeof hdr, hdr.sector * 512, rlen - (uint32_t)sizeof hdr) != 0)
             status = S_IOERR;
         break;
     }
@@ -115,7 +153,8 @@ static void *worker(void *opaque) {
     /* HV_BLK_STATS: requests, bytes, flushes and how busy this worker was, every 10 s. */
     int stats = getenv("HV_BLK_STATS") != NULL;
     uint64_t every = stats && atoi(getenv("HV_BLK_STATS")) > 0 ? (uint64_t)atoi(getenv("HV_BLK_STATS")) * 1000000 : 10000000;
-    uint64_t t_last = now_us(), busy = 0, reqs = 0, bytes = 0, flushes = 0, flush_us = 0;
+    unsigned capture_seen = 0;
+    uint64_t t_last = now_us(), busy = 0, reqs = 0, bytes = 0, flushes = 0, flush_us = 0, max_us = 0;
     for (;;) {
         pthread_mutex_lock(&b->mu);
         while (b->fence || b->claimed == __atomic_load_n(&b->submitted, __ATOMIC_ACQUIRE)) {
@@ -137,29 +176,54 @@ static void *worker(void *opaque) {
         b->inflight++;
         pthread_mutex_unlock(&b->mu);
 
-        uint64_t t0 = stats ? now_us() : 0;
+        unsigned capture = __atomic_load_n(&b->capture_epoch, __ATOMIC_RELAXED);
+        int measuring = stats || (capture & 1);
+        if (!stats && capture != capture_seen) {
+            capture_seen = capture;
+            busy = reqs = bytes = flushes = flush_us = max_us = 0;
+            if (measuring) t_last = now_us();
+        }
+        uint64_t t0 = measuring ? now_us() : 0;
         if (handle(b, &r->e, &r->written) != 0) r->written = 0;
-        if (stats) {
-            uint64_t t1 = now_us();
+        uint64_t t1=measuring?now_us():0;
+        if (measuring) {
             busy += t1 - t0, reqs++, bytes += r->written > 1 ? r->written : readable(&r->e);
+            if (t1 - t0 > max_us) max_us = t1 - t0;
             if (type == T_FLUSH) flushes++, flush_us += t1 - t0;
-            if (t1 - t_last > every) {
-                fprintf(stderr, "virtio-blk %s worker: %.0f req/s %.1f MB/s, %.0f flushes/s (%.1f ms each), busy %.0f%%\n",
-                        b->disk->offset ? "aux" : "root", reqs * 1e6 / every, bytes * 1e6 / every / (1 << 20), flushes * 1e6 / every,
-                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy * 100.0 / every);
-                t_last = t1, busy = reqs = bytes = flushes = flush_us = 0;
+            if (t1 - t_last > (stats ? every : 5000000) &&
+                (stats || capture == __atomic_load_n(&b->capture_epoch, __ATOMIC_RELAXED))) {
+                fprintf(stderr, "virtio-blk %s worker: %.0f req/s %.1f MB/s, %.0f flushes/s (%.1f ms each), busy %.0f%%; service_max_ms=%.2f interval_s=%.3f (host I/O service, not guest asset latency)\n",
+                        b->disk->offset ? "aux" : "root", reqs * 1e6 / (t1-t_last), bytes * 1e6 / (t1-t_last) / (1 << 20), flushes * 1e6 / (t1-t_last),
+                        flushes ? flush_us / 1000.0 / flushes : 0.0, busy * 100.0 / (t1-t_last), max_us / 1000.0, (t1-t_last)/1e6);
+                fprintf(stderr,"block-io-shape: disk=%s single_span_attempts=%llu scatter_attempts=%llu scatter_vectors=%llu (sampled since VM start while disk diagnostics/capture active; vectors are not syscall counts after short/chunked I/O)\n",
+                        b->disk->offset?"aux":"root",(unsigned long long)__atomic_load_n(&b->io_shape[0],__ATOMIC_RELAXED),
+                        (unsigned long long)__atomic_load_n(&b->io_shape[1],__ATOMIC_RELAXED),(unsigned long long)__atomic_load_n(&b->io_shape[2],__ATOMIC_RELAXED));
+                t_last = t1, busy = reqs = bytes = flushes = flush_us = max_us = 0;
             }
         }
 
         pthread_mutex_lock(&b->mu);
+        if(measuring && (stats || capture==__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED))) {
+            b->timing[0]++;b->timing[1]+=t1-t0;
+            if(r->queued_us && t0>=r->queued_us)b->timing[2]+=t0-r->queued_us;
+            if(type==T_FLUSH){b->timing[3]+=t1-t0;b->timing[5]++;}
+            if(t1-t0>b->timing[4])b->timing[4]=t1-t0;
+        }
         __atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
+        /* Must precede completed: drain acquiring the last completion must
+           also observe the publication that makes its final poll effective. */
+        int wake = !__atomic_exchange_n(&b->completion_pending, 1, __ATOMIC_SEQ_CST);
         b->inflight--;
         if (fence) b->fence = 0;
         __atomic_add_fetch(&b->completed, 1, __ATOMIC_RELEASE);
         pthread_cond_broadcast(&b->done_cv);
         if (fence) pthread_cond_broadcast(&b->cv);
         pthread_mutex_unlock(&b->mu);
-        hv_machine_wake(b->vio.m);
+        /* Publish once per batch, rather than interrupting CPU0 (and issuing
+           SEV to the host cores) separately for every completed DMA. The RMW
+           follows done's release; poll acquires this publication before scan.
+           A completion racing the consumer's clear schedules the next poll. */
+        if (wake) hv_machine_wake(b->vio.m);
     }
     return NULL;
 }
@@ -184,6 +248,7 @@ static void notify(HvVirtio *v, int q) {
         }
         if (got == 0) break;
         r->q = q;
+        r->queued_us=(b->log_stats || (__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED)&1))?now_us():0;
         pthread_mutex_lock(&b->mu);
         __atomic_store_n(&b->submitted, b->submitted + 1, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&b->mu);
@@ -195,6 +260,18 @@ static void notify(HvVirtio *v, int q) {
 void hv_virtio_blk_drain(HvVirtioBlk *b) {
     while (__atomic_load_n(&b->completed, __ATOMIC_ACQUIRE) != b->submitted) usleep(100);
     hv_virtio_blk_poll(b);
+}
+
+void hv_virtio_blk_capture_timing(HvVirtioBlk *b, int enabled) {
+    if (!b) return;
+    unsigned old = __atomic_load_n(&b->capture_epoch, __ATOMIC_RELAXED);
+    while ((old & 1) != !!enabled &&
+           !__atomic_compare_exchange_n(&b->capture_epoch, &old, old + 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+int hv_virtio_blk_read_timing(HvVirtioBlk *b,uint64_t out[6]) {
+    memset(out,0,6*sizeof *out);if(!b)return 0;
+    pthread_mutex_lock(&b->mu);memcpy(out,b->timing,sizeof b->timing);pthread_mutex_unlock(&b->mu);
+    return b->log_stats || (__atomic_load_n(&b->capture_epoch,__ATOMIC_RELAXED)&1);
 }
 
 void hv_virtio_blk_stop(HvVirtioBlk *b) {
@@ -241,6 +318,9 @@ void hv_virtio_blk_destroy(HvVirtioBlk *b) {
    a slot is reused once it and every slot before it are back. */
 void hv_virtio_blk_poll(HvVirtioBlk *b) {
     if (!b) return;
+    /* Clear BEFORE scanning: a worker finishing during/after this scan must
+       publish a fresh wake. Empty polls avoid walking all outstanding DMA. */
+    if (!__atomic_exchange_n(&b->completion_pending, 0, __ATOMIC_SEQ_CST)) return;
     int q = -1;
     for (uint32_t i = b->published; i != b->submitted; i++) {
         HvVblkReq *r = &b->ring[i % HV_VBLK_RING];
@@ -269,6 +349,7 @@ HvVirtioBlk *hv_virtio_blk_create(HvMachine *m, HvPcie *bus, HvDisk *disk, int a
     v->dev = b;
     v->notify = notify;
     b->disk = disk;
+    b->log_stats=getenv("HV_BLK_STATS")!=NULL;
     b->ring = calloc(HV_VBLK_RING, sizeof *b->ring);
     pthread_mutex_init(&b->mu, NULL);
     pthread_cond_init(&b->cv, NULL);

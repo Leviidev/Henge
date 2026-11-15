@@ -26,13 +26,13 @@ static void notify(HvVirtio *v, int q) {
     if (any) hv_virtio_interrupt(v);
 }
 
-int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
+static int push_rx(HvVirtioNet *n, const uint8_t *frame, uint32_t len, int *notify_rx) {
     HvVirtio *v = &n->vio;
     static HvVirtqElem e;
     if (!(v->status & 4) || !v->q[RXQ].enabled || hv_virtq_pop(v, RXQ, &e) <= 0) return 0;
     if (hv_virtq_writable(&e) < HDR_LEN + len) { /* too small for it: drop the frame, return the buffer */
         hv_virtq_push(v, RXQ, &e, 0);
-        hv_virtio_interrupt(v);
+        *notify_rx = 1;
         n->rx_dropped++;
         return 1;
     }
@@ -41,9 +41,27 @@ int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
     hv_virtq_write(v, &e, 0, hdr, HDR_LEN);
     hv_virtq_write(v, &e, HDR_LEN, frame, len);
     hv_virtq_push(v, RXQ, &e, HDR_LEN + len);
-    hv_virtio_interrupt(v);
+    *notify_rx = 1;
     n->rx_frames++;
     return 1;
+}
+
+int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
+    int notify_rx=0;
+    int consumed=push_rx(n,frame,len,&notify_rx);
+    if(notify_rx)hv_virtio_interrupt(&n->vio);
+    return consumed;
+}
+
+/* Receive batching from oliverames' upstream PR176. Publish every used-ring
+   entry normally, then signal once. An unposted buffer leaves the remaining
+   frames owned by the caller, in their original order. Device lock held. */
+int hv_virtio_net_receive_batch(HvVirtioNet *n,const uint8_t *const *frames,
+                              const uint32_t *lengths,int count) {
+    int notify_rx=0,consumed=0;
+    while(consumed<count&&push_rx(n,frames[consumed],lengths[consumed],&notify_rx))consumed++;
+    if(notify_rx)hv_virtio_interrupt(&n->vio);
+    return consumed;
 }
 
 HvVirtioNet *hv_virtio_net_create(HvMachine *m, HvPcie *bus, const uint8_t mac[6]) {
