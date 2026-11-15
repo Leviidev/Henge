@@ -9,6 +9,8 @@
    lookup's own thread. */
 typedef void (*HvDnsSend)(const uint8_t *frame, uint32_t len, int to_guest);
 
+/* At a new network session, before accepting any queries. */
+void hv_dns_proxy_reset(void);
 int hv_dns_proxy_on(void);
 /* Start a fresh network session, or stop and wait for every lookup callback.
    The caller keeps its send queues alive until stop returns. */

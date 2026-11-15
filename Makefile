@@ -3,7 +3,7 @@ CC = clang
 CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices
 B = build
 
-CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
+CORE = $(B)/fastmem_log.o $(B)/fastmem.o $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
        $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
@@ -64,6 +64,9 @@ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/
 	$(CC) $(CFLAGS) host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/snapshot.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a -lz -lcompression -framework Foundation -framework CFNetwork -framework Security -framework SystemConfiguration -framework IOKit $(SLIRP_LIBS) -framework AudioToolbox -framework ParavirtualizedGraphics -framework Metal -framework IOSurface \
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
+
+$(B)/fastmem.o: core/fastmem.c core/*.h host/*.h | $(B)
+	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
 
 # mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
 $(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
@@ -264,3 +267,62 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+$(B)/test_fastmem: tests/test_fastmem.c $(ENGINE)
+	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
+
+$(B)/test_memory_bounds: tests/test_memory_bounds.c $(ENGINE)
+	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
+
+$(B)/test_inline_sysreg: tests/test_inline_sysreg.c $(ENGINE)
+	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
+
+$(B)/test_tail_recheck: tests/test_tail_recheck.c $(ENGINE)
+	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
+
+$(B)/test_jit_ring: tests/test_jit_ring.c $(ENGINE)
+	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
+
+$(B)/test_register_groups: tests/test_register_groups.c $(ENGINE)
+	$(CC) $(CFLAGS) -D_DARWIN_C_SOURCE -pthread $< $(ENGINE) -o $@
+
+.PHONY: test-memory-jit
+test-memory-jit: $(B)/test_fastmem $(B)/test_memory_bounds $(B)/test_inline_sysreg $(B)/test_tail_recheck $(B)/test_jit_ring $(B)/test_register_groups
+	$(B)/test_fastmem
+	$(B)/test_memory_bounds
+	$(B)/test_inline_sysreg
+	$(B)/test_tail_recheck
+	$(B)/test_jit_ring
+	$(B)/test_register_groups
+
+# Differential build: same production emitter, previous register-only policy.
+$(B)/translate-register-reference.o: core/translate.c core/*.h host/*.h | $(B)
+	$(CC) $(CFLAGS) -DHV_GROUP_WRITEBACK=0 -c $< -o $@
+ENGINE_REGISTER_REFERENCE = $(filter-out $(B)/translate.o,$(ENGINE)) $(B)/translate-register-reference.o
+$(B)/test_mem_register_reference: tests/test_mem.c tests/mem_programs.S tests/harness.S $(ENGINE_REGISTER_REFERENCE)
+	$(CC) $(CFLAGS) tests/test_mem.c tests/mem_programs.S tests/harness.S $(ENGINE_REGISTER_REFERENCE) -o $@
+$(B)/bench_stack_groups: tests/bench_stack_groups.c tests/mem_programs.S tests/harness.S $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+$(B)/bench_stack_groups_reference: tests/bench_stack_groups.c tests/mem_programs.S tests/harness.S $(ENGINE_REGISTER_REFERENCE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(B)/test_exc_register_reference: tests/test_exc.c tests/exc_programs.S tests/harness.S $(ENGINE_REGISTER_REFERENCE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(B)/bench_interleaved_groups: tests/bench_interleaved_groups.c tests/mem_programs.S tests/harness.S $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(B)/bench_jit_retention: tests/bench_jit_retention.c $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(B)/bench_branch_sites: tests/bench_branch_sites.c $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(B)/test_ijc_eviction: tests/test_ijc_eviction.c $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(B)/test_jit_retention: tests/test_jit_retention.c $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(B)/test_branch_sites: tests/test_branch_sites.c $(ENGINE)
+	$(CC) $(CFLAGS) $^ -o $@

@@ -241,10 +241,18 @@ _hv_helper_thunk:
     str x15, [x28, #CPU_SP]
     ldr x15, [x28, #CPU_HOST_SP]
     mov sp, x15
+#ifdef HV_SANITIZER_HELPERS
+    // Sanitizer runtime calls have the ordinary SIMD-clobbering C ABI even
+    // when the light helper itself is compiled -mgeneral-regs-only.
+    SAVE_FLAGS_FP
+#endif
     mov x0, x28
     mov x1, x7
     bl _hv_tlb_refill
     mov x7, x0
+#ifdef HV_SANITIZER_HELPERS
+    LOAD_FLAGS_FP
+#endif
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
     ldr x0, [x28, #CPU_NZCV]
@@ -311,11 +319,24 @@ _hv_ijc_thunk:
     str x15, [x28, #CPU_SP]
     ldr x15, [x28, #CPU_HOST_SP]
     mov sp, x15
+#ifdef HV_SANITIZER_HELPERS
+    // Sanitizer runtime calls have the ordinary SIMD-clobbering C ABI even
+    // when the light helper itself is compiled -mgeneral-regs-only.
+    SAVE_FLAGS_FP
+#endif
     mov x0, x28
     mov x1, x7
     ldr w2, [x30]
-    bl _hv_ijc_resolve
+    mov x3, #0
+    tbz w2, #31, Lijc_no_site
+    ldr x3, [x30, #8]
+Lijc_no_site:
+    and w2, w2, #0x7fffffff
+    bl _hv_ijc_resolve_site
     mov x6, x0
+#ifdef HV_SANITIZER_HELPERS
+    LOAD_FLAGS_FP
+#endif
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
     ldr x0, [x28, #CPU_NZCV]
@@ -334,6 +355,10 @@ _hv_ijc_thunk:
     isb                           // a block found in the hash may be one another CPU just wrote
     ret x6
 1:  ldr x15, [x28, #CPU_REFILL_RET]
+    ldr w6, [x15]
+    tbz w6, #31, Lijc_short_info
+    add x15, x15, #12
+Lijc_short_info:
     add x15, x15, #4
     ret x15
 
@@ -387,12 +412,20 @@ _hv_xjump_thunk:
     str x15, [x28, #CPU_SP]
     ldr x15, [x28, #CPU_HOST_SP]
     mov sp, x15
+#ifdef HV_SANITIZER_HELPERS
+    // Sanitizer runtime calls have the ordinary SIMD-clobbering C ABI even
+    // when the light helper itself is compiled -mgeneral-regs-only.
+    SAVE_FLAGS_FP
+#endif
     mov x0, x28
     ldr x1, [x7, #8]
     ldr w2, [x7]
     and w2, w2, #0x7fffffff
     bl _hv_ijc_resolve
     mov x6, x0
+#ifdef HV_SANITIZER_HELPERS
+    LOAD_FLAGS_FP
+#endif
     ldr x0, [x28, #CPU_SP]
     mov sp, x0
     ldr x0, [x28, #CPU_NZCV]
