@@ -1,4 +1,5 @@
 #include "usb_host.h"
+#include "scheduling.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -91,6 +92,7 @@ static void print_string(HvVirtioUsb *d, uint8_t idx) {
 }
 
 static void *probe(void *arg) {
+    hv_schedule_aux_start(HV_ROLE_USB_PROBE);
     HvVirtioUsb *d = arg;
     int64_t s = hv_usb_wait_online(d, 120000);
     fprintf(stderr, "usb probe: online (session %lld)\n", (long long)s);

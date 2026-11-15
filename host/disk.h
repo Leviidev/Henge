@@ -2,6 +2,10 @@
 #define HENGEVM_DISK_H
 
 #include <stdint.h>
+#include <sys/uio.h>
+
+/* Bounded by the block queue's descriptor limit, below Darwin's IOV_MAX. */
+#define HV_DISK_IOV_MAX 128
 
 /* A raw disk image file, optionally starting `offset` bytes in (QEMU's vmapple
    notes say the first 16 KB of auxiliary.bin is metadata the guest never sees). */
@@ -18,6 +22,10 @@ void hv_disk_close(HvDisk *d);
 /* Return 0, or -1 on an I/O error or an access past the end. */
 int hv_disk_read(HvDisk *d, uint64_t off, void *buf, uint64_t len);
 int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len);
+/* Scatter/gather within ONE request. No staging copy, request reordering or
+   weakening of flush/barrier semantics. The caller retains the buffers. */
+int hv_disk_readv(HvDisk *d, uint64_t off, const struct iovec *iov, int count);
+int hv_disk_writev(HvDisk *d, uint64_t off, const struct iovec *iov, int count);
 int hv_disk_flush(HvDisk *d);
 
 #endif

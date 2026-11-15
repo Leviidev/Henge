@@ -111,6 +111,7 @@ _\name\()_end:
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "cpu.h"
 #include "dispatch.h"
@@ -179,17 +180,26 @@ static inline void seed_cpu(HvCpu *cpu, uint64_t seed, uint64_t sp) {
 /* Native reference. Darwin may clear x18 on a context switch, so run until two
    runs agree. reset (may be NULL) puts guest memory back before each run. */
 static inline void run_native(const TestProgram *p, const HvCpu *init, HvCpu *out, void (*reset)(void)) {
-    HvCpu a, b;
+    /* HvCpu includes megabytes of software TLB state. Two automatic copies
+       overflow the normal macOS main-thread stack before any guest code runs.
+       Keep the complete reference states without requiring a raised ulimit. */
+    HvCpu *a = malloc(sizeof *a), *b = malloc(sizeof *b);
+    if (!a || !b) {
+        free(a); free(b);
+        fputs("Cannot allocate native-reference CPU states\n", stderr);
+        abort();
+    }
     for (int tries = 0; tries < 10; tries++) {
         if (reset) reset();
-        a = *init;
-        hv_native_run(&a, p->native);
+        *a = *init;
+        hv_native_run(a, p->native);
         if (reset) reset();
-        b = *init;
-        hv_native_run(&b, p->native);
-        if (memcmp(a.x, b.x, sizeof a.x) == 0 && a.v[0] == b.v[0]) break;
+        *b = *init;
+        hv_native_run(b, p->native);
+        if (memcmp(a->x, b->x, sizeof a->x) == 0 && a->v[0] == b->v[0]) break;
     }
-    *out = a;
+    *out = *a;
+    free(b); free(a);
 }
 
 /* Through the JIT: code runs in place, guest PA = host address. */

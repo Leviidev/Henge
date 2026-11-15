@@ -74,16 +74,17 @@ static int hppi(HvGic *g, int c, int masked) {
     return best;
 }
 
+/* Banked PPI changes cannot alter another CPU's interrupt arbitration. */
+static void update_cpu_line(HvGic *g, int c) {
+    int i = hppi(g, c, 1);
+    HvPerCpu *p = &g->m->percpu[c];
+    int irq = i != SPURIOUS && F(g, c, group, i) == 1, fiq = i != SPURIOUS && F(g, c, group, i) == 0;
+    int raised = (irq && !p->irq_line) || (fiq && !p->fiq_line);
+    p->irq_line = irq; p->fiq_line = fiq;
+    if (raised && g->m->cpus[c] && g->m->ncpus > 1) hv_cpu_wake(g->m->cpus[c]);
+}
 static void hv_gicv3_update_body(HvGic *g) {
-    for (int c = 0; c < ncpus(g); c++) {
-        int i = hppi(g, c, 1);
-        HvPerCpu *p = &g->m->percpu[c];
-        int irq = i != SPURIOUS && F(g, c, group, i) == 1, fiq = i != SPURIOUS && F(g, c, group, i) == 0;
-        int raised = (irq && !p->irq_line) || (fiq && !p->fiq_line);
-        p->irq_line = irq;
-        p->fiq_line = fiq;
-        if (raised && g->m->cpus[c] && g->m->ncpus > 1) hv_cpu_wake(g->m->cpus[c]); /* it may be asleep in WFI, or running */
-    }
+    for (int c = 0; c < ncpus(g); c++) update_cpu_line(g, c);
 }
 
 static void hv_gicv3_set_irq_body(HvGic *g, int intid, int level) {
@@ -102,7 +103,7 @@ static void hv_gicv3_set_ppi_body(HvGic *g, int c, int intid, int level) {
     if (k->level[intid] == level) return; /* the timer re-asserts every tick */
     if (k->edge[intid] && level) k->latch[intid] = 1;
     k->level[intid] = (uint8_t)level;
-    hv_gicv3_update(g);
+    update_cpu_line(g, c);
 }
 
 static void hv_gicv3_pend_body(HvGic *g, int intid) {
@@ -400,6 +401,26 @@ void hv_gicv3_set_ppi(HvGic *g, int c, int intid, int level) {
         return;
     pthread_mutex_lock(&g->mu);
     hv_gicv3_set_ppi_body(g, c, intid, level);
+    pthread_mutex_unlock(&g->mu);
+}
+
+/* Both generic-timer inputs are sampled at the same host counter value. */
+void hv_gicv3_set_timer_lines(HvGic *g, int c, int virtual_level, int physical_level) {
+    if (c < 0 || c >= ncpus(g)) return;
+    virtual_level = virtual_level != 0; physical_level = physical_level != 0;
+    HvGicCpu *k = &g->cpu[c];
+    if (__atomic_load_n(&k->level[27], __ATOMIC_RELAXED) == virtual_level &&
+        __atomic_load_n(&k->level[30], __ATOMIC_RELAXED) == physical_level) return;
+    pthread_mutex_lock(&g->mu);
+    int changed = 0;
+    int levels[2] = {virtual_level, physical_level}, ids[2] = {27,30};
+    for (int j = 0; j < 2; j++) {
+        int i = ids[j], level = levels[j];
+        if (k->level[i] == level) continue;
+        if (k->edge[i] && level) k->latch[i] = 1;
+        k->level[i] = (uint8_t)level; changed = 1;
+    }
+    if (changed) update_cpu_line(g, c);
     pthread_mutex_unlock(&g->mu);
 }
 

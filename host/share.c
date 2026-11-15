@@ -5,10 +5,12 @@
    10.0.2.4:80 to a Unix socket in the app's own storage: no TCP port is open, so other apps can't reach this.
 
    /.henge/ is not part of the folder. It has the clipboard, where the helper inside macOS (tools/henge-agent.m)
-   waits for the device's clipboard and sends the guest's, and what it takes to install that helper.
+   waits for the device's clipboard and sends the guest's, what installs the helpers, and the
+   optional native-touch companion's input/status exchange.
 
    Locks are accepted but not enforced: macOS only writes to a server that offers them, and there is one client. */
 #include "share.h"
+#include "native_touch.h"
 
 #include <copyfile.h>
 #include <dirent.h>
@@ -42,17 +44,44 @@ static char agent_path[PATH_MAX];
 static pthread_mutex_t clip_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t clip_cond = PTHREAD_COND_INITIALIZER;
 static char *device_clip; /* the device's, for the guest */
-static unsigned long device_seq;
+static unsigned long device_seq, delivered_seq;
+static int agent_ack;
 static char *guest_clip; /* the guest's, until the device takes it */
 static time_t agent_seen;
+static void (*clipboard_notify)(void);
 
-void hv_share_set_clipboard(const char *text) {
+void hv_share_set_clipboard_notify(void (*notify)(void)) {
     pthread_mutex_lock(&clip_mu);
-    free(device_clip);
-    device_clip = strdup(text);
-    device_seq++;
+    clipboard_notify = notify;
+    int pending = guest_clip != NULL;
+    pthread_mutex_unlock(&clip_mu);
+    if (notify && pending) notify();
+}
+
+unsigned long hv_share_publish_clipboard(const char *text) {
+    if (!text || strlen(text) > SMALL_BODY_MAX) return 0;
+    char *copy = strdup(text);
+    if (!copy) return 0;
+    pthread_mutex_lock(&clip_mu);
+    free(device_clip); device_clip = copy;
+    if (!++device_seq) ++device_seq;
+    unsigned long seq = device_seq;
     pthread_cond_broadcast(&clip_cond);
     pthread_mutex_unlock(&clip_mu);
+    return seq;
+}
+void hv_share_set_clipboard(const char *text) { (void)hv_share_publish_clipboard(text); }
+int hv_share_clipboard_ready(void) {
+    pthread_mutex_lock(&clip_mu);
+    int ready = agent_ack && agent_seen && time(NULL) - agent_seen < 40;
+    pthread_mutex_unlock(&clip_mu);
+    return ready;
+}
+int hv_share_clipboard_delivered(unsigned long seq) {
+    pthread_mutex_lock(&clip_mu);
+    int delivered = seq && seq == device_seq && seq == delivered_seq;
+    pthread_mutex_unlock(&clip_mu);
+    return delivered;
 }
 
 char *hv_share_take_clipboard(void) {
@@ -588,12 +617,27 @@ static const char install_script[] =
     "launchctl bootout \"gui/$(id -u)/com.henge.agent\" 2>/dev/null\n"
     "curl -fsS http://" HV_SHARE_ADDR "/.henge/agent | gunzip > \"$D/henge-agent\" || { echo 'Could not reach Henge.'; exit 1; }\n"
     "chmod 755 \"$D/henge-agent\"\n"
+    "A=\"$D/henge-agent\"\n"
+    /* If the bundle update fails, run the freshly downloaded sharing binary,
+       never silently choose a valid but obsolete installed bundle instead. */
+    "T=$(mktemp -d \"$D/touch-update.XXXXXX\") || exit 1\n"
+    "if curl -fsS http://" HV_SHARE_ADDR "/.henge/touch-agent -o \"$T/helper.tar.gz\" && tar -xzf \"$T/helper.tar.gz\" -C \"$T\" && codesign --verify --strict \"$T/Henge Touch Agent.app\" && { [ ! -d \"$T/Henge Sharing Agent.app\" ] || codesign --verify --strict \"$T/Henge Sharing Agent.app\"; }; then\n"
+    "  rm -rf \"$D/Henge Touch Agent.app\"\n"
+    "  mv \"$T/Henge Touch Agent.app\" \"$D/Henge Touch Agent.app\"\n"
+    "  rm -f \"$D/henge-touch-agent\"\n"
+    "  if [ -d \"$T/Henge Sharing Agent.app\" ] && codesign --verify --strict \"$T/Henge Sharing Agent.app\"; then\n"
+    "    rm -rf \"$D/Henge Sharing Agent.app\"\n"
+    "    mv \"$T/Henge Sharing Agent.app\" \"$D/Henge Sharing Agent.app\"\n"
+    "    A=\"$D/Henge Sharing Agent.app/Contents/MacOS/henge-agent\"\n"
+    "  fi\n"
+    "else echo \"Touch helper update failed; keeping the previous helper.\"; fi\n"
+    "rm -rf \"$T\"\n"
     "cat > \"$P\" <<EOF\n"
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
     "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
     "<plist version=\"1.0\"><dict>\n"
     "<key>Label</key><string>com.henge.agent</string>\n"
-    "<key>ProgramArguments</key><array><string>$D/henge-agent</string></array>\n"
+    "<key>ProgramArguments</key><array><string>$A</string></array>\n"
     "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n"
     "<key>LimitLoadToSessionType</key><string>Aqua</string>\n"
     "<key>ProcessType</key><string>Background</string>\n"
@@ -602,60 +646,16 @@ static const char install_script[] =
     "launchctl bootstrap \"gui/$(id -u)\" \"$P\"\n"
     "echo 'Henge is set up. You can close this window.'\n";
 
-/* What "curl -s http://10.0.2.4/.henge/lighten | sh" runs in macOS: less background work and drawing, for a Mac
-   whose CPUs are emulated: less animation and drawing, and the system part (update checks, Time Machine) with the
-   Mac's password once. Apple's own background agents can't be turned off with System Integrity Protection on
-   (launchctl disable of gui/ agents did not survive a log out on the Mac bench, 2026-11-08), so it doesn't try.
-   Reduce Motion and Reduce Transparency need System Settings (a script can't write com.apple.universalaccess).
-   Nothing reads the script's own stdin (sh is reading the script from it). */
-static const char lighten_script[] =
-    "#!/bin/sh\n"
-    "echo 'Making macOS lighter for Henge...'\n"
-    "defaults write com.apple.universalaccess reduceMotion -bool true 2>/dev/null </dev/null || "
-    "echo '  Reduce Motion: turn it on in System Settings, Accessibility, Motion.'\n"
-    "defaults write com.apple.universalaccess reduceTransparency -bool true 2>/dev/null </dev/null || "
-    "echo '  Reduce Transparency: turn it on in System Settings, Accessibility, Display.'\n"
-    "defaults write -g NSAutomaticWindowAnimationsEnabled -bool false </dev/null\n"
-    "defaults write -g NSWindowResizeTime -float 0.001 </dev/null\n"
-    "defaults write com.apple.dock launchanim -bool false </dev/null\n"
-    "defaults -currentHost write com.apple.screensaver idleTime -int 0 </dev/null\n"
-    "defaults write com.apple.WindowManager StandardHideWidgets -int 1 </dev/null\n"
-    "defaults write com.apple.WindowManager StageManagerHideWidgets -int 1 </dev/null\n"
-    "W=\"/System/Library/Desktop Pictures/Solid Colors/Black.png\"\n"
-    "[ -f \"$W\" ] || W=$(ls \"/System/Library/Desktop Pictures/Solid Colors/\"*.png 2>/dev/null | head -1)\n"
-    "if [ -n \"$W\" ]; then\n"
-    "  osascript -l JavaScript - \"$W\" >/dev/null 2>&1 <<'JS'\n"
-    "ObjC.import('AppKit');\n"
-    "function run(argv) {\n"
-    "  var url = $.NSURL.fileURLWithPath(argv[0]), screens = $.NSScreen.screens;\n"
-    "  for (var i = 0; i < screens.count; i++)\n"
-    "    $.NSWorkspace.sharedWorkspace.setDesktopImageURLForScreenOptionsError(url, screens.objectAtIndex(i), $({}), null);\n"
-    "}\n"
-    "JS\n"
-    "fi\n"
-    "killall Dock 2>/dev/null\n"
-    "echo 'Done: window and Dock animations, desktop widgets, the screen saver and a moving wallpaper are off.'\n"
-    "echo 'Also turn on Reduce Motion and Reduce Transparency: System Settings, Accessibility.'\n"
-    "echo 'Log out and back in for all of it to take effect. To undo: curl -s http://" HV_SHARE_ADDR "/.henge/unlighten | sh'\n";
-
-/* And back. The wallpaper stays as it is: pick one in System Settings. */
-static const char unlighten_script[] =
-    "#!/bin/sh\n"
-    "defaults write com.apple.universalaccess reduceMotion -bool false 2>/dev/null </dev/null\n"
-    "defaults write com.apple.universalaccess reduceTransparency -bool false 2>/dev/null </dev/null\n"
-    "defaults delete -g NSAutomaticWindowAnimationsEnabled 2>/dev/null </dev/null\n"
-    "defaults delete -g NSWindowResizeTime 2>/dev/null </dev/null\n"
-    "defaults delete com.apple.dock launchanim 2>/dev/null </dev/null\n"
-    "defaults -currentHost delete com.apple.screensaver idleTime 2>/dev/null </dev/null\n"
-    "defaults write com.apple.WindowManager StandardHideWidgets -int 0 </dev/null\n"
-    "defaults write com.apple.WindowManager StageManagerHideWidgets -int 0 </dev/null\n"
-    "killall Dock 2>/dev/null\n"
-    "echo 'Back as it was, apart from the wallpaper (System Settings, Wallpaper).'\n"
-    "echo 'Log out and back in (or restart) for all of it to take effect.'\n";
-
-static int serve_agent(Conn *c, Request *r) {
+static int serve_agent(Conn *c, Request *r, int touch) {
     if (body_discard(c, r) != 0) return -1;
-    int fd = agent_path[0] ? open(agent_path, O_RDONLY) : -1;
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s", agent_path);
+    if (touch) {
+        char *slash = strrchr(path, '/');
+        if (!slash || (size_t)(slash-path)+32 >= sizeof path) return respond_empty(c, r, 404, "Not Found");
+        strcpy(slash+1, "henge-touch-agent.tar.gz");
+    }
+    int fd = path[0] ? open(path, O_RDONLY) : -1;
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0) {
         if (fd >= 0) close(fd);
@@ -683,10 +683,17 @@ static int clipboard_get(Conn *c, Request *r) {
     until.tv_nsec = now.tv_usec * 1000;
     pthread_mutex_lock(&clip_mu);
     agent_seen = time(NULL);
-    while (device_seq <= since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
+    int initial = strstr(r->query, "initial=1") != NULL;
+    agent_ack = !initial && strstr(r->query, "ack=1") != NULL;
+    if (!initial) {
+        while (device_seq <= since) {
+            int rc = pthread_cond_timedwait(&clip_cond, &clip_mu, &until);
+            if (rc) break; /* no busy loop if a wait fails */
+        }
+    }
     agent_seen = time(NULL);
     unsigned long seq = device_seq;
-    char *text = seq > since && device_clip ? strdup(device_clip) : NULL;
+    char *text = !initial && seq > since && device_clip ? strdup(device_clip) : NULL;
     pthread_mutex_unlock(&clip_mu);
     char headers[64];
     snprintf(headers, sizeof headers, "X-Henge-Seq: %lu\r\n", seq);
@@ -699,9 +706,29 @@ static int clipboard_put(Conn *c, Request *r) {
     size_t len = 0;
     char *text = body_small(c, r, &len);
     if (!text) return -1;
+    if (memchr(text, 0, len)) { free(text); return respond_empty(c, r, 400, "Bad Request"); }
     pthread_mutex_lock(&clip_mu);
     free(guest_clip);
     guest_clip = text;
+    agent_seen = time(NULL);
+    void (*notify)(void) = clipboard_notify;
+    pthread_mutex_unlock(&clip_mu);
+    if (notify) notify();
+    return respond_empty(c, r, 204, "No Content");
+}
+
+/* Acknowledged only after the companion installs the text on NSPasteboard. */
+static int clipboard_ack(Conn *c, Request *r) {
+    size_t len = 0;
+    char *body = body_small(c, r, &len), *end = NULL;
+    if (!body) return -1;
+    errno = 0;
+    unsigned long seq = strtoul(body, &end, 10);
+    int valid = len > 0 && len < 32 && body[0] >= '0' && body[0] <= '9' && !errno && end == body + len && seq;
+    free(body);
+    if (!valid) return respond_empty(c, r, 400, "Bad Request");
+    pthread_mutex_lock(&clip_mu);
+    if (seq == device_seq) delivered_seq = seq;
     agent_seen = time(NULL);
     pthread_mutex_unlock(&clip_mu);
     return respond_empty(c, r, 204, "No Content");
@@ -709,16 +736,68 @@ static int clipboard_put(Conn *c, Request *r) {
 
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
+    if (!strcmp(what, "runner")) {
+        if (body_discard(c, r) != 0) return -1;
+        if (!strcmp(r->method, "GET") && strcmp(r->query, "since=18446744073709551615")) {
+            const char stop[] = "{\"version\":1,\"action\":\"stop\"}";
+            return respond(c,r,200,"OK","Content-Type: application/json\r\nCache-Control: no-store\r\nX-Henge-Seq: 18446744073709551615\r\n",stop,sizeof stop-1);
+        }
+        return respond_empty(c,r,410,"Gone");
+    }
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
     }
-    if ((!strcmp(what, "lighten") || !strcmp(what, "unlighten")) && !strcmp(r->method, "GET")) {
+    if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r, 0);
+    if (!strcmp(what, "touch-agent") && !strcmp(r->method, "GET")) return serve_agent(c, r, 1);
+    if (!strcmp(what, "native-touch-usb") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
-        const char *s = what[0] == 'l' ? lighten_script : unlighten_script;
-        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", s, strlen(s));
+        char json[256]; size_t n = hv_native_touch_usb_state(json, sizeof json);
+        return respond(c, r, 200, "OK", "Content-Type: application/json\r\n", json, n);
     }
-    if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
+    if (!strcmp(what, "native-touch-usb") && !strcmp(r->method, "PUT")) {
+        if (r->chunked || r->length < 0 || r->length > 64) { r->close = 1; return respond_empty(c, r, 400, "Bad Request"); }
+        size_t length; char *body = body_small(c, r, &length);
+        unsigned generation; int action; char extra;
+        if (!body) return -1;
+        int valid = sscanf(body, "%u %d %c", &generation, &action, &extra) == 2 && action >= 0 && action <= 3;
+        free(body);
+        if (!valid) return respond_empty(c, r, 400, "Bad Request");
+        int accepted = action == 3 ? hv_native_touch_usb_host_encoding(generation) :
+                       action == 2 ? hv_native_touch_usb_mapped(generation) : hv_native_touch_usb_connect(generation, action);
+        if (!accepted) return respond_empty(c, r, 409, "Conflict");
+        return respond_empty(c, r, 204, "No Content");
+    }
+    if (!strcmp(what, "native-touch-usb/report") && !strcmp(r->method, "PUT")) {
+        if (r->chunked || r->length != 36) { r->close = 1; return respond_empty(c, r, 400, "Bad Request"); }
+        size_t length; uint8_t *body = (uint8_t *)body_small(c, r, &length);
+        if (!body) return -1;
+        if (length != 36) { free(body); return respond_empty(c, r, 400, "Bad Request"); }
+        uint32_t generation = (uint32_t)body[0] | (uint32_t)body[1] << 8 | (uint32_t)body[2] << 16 | (uint32_t)body[3] << 24;
+        int accepted = hv_native_touch_usb_report(generation, body + 4);
+        free(body);
+        return accepted ? respond_empty(c, r, 204, "No Content") : respond_empty(c, r, 409, "Conflict");
+    }
+    if (!strcmp(what, "native-touch") && !strcmp(r->method, "GET")) {
+        if (body_discard(c, r) != 0) return -1;
+        char json[1024]; size_t n = hv_native_touch_next(json, sizeof json);
+        return respond(c, r, 200, "OK", "Content-Type: application/json\r\n", json, n);
+    }
+    if (!strcmp(what, "native-touch") && !strcmp(r->method, "PUT")) {
+        if (r->chunked || r->length < 0 || r->length > 64) { r->close = 1; return respond_empty(c, r, 400, "Bad Request"); }
+        size_t length; char *body = body_small(c, r, &length);
+        unsigned generation; int state,phase=0,code=0; char extra;
+        if (!body) return -1;
+        int plain=sscanf(body,"%u %d %c",&generation,&state,&extra)==2;
+        int progress=sscanf(body,"%u %d %d %c",&generation,&state,&phase,&extra)==3 && state==HV_TOUCH_WAITING && phase>=0 && phase<=6;
+        int detail=sscanf(body,"%u %d %d %d %c",&generation,&state,&phase,&code,&extra)==4 && state==HV_TOUCH_DEVICE && phase>=0 && phase<=6 && code>=-1000000 && code<=1000000;
+        int valid = (plain || progress || detail) && state >= HV_TOUCH_WAITING && state <= HV_TOUCH_DEVICE;
+        free(body);
+        if (!valid) return respond_empty(c, r, 400, "Bad Request");
+        if(detail)hv_native_touch_failure(generation,phase,code);else if(progress)hv_native_touch_progress(generation,phase);else hv_native_touch_report(generation,state);
+        return respond_empty(c, r, 204, "No Content");
+    }
+    if (!strcmp(what, "clipboard-ack") && !strcmp(r->method, "POST")) return clipboard_ack(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
     if (body_discard(c, r) != 0) return -1;

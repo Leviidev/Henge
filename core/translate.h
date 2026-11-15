@@ -5,6 +5,10 @@
 
 #include "machine.h"
 
+/* Build-time reference switch for differential codegen/performance checks. */
+int hv_translate_writeback_groups(void);
+int hv_translate_interleaved_groups(void);
+
 /* What a block passes to hv_helper. Lives in the block's literal pool. */
 typedef struct HvHelperInfo {
     uint64_t pc;
@@ -39,6 +43,7 @@ int hv_translate_block(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t 
 int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail);
 int hv_translate_place(HvMachine *m, HvBlock *b);
 uint32_t hv_translate_last_words(void);
+uint32_t hv_translate_pending_words(void); /* hot+cold words, before placement */
 
 int hv_branch_retarget(uint32_t *w, int64_t off);
 

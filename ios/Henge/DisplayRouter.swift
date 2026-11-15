@@ -10,11 +10,18 @@ final class DisplayRouter: ObservableObject {
     private var targets = DisplayTargetSelection()
     private var layers: [UUID: CAMetalLayer] = [:]
     private var selected: UUID?
+    private var refreshTask: Task<Void, Never>?
 
     func connect(_ id: UUID, layer: CAMetalLayer, role: DisplayTargetSelection.Role) {
+        let replacedSelected = selected == id && layers[id] !== layer
+        let previous = selected
         layers[id] = layer
         targets.connect(id, role: role)
         updateTarget()
+        if replacedSelected && selected == previous {
+            refreshTask?.cancel(); refreshTask = nil
+            sendTarget()
+        }
     }
 
     func disconnect(_ id: UUID) {
@@ -27,12 +34,19 @@ final class DisplayRouter: ObservableObject {
     /// even when macOS is idle and isn't submitting another frame.
     func refresh(_ id: UUID? = nil) {
         guard id == nil || id == selected else { return }
-        sendTarget()
+        guard refreshTask == nil else { return }
+        refreshTask = Task { @MainActor [weak self] in
+            await Task.yield() // fold/rotation layout can publish several sizes in one turn
+            guard !Task.isCancelled, let self else { return }
+            self.refreshTask = nil
+            self.sendTarget()
+        }
     }
 
     private func updateTarget() {
         let next = targets.selected
         if next != selected {
+            refreshTask?.cancel(); refreshTask = nil
             selected = next
             sendTarget()
         }
