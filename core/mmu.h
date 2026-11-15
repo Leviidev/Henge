@@ -62,9 +62,19 @@ void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid);
 /* Translated code's TLB miss: walk and fill without the full helper (see mmu.c). */
 int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags);
 struct HvBlock;
+#define HV_IJC_SEGMENT_WORDS ((size_t)HV_IJC_TABLES * (1u<<HV_IJC_BITS) / 64)
+/* Every CPU parked. Removed points sorted by executable address; -1 requests
+   the existing full-reset fallback if allocation/index metadata is unavailable. */
+int hv_ijc_evict_range(HvCpu *cpu,const uint32_t *lo,const uint32_t *hi,uint32_t *const *removed,size_t count);
+void hv_ijc_evict_index(HvCpu *cpu);
 void hv_ijc_fill(HvCpu *cpu, struct HvBlock *b);
 int hv_ijc_fill_checked(HvCpu *cpu, struct HvBlock *b); /* only if the TLB still maps it (0: not cached) */
 void *hv_ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags);
+static inline unsigned hv_ijc_site_slot(uint64_t site,unsigned flags){return (flags&15)*32+(unsigned)(((site>>2)^(site>>11))&31);}
+void hv_ijc_site_observe(HvCpu *cpu,uint64_t site,uint64_t target,uint32_t flags);
+int hv_ijc_site_admitted(struct HvMachine *m,uint64_t site,uint32_t flags);
+void *hv_ijc_resolve_site(HvCpu *cpu,uint64_t va,uint32_t flags,uint64_t site);
+
 /* Another CPU's TLBI of one page: drop target's entries for it from here. 1 if
    that is enough (no page walk of target's raced it), 0 if target must do it
    itself and be waited for. Its branch cache is still target's own business. */
@@ -82,6 +92,18 @@ void hv_tlb_protect_code_page(HvCpu *cpu, struct HvRam *ram, uint64_t pg); /* th
    filling the TLB when the page is ordinary RAM. Returns 0 and sets *pa, or the
    fault status code. */
 uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *pa);
+
+/* Reuse the owner's already validated RAM translation. No independent cache:
+   every existing TLBI, PAN view and code-page protection rule still applies.
+   A complete span is required, including accesses in the final 15 bytes. */
+static inline const void *hv_tlb_read_span(HvCpu *cpu, uint64_t va, uint32_t bytes, int el) {
+    const uint64_t mask = (1ull << HV_TLB_PAGE_BITS) - 1;
+    if (!bytes || bytes > (mask + 1) - (va & mask)) return NULL;
+    const HvTlbEntry *entry = hv_tlb_ent(cpu, (uint32_t)(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), hv_tlb_table(cpu, el));
+    uint64_t tag = entry->read_tag;
+    if (tag == HV_TLB_INVALID || tag + HV_TLB_ADJ != (va & ~mask)) return NULL;
+    return (const void *)(uintptr_t)(va + (uint64_t)entry->addend);
+}
 
 /* For the dispatcher: host pointer to the guest instructions at va and how many
    can be read before the page ends. On a fault, the instruction abort is taken

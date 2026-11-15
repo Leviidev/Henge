@@ -6,20 +6,20 @@
 #include "cpu.h"
 
 /* Exception classes (ESR_ELx.EC). */
-#define HV_EC_UNKNOWN     0x00
-#define HV_EC_FP_ACCESS   0x07
-#define HV_EC_ILLEGAL     0x0e
-#define HV_EC_SVC64       0x15
-#define HV_EC_HVC64       0x16
-#define HV_EC_SMC64       0x17
-#define HV_EC_SYSREG      0x18
-#define HV_EC_IABT_LOWER  0x20
-#define HV_EC_IABT_SAME   0x21
-#define HV_EC_PC_ALIGN    0x22
-#define HV_EC_DABT_LOWER  0x24
-#define HV_EC_DABT_SAME   0x25
-#define HV_EC_SP_ALIGN    0x26
-#define HV_EC_BRK         0x3c
+#define HV_EC_UNKNOWN     0x00u
+#define HV_EC_FP_ACCESS   0x07u
+#define HV_EC_ILLEGAL     0x0eu
+#define HV_EC_SVC64       0x15u
+#define HV_EC_HVC64       0x16u
+#define HV_EC_SMC64       0x17u
+#define HV_EC_SYSREG      0x18u
+#define HV_EC_IABT_LOWER  0x20u
+#define HV_EC_IABT_SAME   0x21u
+#define HV_EC_PC_ALIGN    0x22u
+#define HV_EC_DABT_LOWER  0x24u
+#define HV_EC_DABT_SAME   0x25u
+#define HV_EC_SP_ALIGN    0x26u
+#define HV_EC_BRK         0x3cu
 
 enum { HV_EXC_SYNC = 0, HV_EXC_IRQ = 1, HV_EXC_FIQ = 2, HV_EXC_SERROR = 3 };
 

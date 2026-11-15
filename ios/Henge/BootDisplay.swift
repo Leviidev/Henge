@@ -15,6 +15,7 @@ struct BootDisplay: View {
     @State private var image: CGImage?
     @State private var gpuLive = false
     @State private var stopped = false
+    @State private var wakeups = SessionWakeups()
     @AppStorage("henge.matchScreenColors") private var matchScreenColors = true
     @AppStorage("henge.display.brightness") private var screenBrightness = 1.0
 
@@ -41,7 +42,9 @@ struct BootDisplay: View {
                     .allowsHitTesting(false)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: SessionNativeEvents.changed)) { _ in wakeups.signal() }
         .task {
+            SessionNativeEvents.start()
             var generation = henge_vm_generation()
             // Keep watching the lifecycle after the GPU takes over. Removing
             // GPUScreen clears its last frame on both device and external screens.
@@ -58,13 +61,19 @@ struct BootDisplay: View {
                     gpuLive = false
                 } else {
                     stopped = false
-                    if !gpuLive && henge_vm_gpu_frames() > 0 {
+                    var observation=HengeVmObservation()
+                    guard henge_vm_try_observation(&observation) != 0 else {
+                        await wakeups.wait(seconds:0.1);continue
+                    }
+                    if !gpuLive && observation.counters.gpu_frames > 0 {
                         gpuLive = true
                         image = nil
                     }
                     if !gpuLive { image = Self.snapshot() ?? image }
                 }
-                try? await Task.sleep(nanoseconds: gpuLive ? 250_000_000 : 100_000_000)
+                // Only the firmware framebuffer needs polling. Once Metal is
+                // live, native lifecycle events clear/recreate its target.
+                await wakeups.wait(seconds: state == 1 && !gpuLive ? 0.1 : nil)
             }
         }
     }
@@ -101,6 +110,8 @@ private struct GPUScreen: UIViewRepresentable {
         private let role: DisplayTargetSelection.Role
         private var attached = false
         private var lastSize: CGSize = .zero
+        private var lastWindow: ObjectIdentifier?
+        private var lastScale: CGFloat = 0
 
         init(display: DisplayRouter, role: DisplayTargetSelection.Role, surface: UUID) {
             self.id = surface
@@ -126,14 +137,19 @@ private struct GPUScreen: UIViewRepresentable {
         }
 
         private func attachIfReady() {
-            guard window != nil, bounds.width > 0, bounds.height > 0,
+            guard let window, bounds.width > 0, bounds.height > 0,
                   let metal = layer as? CAMetalLayer else { return }
             if !attached {
                 attached = true
                 lastSize = bounds.size
+                lastWindow = ObjectIdentifier(window); lastScale = window.screen.scale
+                metal.contentsScale = lastScale
+                HengeLog.log("display", "display-viewport: role=\(role) window=\(window.bounds.width)x\(window.bounds.height) layer=\(bounds.width)x\(bounds.height) scale=\(window.screen.scale)")
                 display.connect(id, layer: metal, role: role)
-            } else if lastSize != bounds.size {
+            } else if lastSize != bounds.size || lastWindow != ObjectIdentifier(window) || lastScale != window.screen.scale {
                 lastSize = bounds.size
+                lastWindow = ObjectIdentifier(window); lastScale = window.screen.scale
+                metal.contentsScale = lastScale
                 display.refresh(id)
             }
         }
@@ -149,8 +165,10 @@ private struct GPUScreen: UIViewRepresentable {
         let metalLayer = view.layer as! CAMetalLayer
         // The guest's display profile is sRGB, and the presenter writes sRGB
         // values. A nil colorspace skips matching on wide-gamut iPad screens.
-        metalLayer.colorspace = matchScreenColors ? Self.srgb : nil
-        view.alpha = CGFloat(min(max(brightness, 0.4), 1))
+        let desired = matchScreenColors ? Self.srgb : nil
+        if metalLayer.colorspace !== desired { metalLayer.colorspace = desired }
+        let alpha = CGFloat(min(max(brightness, 0.4), 1))
+        if view.alpha != alpha { view.alpha = alpha }
     }
 
     func makeUIView(context: Context) -> Screen {

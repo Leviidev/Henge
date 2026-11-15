@@ -6,6 +6,12 @@
 #include <time.h>
 
 #include "machine.h"
+#include "gamepad_ds4.h"
+
+/* Keep the old serialized layout: this profile occupies a previously zero
+   padding byte, so old snapshots restore the generic profile without migration. */
+_Static_assert(offsetof(HvXhci,gp_head) ==
+    ((offsetof(HvXhci,gp_reports)+sizeof(((HvXhci *)0)->gp_reports)+3)&~(size_t)3), "gamepad snapshot layout changed");
 
 /* Register layout in BAR 0. */
 #define CAPLENGTH 0x40
@@ -126,6 +132,41 @@ static const uint8_t tp_config_desc[34] = {
 
 static const char *const tp_strings[] = {NULL, "Apple Inc.", "Magic Trackpad 2", "HengeVM"};
 
+/* Port 3: standard HID Digitizers/Touch Screen, five parallel Finger collections.
+   Confidence (TouchValid) remains set in lift reports so macOS classifies them
+   as fingers. No Apple vendor identity or guest userspace virtual HID is used. */
+#define TS_FINGER \
+    0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, \
+    0x09, 0x42, 0x09, 0x47, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 2, 0x81, 2, \
+    0x75, 6, 0x95, 1, 0x81, 3, \
+    0x09, 0x51, 0x25, 0x7f, 0x75, 8, 0x95, 1, 0x81, 2, \
+    0x05, 1, 0x09, 0x30, 0x09, 0x31, 0x16, 0, 0, 0x26, 0xff, 0x7f, \
+    0x75, 16, 0x95, 2, 0x81, 2, 0xc0
+static const uint8_t ts_report_desc[] = {
+    0x05, 0x0d, 0x09, 4, 0xa1, 1, 0x85, 1,
+    TS_FINGER, TS_FINGER, TS_FINGER, TS_FINGER, TS_FINGER,
+    0x05, 0x0d, 0x09, 0x54, 0x15, 0, 0x25, HV_TS_FINGERS,
+    0x75, 8, 0x95, 1, 0x81, 2,
+    0x85, 2, 0x09, 0x55, 0x75, 8, 0x95, 1, 0xb1, 2,
+    /* Read during HID event-driver initialization; its reply waits for UUID binding. */
+    0x85, 3, 0x09, 0xa1, 0x16, 0, 0, 0x26, 0xe8, 3,
+    0x75, 16, 0x95, 1, 0xb1, 2, 0xc0,
+};
+#undef TS_FINGER
+static const uint8_t ts_device_desc[18] = {
+    18, 1, 0, 2, 0, 0, 0, 64,
+    0x09, 0x12, 0x07, 0xd0, /* experimental 0x1209:0xd007 */
+    0, 1, 1, 2, 3, 1,
+};
+static const uint8_t ts_config_desc[34] = {
+    9, 2, 34, 0, 1, 1, 0, 0x80, 50,
+    9, 4, 0, 0, 1, 3, 0, 0, 0, /* HID, no boot mouse/keyboard protocol */
+    9, 0x21, 0x11, 1, 0, 1, 0x22,
+    sizeof ts_report_desc & 0xff, sizeof ts_report_desc >> 8,
+    7, 5, 0x81, 3, HV_TS_REPORT_LEN, 0, 4,
+};
+static const char *const ts_strings[] = {NULL, "Henge", "Henge touchscreen", "HengeTouch1"};
+
 struct HvXhciDev {
     const char *const *strings;
     const uint8_t *device_desc;
@@ -133,9 +174,31 @@ struct HvXhciDev {
     const uint8_t *report_desc;
     unsigned report_desc_len;
 };
+static const uint8_t gp_device_desc[18] = {
+    18,1,0,2,0,0,0,64,0x27,0x06,0x03,0x00,0,1,1,2,3,1
+};
+static const uint8_t gp_config_desc[34] = {
+    9,2,34,0,1,1,0,0x80,25,
+    9,4,0,0,1,3,0,0,0,
+    9,0x21,0x11,0x01,0,1,0x22,sizeof hv_gamepad_descriptor,0,
+    7,5,0x81,3,16,0,8
+};
+static const char *const gp_strings[] = {NULL,"HengeVM","Henge Virtual Gamepad","1"};
+static const uint8_t ds4_device_desc[18] = {
+    18,1,0,2,0,0,0,64,0x4c,0x05,0xc4,0x05,0,1,1,2,3,1
+};
+static const uint8_t ds4_config_desc[41] = {
+    9,2,41,0,1,1,0,0x80,25, 9,4,0,0,2,3,0,0,0,
+    9,0x21,0x11,0x01,0,1,0x22,sizeof hv_ds4_descriptor&255,sizeof hv_ds4_descriptor>>8,
+    7,5,0x81,3,64,0,4, 7,5,0x02,3,64,0,4
+};
+static const char *const ds4_strings[] = {NULL,"Sony Computer Entertainment","Wireless Controller","HENGE-USB-1"};
+static const struct HvXhciDev ds4_dev = {ds4_strings,ds4_device_desc,ds4_config_desc,hv_ds4_descriptor,sizeof hv_ds4_descriptor};
 static const struct HvXhciDev devs[HV_XHCI_DEVICES] = {
     {kbd_strings, kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_report_desc},
     {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
+    {gp_strings, gp_device_desc, gp_config_desc, hv_gamepad_descriptor, sizeof hv_gamepad_descriptor},
+    {ts_strings, ts_device_desc, ts_config_desc, ts_report_desc, sizeof ts_report_desc},
 };
 
 static int xlog(void) {
@@ -320,8 +383,13 @@ static void tp_select(HvXhci *x, int reg) {
    requests), or -1 to stall. */
 static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, int max) {
     const struct HvXhciDev *d = &devs[x->slots[slot].dev];
+    if(x->slots[slot].dev==2 && x->gp_profile==1)d=&ds4_dev;
     uint8_t type = setup[0], req = setup[1];
     uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
+    if(x->slots[slot].dev==2 && x->gp_requests<32) {
+        x->gp_requests++;
+        fprintf(stderr,"hengevm: virtual-gamepad profile=%u setup=%02x/%02x value=%04x (bounded enumeration diagnostics)\n",x->gp_profile,type,req,value);
+    }
     if (xlog()) fprintf(stderr, "xhci: request %02x %02x value %04x len %u\n", type, req, value, setup[6] | setup[7] << 8);
     /* Every request the trackpad gets goes to the log, unconditionally: the guest's
        driver handshake is exactly what we are trying to watch. Capped so a polling
@@ -331,13 +399,16 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
         fprintf(stderr, "hengevm: xhci: tp request %02x %02x value %04x index %04x len %u\n",
                 type, req, value, setup[4] | setup[5] << 8, setup[6] | setup[7] << 8);
     }
+    if (x->slots[slot].dev == 3 && x->ts_reqs++ < 32)
+        fprintf(stderr, "hengevm: xhci: touchscreen request %02x %02x value %04x len %u\n",
+                type, req, value, setup[6] | setup[7] << 8);
     const uint8_t *src = NULL;
     int len = 0;
     uint8_t tmp[HV_TP_REPORT_LEN + 8];
     if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
         uint8_t dt = value >> 8, idx = value & 0xff;
         if (dt == 1) src = d->device_desc, len = 18;
-        else if (dt == 2) src = d->config_desc, len = 34;
+        else if (dt == 2) src = d->config_desc, len = d->config_desc[2] | d->config_desc[3]<<8;
         else if (dt == 3) {
             if (idx == 0) {
                 tmp[0] = 4, tmp[1] = 3, tmp[2] = 0x09, tmp[3] = 0x04; /* English (US) */
@@ -373,7 +444,37 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
         src = tmp, len = 1;
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT: wValue is (type << 8) | report ID */
         if (x->slots[slot].dev == 0) src = x->state, len = 8;
-        else {
+        else if (x->slots[slot].dev == 2) {
+            if (x->gp_profile==1) {
+                if (value==0x101) {
+                    pthread_mutex_lock(&x->mu);hv_ds4_pack(tmp,x->gp_state,x->gp_delivered);pthread_mutex_unlock(&x->mu);
+                    len=HV_DS4_BYTES;
+                } else if ((value>>8)==3) {len=hv_ds4_feature(value&255,tmp,sizeof tmp);if(len<0)return -1;}
+                else return -1;
+                src=tmp;
+            } else {
+                if (value != 0x100) return -1;
+                pthread_mutex_lock(&x->mu);memcpy(tmp,x->gp_state,HV_GAMEPAD_BYTES);pthread_mutex_unlock(&x->mu);
+                src=tmp;len=HV_GAMEPAD_BYTES;
+            }
+        } else if (x->slots[slot].dev == 3) {
+            if (value == 0x0302) {
+                tmp[0] = 2; tmp[1] = HV_TS_FINGERS;
+                src = tmp; len = 2;
+            } else if (value == 0x0303) {
+                pthread_mutex_lock(&x->mu);
+                int mapped = x->ts_mapped;
+                pthread_mutex_unlock(&x->mu);
+                if (!mapped) return -2; /* leave the setup TRB pending, not stalled */
+                tmp[0] = 3; tmp[1] = 60; tmp[2] = 0;
+                src = tmp; len = 3;
+            } else if (value == 0x0101) {
+                pthread_mutex_lock(&x->mu);
+                memcpy(tmp, x->ts_state, HV_TS_REPORT_LEN);
+                pthread_mutex_unlock(&x->mu);
+                src = tmp; len = HV_TS_REPORT_LEN;
+            } else return -1;
+        } else {
             int rtype = value >> 8, rid = value & 0xff;
             if (rtype == 3) { /* feature: the sensor-configuration registers */
                 if (rid == 0x01) { /* the header for the register just selected */
@@ -429,7 +530,7 @@ static void run_ep0(HvXhci *x, int slot) {
     HvXhciRing *r = &x->slots[slot].ep[1];
     uint32_t trb[4];
     uint64_t at;
-    uint8_t setup[8], reply[256];
+    uint8_t setup[8], reply[1024]; /* full 507-byte compatible controller descriptor */
     int reply_len = 0, stalled = 0;
     while (ring_peek(x, r, trb, &at)) {
         int type = (trb[3] >> 10) & 0x3f;
@@ -438,6 +539,10 @@ static void run_ep0(HvXhci *x, int slot) {
             memcpy(setup, trb, 8);
             uint16_t wlen = (uint16_t)(setup[6] | setup[7] << 8);
             reply_len = control(x, slot, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
+            if (reply_len == -2) {
+                x->ts_ep0_waiting |= 1u << slot;
+                return;
+            }
             stalled = reply_len < 0;
             ring_advance(r);
             if (stalled) {
@@ -488,7 +593,7 @@ static void run_ep0(HvXhci *x, int slot) {
 static void run_ep_in(HvXhci *x, int slot) {
     struct HvXhciSlot *s = &x->slots[slot];
     int dci = -1;
-    for (int d = 2; d < HV_XHCI_EPS; d++) if (s->ep_running[d]) { dci = d; break; }
+    for (int d = 3; d < HV_XHCI_EPS; d+=2) if (s->ep_running[d]) { dci = d; break; }
     if (s->dev < 0 || dci < 0) return;
     HvXhciRing *r = &s->ep[dci];
     uint32_t trb[4];
@@ -507,7 +612,19 @@ static void run_ep_in(HvXhci *x, int slot) {
             x->delivered++;
             transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
         }
-    } else {
+    } else if (s->dev == 2) {
+        while (x->gp_online && x->gp_head != x->gp_tail && ring_peek(x,r,trb,&at)) {
+            int type=(trb[3]>>10)&0x3f;ring_advance(r);
+            if (type!=TRB_NORMAL) continue;
+            uint64_t buf=(uint64_t)trb[1]<<32|trb[0];uint32_t want=trb[2]&0x1ffff;
+            const uint8_t *report=x->gp_reports[x->gp_head++%64];uint8_t compatible[HV_DS4_BYTES];
+            uint32_t bytes=HV_GAMEPAD_BYTES;
+            if(x->gp_profile==1){hv_ds4_pack(compatible,report,x->gp_delivered);report=compatible;bytes=HV_DS4_BYTES;}
+            uint32_t n=want<bytes?want:bytes;
+            wr(x,buf,report,n);x->gp_delivered++;
+            transfer_event(x,at,n<want?CC_SHORT_PACKET:CC_SUCCESS,want-n,slot,dci);
+        }
+    } else if (s->dev == 1) {
         while (x->tp_rhead != x->tp_rtail && ring_peek(x, r, trb, &at)) {
             int type = (trb[3] >> 10) & 0x3f;
             ring_advance(r);
@@ -536,7 +653,41 @@ static void run_ep_in(HvXhci *x, int slot) {
             transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
         }
     }
+    if (s->dev == 3) {
+        while (x->ts_rhead != x->ts_rtail && ring_peek(x, r, trb, &at)) {
+            ring_advance(r);
+            if (((trb[3] >> 10) & 0x3f) != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t n = want < HV_TS_REPORT_LEN ? want : HV_TS_REPORT_LEN;
+            const uint8_t *report = x->ts_reports[x->ts_rhead++ % HV_TS_REPORTS];
+            wr(x, buf, report, n);
+            if (n == HV_TS_REPORT_LEN) memcpy(x->ts_device_state, report, n);
+            x->ts_delivered++;
+            if (x->ts_delivered <= 8)
+                fprintf(stderr, "hengevm: xhci: touchscreen: %u bytes delivered (%llu)\n", n, (unsigned long long)x->ts_delivered);
+            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+        }
+    }
     pthread_mutex_unlock(&x->mu);
+}
+
+/* Compatible USB output reports complete on their own OUT endpoint. This
+   virtual controller has no physical motors/light bar; no haptic timer is run. */
+static void run_ep_out(HvXhci *x,int slot,int dci) {
+    struct HvXhciSlot *s=&x->slots[slot];
+    if(s->dev!=2 || x->gp_profile!=1 || dci!=4)return;
+    HvXhciRing *ring=&s->ep[dci];uint32_t trb[4];uint64_t at;
+    while(ring_peek(x,ring,trb,&at)) {
+        ring_advance(ring);
+        if(((trb[3]>>10)&0x3f)!=TRB_NORMAL)continue;
+        uint32_t length=trb[2]&0x1ffff;uint8_t report=0;
+        uint64_t address=(uint64_t)trb[1]<<32|trb[0];
+        if(length)rd(x,address,&report,1);
+        int valid=length>=32 && length<=64 && report==5;
+        transfer_event(x,at,valid?CC_SUCCESS:CC_STALL,valid?0:length,slot,dci);
+        if(!valid){set_ep_state(x,slot,dci,2);s->ep_running[dci]=0;break;}
+    }
 }
 
 /* ---- commands ---- */
@@ -557,7 +708,8 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     rd(x, input + 64, ep0, 32);
     int port = slot_ctx[6]; /* root hub port number, dword 1 bits 23:16 */
     int dev = port - 1;
-    if (dev < 0 || dev >= HV_XHCI_DEVICES) return CC_TRB_ERROR;
+    if (dev < 0 || dev >= HV_XHCI_DEVICES || (dev==3 && !x->ts_enabled)) return CC_TRB_ERROR;
+    if (dev==2 && !x->gp_online) return CC_CONTEXT_STATE;
     x->slots[slot].dev = dev;
     uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot); /* default or addressed; address = slot */
     memcpy(slot_ctx + 12, &dw3, 4);
@@ -704,8 +856,9 @@ static void run_commands(HvXhci *x) {
    Magic Trackpad 2 is. */
 static void port_connect(HvXhci *x) {
     for (int p = 0; p < HV_XHCI_PORTS; p++) {
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
-        port_event(x, p);
+        if ((p==2 && !x->gp_online) || (p==3 && !x->ts_connected)) { x->portsc[p]=PORT_PP;continue; }
+        x->portsc[p]=PORT_PP|PORT_CCS|PORT_CSC|(uint32_t)((p==1 || p==3)?SPEED_HIGH:SPEED_FULL)<<PORT_SPEED_SHIFT|7u<<PORT_PLS_SHIFT;
+        port_event(x,p);
     }
 }
 
@@ -737,6 +890,7 @@ static void port_write(HvXhci *x, int p, uint32_t v) {
 /* ---- registers ---- */
 
 static void reset(HvXhci *x) {
+    pthread_mutex_lock(&x->mu);
     x->usbcmd = 0;
     x->usbsts = 1; /* halted */
     x->dnctrl = x->config = 0;
@@ -750,6 +904,7 @@ static void reset(HvXhci *x) {
     memset(x->reports, 0, sizeof x->reports);
     x->rhead = x->rtail = 0;
     memset(x->state, 0, sizeof x->state);
+    memset(x->key_owners,0,sizeof x->key_owners);
     memset(x->tp_fingers, 0, sizeof x->tp_fingers);
     x->tp_button = 0;
     x->tp_ts = 0;
@@ -760,8 +915,21 @@ static void reset(HvXhci *x) {
     x->tp_db = 0;
     x->tp_multi_logs = 0;
     x->tp_f1_len = 0;
-    for (int p = 0; p < HV_XHCI_PORTS; p++)
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+    x->gp_online=x->gp_desired;
+    x->gp_head=x->gp_tail=0;
+    if (x->gp_desired) memcpy(x->gp_reports[x->gp_tail++],x->gp_state,HV_GAMEPAD_BYTES);
+    x->ts_rhead = x->ts_rtail = x->ts_reqs = 0;
+    x->ts_delivered = 0;
+    x->ts_deadline_ns = 0;
+    x->ts_release_phase = 0;
+    x->ts_release_at_ns = x->ts_release_limit_ns = 0;
+    x->ts_ep0_waiting = 0;
+    x->ts_mapped = x->ts_unmanaged;
+    memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
+    memset(x->ts_device_state, 0, sizeof x->ts_device_state); x->ts_device_state[0] = 1;
+    for(int p=0;p<HV_XHCI_PORTS;p++)
+        x->portsc[p]=(p==2 && !x->gp_online) || (p==3 && !x->ts_connected) ? PORT_PP : PORT_PP|PORT_CCS|PORT_CSC|(uint32_t)((p==1 || p==3)?SPEED_HIGH:SPEED_FULL)<<PORT_SPEED_SHIFT|7u<<PORT_PLS_SHIFT;
+    pthread_mutex_unlock(&x->mu);
     update_irq(x);
 }
 
@@ -774,9 +942,9 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         if (n++ < 60) fprintf(stderr, "xhci: read +%llx (%u)\n", (unsigned long long)off, size);
     }
     if (off < CAPLENGTH) {
-        static const uint32_t cap[8] = {
+        const uint32_t cap[8] = {
             CAPLENGTH | 0x0100u << 16,                           /* CAPLENGTH, HCIVERSION 1.0 */
-            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8 | (uint32_t)HV_XHCI_PORTS << 24, /* slots, interrupters, ports */
+            HV_XHCI_SLOTS | (uint32_t)HV_XHCI_INTRS << 8 | (uint32_t)(x->ts_enabled ? 4 : 3) << 24, /* slots, interrupters, ports */
             1u << 4,                                             /* ERST max 2 segments */
             0,
             1u | (uint32_t)(XECP / 4) << 16,                     /* 64-bit addressing, extended caps */
@@ -789,7 +957,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         if (size == 8 && i + 1 < 8) v |= (uint64_t)cap[i + 1] << 32;
         v >>= 8 * (off & 3);
     } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on every port */
-        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | ((1u << HV_XHCI_PORTS) - 1u) << 8, 0};
+        const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)(x->ts_enabled ? 4 : 3) << 8, 0};
         uint32_t i = (uint32_t)(off - XECP) / 4;
         v = ext[i];
         if (size == 8 && i + 1 < 4) v |= (uint64_t)ext[i + 1] << 32;
@@ -926,34 +1094,119 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t v, unsigned s
             if (state != 1) set_ep_state(x, slot, dci, 1);
             x->slots[slot].ep_running[dci] = 1;
             if (dci == 1) run_ep0(x, slot);
+            else if (!(dci&1)) run_ep_out(x,slot,dci);
             else run_ep_in(x, slot);
         }
     }
 }
 
-/* ---- the keyboard's reports ---- */
+static uint64_t touchscreen_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
 
-void hv_xhci_key(HvXhci *x, uint8_t usage, int down) {
-    if (!x || !usage) return;
-    pthread_mutex_lock(&x->mu);
-    uint8_t *s = x->state;
-    if (usage >= 0xe0 && usage <= 0xe7) { /* modifiers live in byte 0 */
-        uint8_t bit = (uint8_t)(1u << (usage - 0xe0));
-        s[0] = down ? s[0] | bit : s[0] & ~bit;
-    } else {
-        int i;
-        for (i = 2; i < 8 && s[i] != usage; i++) {}
-        if (down && i == 8) { /* not held yet: take a free place */
-            for (i = 2; i < 8 && s[i]; i++) {}
-            if (i < 8) s[i] = usage;
-        } else if (!down && i < 8) { /* let go: close the gap */
-            memmove(s + i, s + i + 1, (size_t)(7 - i));
-            s[7] = 0;
+/* Coordinates may collapse, but every contact membership edge must reach
+   AppKit. Preserve the first position after a down/lift/ID change as well. */
+static int touchscreen_same_contacts(const uint8_t *a, const uint8_t *b) {
+    if (a[31] != b[31]) return 0;
+    for (unsigned i = 0; i < a[31]; i++)
+        if (a[1 + 6*i] != b[1 + 6*i] || a[2 + 6*i] != b[2 + 6*i]) return 0;
+    return 1;
+}
+
+int hv_xhci_touchscreen_report(HvXhci *x, const uint8_t report[HV_TS_REPORT_LEN]) {
+    if (!x || !x->ts_enabled || !report || report[0] != 1 || report[31] > HV_TS_FINGERS) return 0;
+    unsigned count = report[31];
+    for (unsigned i = 0; i < HV_TS_FINGERS; i++) {
+        const uint8_t *finger = report + 1 + 6 * i;
+        if (i >= count) {
+            for (int j = 0; j < 6; j++) if (finger[j]) return 0;
+            continue;
         }
+        if ((finger[0] != 2 && finger[0] != 3) || !finger[1] || finger[1] > 127 ||
+            finger[3] > 127 || finger[5] > 127) return 0;
+        for (unsigned j = 0; j < i; j++) if (report[2 + 6 * j] == finger[1]) return 0;
     }
-    if (x->rtail - x->rhead < HV_XHCI_REPORTS) memcpy(x->reports[x->rtail++ % HV_XHCI_REPORTS], s, 8);
+    pthread_mutex_lock(&x->mu);
+    if (!x->ts_connected || x->ts_release_phase || (x->ts_connection_pending && !x->ts_wanted)) {
+        pthread_mutex_unlock(&x->mu);
+        return 0;
+    }
+    unsigned queued = x->ts_rtail - x->ts_rhead;
+    uint8_t *last = queued ? x->ts_reports[(x->ts_rtail - 1) % HV_TS_REPORTS] : NULL;
+    const uint8_t *before = queued > 1 ? x->ts_reports[(x->ts_rtail - 2) % HV_TS_REPORTS] : x->ts_device_state;
+    int coalesce = last && touchscreen_same_contacts(last, report) && touchscreen_same_contacts(before, last);
+    int accepted = coalesce || queued < HV_TS_REPORTS;
+    if (accepted) {
+        memcpy(x->ts_state, report, HV_TS_REPORT_LEN);
+        if (coalesce) memcpy(last, report, HV_TS_REPORT_LEN);
+        else memcpy(x->ts_reports[x->ts_rtail++ % HV_TS_REPORTS], report, HV_TS_REPORT_LEN);
+    }
+    else {
+        x->ts_rhead = x->ts_rtail = 0;
+        x->ts_wanted = 0; x->ts_connection_pending = 1;
+    }
+    x->ts_deadline_ns = touchscreen_now() + 700000000ull;
     pthread_mutex_unlock(&x->mu);
     hv_machine_wake(x->m);
+    return accepted;
+}
+
+int hv_xhci_touchscreen_connect(HvXhci *x, int connected) {
+    if (!x || !x->ts_enabled || (connected != 0 && connected != 1)) return 0;
+    pthread_mutex_lock(&x->mu);
+    x->ts_wanted = connected;
+    x->ts_connection_pending = 1;
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+    return 1;
+}
+
+int hv_xhci_touchscreen_connected(HvXhci *x) {
+    if (!x) return 0;
+    pthread_mutex_lock(&x->mu);
+    int connected = x->ts_connected;
+    pthread_mutex_unlock(&x->mu); return connected;
+}
+
+void hv_xhci_touchscreen_keepalive(HvXhci *x) {
+    if (!x) return;
+    pthread_mutex_lock(&x->mu);
+    x->ts_deadline_ns = touchscreen_now() + 700000000ull;
+    pthread_mutex_unlock(&x->mu);
+}
+
+int hv_xhci_touchscreen_mapped(HvXhci *x) {
+    if (!x) return 0;
+    pthread_mutex_lock(&x->mu);
+    int accepted = x->ts_connected && x->ts_wanted && !x->ts_release_phase;
+    if (accepted) x->ts_mapped = 1;
+    pthread_mutex_unlock(&x->mu);
+    if (accepted) hv_machine_wake(x->m);
+    return accepted;
+}
+
+/* ---- the keyboard's reports ---- */
+
+void hv_xhci_key_source(HvXhci *x,uint8_t usage,int down,unsigned source) {
+    if (!x || usage<4 || usage>231 || source>7) return;
+    pthread_mutex_lock(&x->mu);
+    uint8_t before=x->key_owners[usage],bit=(uint8_t)(1u<<source);
+    uint8_t after=down ? before|bit : before&~bit;
+    x->key_owners[usage]=after;
+    if (!!before==!!after) {pthread_mutex_unlock(&x->mu);return;}
+    uint8_t *s=x->state;memset(s,0,8);unsigned held=0;
+    for(unsigned k=4;k<224;k++) if(x->key_owners[k]) {if(held<6)s[2+held]=(uint8_t)k;held++;}
+    if(held>6)memset(s+2,1,6); /* boot-keyboard ErrorRollOver, never lose a release */
+    for(unsigned k=224;k<232;k++) if(x->key_owners[k])s[0]|=(uint8_t)(1u<<(k-224));
+    if(x->rtail-x->rhead==HV_XHCI_REPORTS)x->rhead++;
+    memcpy(x->reports[x->rtail++%HV_XHCI_REPORTS],s,8);
+    pthread_mutex_unlock(&x->mu);hv_machine_wake(x->m);
+}
+void hv_xhci_key(HvXhci *x,uint8_t usage,int down) { hv_xhci_key_source(x,usage,down,0); }
+void hv_xhci_release_source(HvXhci *x,unsigned source) {
+    for(unsigned k=4;k<232;k++)hv_xhci_key_source(x,(uint8_t)k,0,source);
 }
 
 /* Linux input key codes to HID keyboard usages (the same table macOS's virtio
@@ -1114,6 +1367,91 @@ void hv_xhci_touch_button(HvXhci *x, int down) {
 
 void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
+    pthread_mutex_lock(&x->mu);
+    int gamepad_changed=x->gp_online!=x->gp_desired;
+    if (gamepad_changed) {
+        x->gp_online=x->gp_desired;
+        x->portsc[2]=(x->portsc[2]&PORT_PP)|PORT_CSC|(x->gp_online ? PORT_CCS|SPEED_FULL<<PORT_SPEED_SHIFT|7u<<PORT_PLS_SHIFT:0);
+    }
+    pthread_mutex_unlock(&x->mu);
+    if (gamepad_changed) {
+        fprintf(stderr,"hengevm: virtual-gamepad %s profile=%s\n",x->gp_online?"connected":"disconnected",x->gp_profile==1?"PS4-compatible":"generic HID");
+        port_event(x,2);
+    }
+    int changed = 0;
+    pthread_mutex_lock(&x->mu);
+    uint64_t now = touchscreen_now();
+    if (x->ts_connected && !x->ts_release_phase && x->ts_deadline_ns && now >= x->ts_deadline_ns) {
+        for (unsigned i = 0; i < HV_TS_FINGERS; i++) {
+            if (!(x->ts_state[1 + 6*i] & 1) && !(x->ts_device_state[1 + 6*i] & 1)) continue;
+            x->ts_wanted = 0; x->ts_connection_pending = 1;
+            break;
+        }
+    }
+    if (x->ts_connection_pending && !x->ts_release_phase) {
+        if (x->ts_connected && !x->ts_wanted && x->ts_device_state[31]) {
+            /* macOS does not reliably send an app a cancellation on USB
+               removal. Deliver explicit lifts, then a neutral frame first. */
+            x->ts_rhead = x->ts_rtail = 0;
+            memcpy(x->ts_state, x->ts_device_state, sizeof x->ts_state);
+            for (unsigned i = 0; i < x->ts_state[31]; i++) x->ts_state[1 + 6*i] = 2;
+            memcpy(x->ts_reports[x->ts_rtail++ % HV_TS_REPORTS], x->ts_state, HV_TS_REPORT_LEN);
+            x->ts_release_phase = 1;
+            x->ts_release_at_ns = now + 60000000ull;
+            x->ts_release_limit_ns = now + 500000000ull;
+        } else {
+            x->ts_connection_pending = 0;
+            if (x->ts_connected != x->ts_wanted) {
+                x->ts_connected = x->ts_wanted;
+                x->ts_mapped = x->ts_unmanaged;
+                x->ts_ep0_waiting = 0;
+                x->ts_rhead = x->ts_rtail = 0;
+                x->ts_deadline_ns = 0;
+                memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
+                memset(x->ts_device_state, 0, sizeof x->ts_device_state); x->ts_device_state[0] = 1;
+                changed = 1;
+            }
+        }
+    }
+    if (x->ts_release_phase &&
+        ((now >= x->ts_release_at_ns && x->ts_rhead == x->ts_rtail) || now >= x->ts_release_limit_ns)) {
+        if (x->ts_release_phase == 1 && now < x->ts_release_limit_ns) {
+            memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
+            memcpy(x->ts_reports[x->ts_rtail++ % HV_TS_REPORTS], x->ts_state, HV_TS_REPORT_LEN);
+            x->ts_release_phase = 2;
+            x->ts_release_at_ns = now + 60000000ull;
+        } else {
+            x->ts_release_phase = 0;
+            x->ts_connected = 0;
+            x->ts_mapped = 0;
+            x->ts_ep0_waiting = 0;
+            x->ts_connection_pending = x->ts_wanted;
+            x->ts_rhead = x->ts_rtail = 0;
+            x->ts_deadline_ns = 0;
+            memset(x->ts_state, 0, sizeof x->ts_state); x->ts_state[0] = 1;
+            memset(x->ts_device_state, 0, sizeof x->ts_device_state); x->ts_device_state[0] = 1;
+            changed = 1;
+        }
+    }
+    int mapped = x->ts_mapped;
+    pthread_mutex_unlock(&x->mu);
+    if (changed) {
+        x->portsc[3] = PORT_PP | PORT_CSC;
+        if (x->ts_connected)
+            x->portsc[3] |= PORT_CCS | SPEED_HIGH << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        else for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++) {
+            if (x->slots[slot].dev != 3) continue;
+            memset(x->slots[slot].ep_running, 0, sizeof x->slots[slot].ep_running);
+        }
+        port_event(x, 3);
+    }
+    if (mapped && x->ts_ep0_waiting) {
+        for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++) {
+            if (!(x->ts_ep0_waiting & (1u << slot))) continue;
+            x->ts_ep0_waiting &= ~(1u << slot);
+            if (x->slots[slot].dev == 3 && x->slots[slot].ep_running[1]) run_ep0(x, slot);
+        }
+    }
     for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
         if (x->slots[slot].dev >= 0) run_ep_in(x, slot);
 }
@@ -1121,7 +1459,16 @@ void hv_xhci_poll(HvXhci *x) {
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     HvXhci *x = calloc(1, sizeof *x);
     x->m = m;
+    const char *touchscreen = getenv("HV_USB_TOUCHSCREEN");
+    x->ts_enabled = !touchscreen || strcmp(touchscreen, "0");
+    /* The ordinary helper installs its UUID observer before attaching touch.
+       Research runs can still request immediate attachment explicitly. */
+    x->ts_unmanaged = touchscreen && !strcmp(touchscreen, "1") && !getenv("HV_USB_TOUCHSCREEN_DELAYED");
+    x->ts_connected = x->ts_wanted = x->ts_unmanaged;
     pthread_mutex_init(&x->mu, NULL);
+    const char *profile=getenv("HV_GAMEPAD_PROFILE");x->gp_profile=profile&&!strcmp(profile,"ds4")?1:0;
+    fprintf(stderr,"hengevm: virtual-gamepad profile=%s; USB is emulated, not physical passthrough\n",x->gp_profile?"PS4-compatible (experimental)":"generic HID");
+    hv_gamepad_neutral(x->gp_state);
     /* QEMU's xHCI IDs. Class 0x0c0330 with revision 0: macOS's IOPCIClassMatch compares all 32 bits. */
     hv_pci_init(&x->pci, 0x1b36, 0x000d, 0x0c033000, 0x1af4, 0x1100);
     x->pci.opaque = x;
@@ -1136,4 +1483,52 @@ HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
     }
     reset(x);
     return x;
+}
+
+/* Focus/background interruption can swallow the physical key/touch-up event.
+   Deliver one released keyboard and the touch stop/empty pair after resuming. */
+void hv_xhci_release_input(HvXhci *x) {
+    if (!x) return;
+    pthread_mutex_lock(&x->mu);
+    memset(x->state, 0, sizeof x->state);
+    memset(x->key_owners,0,sizeof x->key_owners);
+    x->rhead = x->rtail;
+    memcpy(x->reports[x->rtail++ % HV_XHCI_REPORTS], x->state, sizeof x->state);
+    x->tp_rhead = x->tp_rtail;
+    x->tp_button = 0;
+    for (int i = 0; i < HV_TP_FINGERS; i++) if (x->tp_fingers[i].in) x->tp_fingers[i].state = 7;
+    tp_queue(x, 0);
+    hv_gamepad_neutral(x->gp_state);
+    x->gp_desired=0; /* virtual control surface is released across VM pause/stop */
+    x->ts_rhead=x->ts_rtail=0;x->ts_wanted=0;x->ts_connection_pending=1;
+    x->ts_deadline_ns=0;x->ts_ep0_waiting=0;x->ts_mapped=0;
+    x->gp_head=x->gp_tail;
+    memcpy(x->gp_reports[x->gp_tail++%64],x->gp_state,HV_GAMEPAD_BYTES);
+    memset(x->tp_fingers, 0, sizeof x->tp_fingers);
+    tp_queue(x, 0);
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+void hv_xhci_gamepad(HvXhci *x,int connected,uint16_t buttons,unsigned hat,
+                     const int16_t axes[4],uint8_t left,uint8_t right) {
+    if (!x || !axes) return;
+    uint8_t report[HV_GAMEPAD_BYTES];
+    if (connected) hv_gamepad_pack(report,buttons,hat,axes,left,right);
+    else hv_gamepad_neutral(report);
+    pthread_mutex_lock(&x->mu);
+    int changed=x->gp_desired!=!!connected || memcmp(x->gp_state,report,sizeof report);
+    x->gp_desired=!!connected;
+    if (changed) {
+        memcpy(x->gp_state,report,sizeof report);
+        if (x->gp_tail!=x->gp_head && !memcmp(x->gp_reports[(x->gp_tail-1)%64],report,3) &&
+            !memcmp(x->gp_reports[(x->gp_tail-1)%64]+11,report+11,2)) {
+            memcpy(x->gp_reports[(x->gp_tail-1)%64],report,sizeof report);x->gp_coalesced++;
+        } else {
+            if (x->gp_tail-x->gp_head==64) {x->gp_head++;x->gp_overflow++;}
+            memcpy(x->gp_reports[x->gp_tail++%64],report,sizeof report);
+        }
+    }
+    pthread_mutex_unlock(&x->mu);
+    if (changed) hv_machine_wake(x->m);
 }

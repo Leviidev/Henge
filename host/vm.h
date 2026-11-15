@@ -31,6 +31,7 @@ int hv_vm_create(const HvVmConfig *cfg, char *err, size_t errlen);
    JIT memory stays owned by the app and can be attached to the next machine. */
 void hv_vm_destroy(void);
 HvMachine *hv_vm_machine(void);
+int hv_vm_audio_event(int recover);
 HvVmapple *hv_vm_board(void);
 HvCpu *hv_vm_cpu(int index);
 extern void (*hv_prof_register)(void); /* debugging: each thread that will run guest code calls this */
@@ -66,6 +67,7 @@ void hv_vm_cpu_qos(void);
 int hv_vm_run_cpu0(void);
 /* Stop at the next block; the CPUs' threads end. */
 void hv_vm_stop(void);
+void hv_vm_log_ticker(void);
 /* Instant resume (see snapshot.h). hv_vm_pause stops every CPU at a block boundary and quiets the devices (disk
    requests finished, the GPU's own memory copied back into the guest's, sound stopped), keeping the machine whole:
    0, or -1 if it stopped for good instead (shut down, or a CPU stopped it at the same moment). A machine whose CPU 0
@@ -82,7 +84,12 @@ uint64_t hv_vm_resume_counter(uint64_t counter, int64_t wall_ns);
 int64_t hv_vm_paused_wall_ns(void);
 /* After a resume (or a long pause): the network link down for 2 s, 1.5 s from now. */
 void hv_vm_link_flap(void);
-void hv_vm_flush_disks(void);
+#if HV_VM_TESTING
+uint64_t hv_vm_test_network_token(void);
+int hv_vm_test_network_apply(uint64_t token, int up);
+#endif
+int hv_vm_flush_disks(void);
+int hv_vm_sync_disks(void);
 /* The disk and auxiliary storage files as they are now (inode, size, last change): a saved machine resumes only onto these. */
 int hv_vm_disk_identity(char *out, size_t n);
 const char *hv_vm_reason_name(int reason);
@@ -100,6 +107,10 @@ void hv_vm_mouse_hwheel(int dx);
 void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
 void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void hv_vm_touch_button(int down); /* the pad's full press (a click) */
+void hv_vm_gamepad(int connected,uint16_t buttons,unsigned hat,const int16_t axes[4],uint8_t left,uint8_t right);
+void hv_vm_key_hid_source(uint8_t usage,int down,unsigned source);
+void hv_vm_mouse_button_source(int button,int down,unsigned source);
+void hv_vm_release_input_source(unsigned source);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

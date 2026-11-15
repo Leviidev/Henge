@@ -20,11 +20,17 @@ struct KeyboardCatcher: UIViewRepresentable {
         let typer = CatcherView()
         var typing = false
         private var hiding: NSObjectProtocol?
+        private var recovery: [NSObjectProtocol] = []
 
         override init(frame: CGRect) {
             super.init(frame: frame)
             addSubview(listener)
             addSubview(typer)
+            for name in [LocalPointerInput.changed, UIApplication.didBecomeActiveNotification] {
+                recovery.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.takeKeyboard()
+                })
+            }
             hiding = NotificationCenter.default.addObserver(forName: UIResponder.keyboardWillHideNotification,
                                                             object: nil, queue: .main) { [weak self] _ in
                 self?.keyboardHid()
@@ -35,6 +41,7 @@ struct KeyboardCatcher: UIViewRepresentable {
 
         deinit {
             if let hiding { NotificationCenter.default.removeObserver(hiding) }
+            recovery.forEach(NotificationCenter.default.removeObserver)
         }
 
         /// iPadOS's own hide-keyboard key closes the keyboard without asking the app, which then went on
@@ -52,7 +59,7 @@ struct KeyboardCatcher: UIViewRepresentable {
 
         /// Called often, which also takes the keyboard back after a sheet has had it.
         func takeKeyboard() {
-            guard let window, window.rootViewController?.presentedViewController == nil else { return }
+            guard let window, window.windowScene?.activationState == .foregroundActive, window.rootViewController?.presentedViewController == nil else { return }
             let holder: UIView = typing ? typer : listener
             if !holder.isFirstResponder { holder.becomeFirstResponder() }
         }
@@ -61,6 +68,12 @@ struct KeyboardCatcher: UIViewRepresentable {
     /// Whichever view holds the keyboard hears a hardware keyboard's keys here.
     class KeyListener: UIView {
         override var canBecomeFirstResponder: Bool { true }
+        override func resignFirstResponder() -> Bool {
+            let wasFocused = isFirstResponder
+            let resigned = super.resignFirstResponder()
+            if wasFocused && resigned { HardwareKeys.releaseAll() }
+            return resigned
+        }
         /// Fingers belong to the session (they drive the Mac's trackpad), not to iPadOS's undo/copy/paste bar.
         override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
@@ -162,6 +175,10 @@ enum Keys {
             type(c)
             try? await Task.sleep(nanoseconds: 25_000_000)
         }
+    }
+
+    static func canType(_ c: Character) -> Bool {
+        letters[c] != nil || (c.lowercased().first.flatMap { letters[$0] } != nil) || plain[c] != nil || shifted[c] != nil
     }
 
     static func type(_ c: Character) {
