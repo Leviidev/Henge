@@ -24,15 +24,21 @@ struct SessionView: View {
     @AppStorage("henge.cpus") private var cpus = 4
     @AppStorage("henge.matchScreenColors") private var matchScreenColors = true
     @AppStorage("henge.display.brightness") private var screenBrightness = 1.0
-    @AppStorage("henge.cursor.scale") private var cursorScale = Device.isPad ? 1 : 3
+    @AppStorage("henge.cursor.scale") private var cursorScale = 0 // 0: automatic (pvg_metal.m cursor_scale)
     @AppStorage("henge.cursor.sharp") private var sharpCursor = true
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
+    @Environment(\.horizontalSizeClass) private var horizontalSize
+    @Environment(\.verticalSizeClass) private var verticalSize
 
     @State private var typing = false
     @State private var zoomed = false
     @State private var showDetails = false
     @State private var controlsHidden = false
+    @State private var hiddenOnLargeScreen = false // which of an iPhone Duo's two screens they were hidden on
     @State private var showRevealHint = false
+    /// The pill tucked into a small handle at the top, off the Mac's menu bar, a few seconds after it was last used.
+    @State private var pillTucked = false
+    @State private var pillTuck: Task<Void, Never>?
     @State private var pointerRefused = false
     @AppStorage("henge.controls.hintsShown") private var revealHintsShown = 0
     @AppStorage(VolumeClicks.inputModeKey) private var inputMode = VolumeClicks.InputMode.touchscreen
@@ -56,7 +62,9 @@ struct SessionView: View {
             let full = CGSize(width: geo.size.width + insets.leading + insets.trailing,
                               height: geo.size.height + insets.top + insets.bottom)
             let landscape = full.width > full.height
-            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: mac.aspect)
+            let strip: CGFloat = !Device.isPad && !(mac.fillScreen ?? true) ? Device.sideStrip : 0
+            let layout = Layout(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing, centre: zoomCentre, aspect: aspect, strip: strip)
+            let space = Layout.space(full: full, insets: insets, landscape: landscape, zoomed: zoomed, typing: typing)
             ZStack(alignment: .topLeading) {
                 (landscape || zoomed ? Color.black : Desk.page)
                 // One view in every layout: it holds the layer the engine draws into.
@@ -147,6 +155,7 @@ struct SessionView: View {
             .animation(.easeInOut(duration: 0.25), value: zoomed)
             .animation(.easeInOut(duration: 0.25), value: typing)
             .animation(.easeInOut(duration: 0.25), value: controlsHidden)
+            .animation(.easeInOut(duration: 0.25), value: pillTucked)
             .animation(.easeInOut(duration: 0.25), value: showRevealHint)
             .animation(.easeInOut(duration: 0.25), value: showWallpaperTip)
             .onReceive(NotificationCenter.default.publisher(for: UIPointerLockState.didChangeNotification)) { _ in
@@ -159,10 +168,23 @@ struct SessionView: View {
                 controlsHidden = false
                 showRevealHint = false
             }
-            .onAppear { shown = layout.shown }
+            .onAppear {
+                shown = layout.shown
+                wantSize(space)
+                display.picture = layout.screen
+                display.full = full
+                HengeLog.log("session", "layout: \(Int(full.width))x\(Int(full.height)) points, insets top \(Int(insets.top)) left \(Int(insets.leading)) "
+                             + "bottom \(Int(insets.bottom)) right \(Int(insets.trailing)), Mac at \(Int(layout.screen.minX)),\(Int(layout.screen.minY)) "
+                             + "\(Int(layout.screen.width))x\(Int(layout.screen.height)), fill \(mac.fillScreen ?? true)")
+            }
             .onChange(of: layout.shown) { shown = $0 }
+            .onChange(of: layout.screen) { display.picture = $0 }
+            .onChange(of: full) { display.full = $0 }
+            .onChange(of: space) { wantSize($0) }
         }
-        .statusBarHidden(zoomed || Device.isPad)
+        // An iPhone's large screen (iPhone Duo unfolded: regular both ways) keeps its status bar on its side too,
+        // over the Mac's menu bar extras: a Mac that fills the screen hides it, one with a side strip has it there.
+        .statusBarHidden(zoomed || Device.isPad || (onLargeScreen && (mac.fillScreen ?? true)))
         .persistentSystemOverlays(.hidden)
         .sheet(isPresented: $showDetails) { details }
         .confirmationDialog("Shut down \(mac.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
@@ -184,6 +206,9 @@ struct SessionView: View {
             HardwareKeys.releaseAll()
             HardwareMouse.shared.releaseButtons()
             VolumeClicks.shared.releaseButtons()
+            // While docked to an external display, locking the phone makes the phone's scene inactive/background
+            // even though the external monitor stays visible; keep the Mac running unless there is no external display.
+            guard !display.isExternal else { return }
             if phase == .inactive { InstantResume.pause() }
             if phase == .background && bootRAM > 0 { InstantResume.suspend(mac, ramMB: bootRAM, cpus: cpus) }
         }
@@ -211,6 +236,17 @@ struct SessionView: View {
         .task { await Sharing.followMacClipboard() }
     }
 
+    /// The shape of the Mac's screen now: what macOS took last, which can differ from the Mac's setting once it
+    /// follows the space it is shown in.
+    private var aspect: CGFloat { display.aspect ?? mac.aspect }
+    private var macScreen: (width: Int, height: Int) { display.screen.map { ($0.width, $0.height) } ?? mac.screen }
+
+    /// The Mac's screen follows the space it has on this device: a rotation, a fold or unfold, a window resized.
+    private func wantSize(_ space: CGSize?) {
+        let scale = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen.scale }.first ?? 2
+        display.want(space.flatMap { DisplayRouter.Size.fitting($0, scale: scale, retina: mac.isRetina) })
+    }
+
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
     private var pointerNeeded: Bool { state == 2 || showDetails || confirmStop || error != nil }
 
@@ -225,12 +261,21 @@ struct SessionView: View {
         let pad: CGRect
         let insets: EdgeInsets
         var barY: CGFloat?    // where the controls go in the space beside the screen, if it has room for them
+        var sideX: CGFloat?   // where they go as a column, in the strip a Mac leaves at the right of a large screen
 
         var shown: CGSize {
             CGSize(width: min(touch.width / max(screen.width, 1), 1), height: min(touch.height / max(screen.height, 1), 1))
         }
 
-        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat) {
+        /// The space the Mac's screen could fill, whatever its shape: on its side, not zoomed in and not typing.
+        /// Elsewhere nil, and the Mac keeps the shape it has (upright, it sits small above the trackpad).
+        static func space(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool) -> CGSize? {
+            guard landscape, !zoomed, !typing else { return nil }
+            let side = Device.isPad && full.height >= 600 ? 2 * max(insets.leading, insets.trailing) : 0
+            return CGSize(width: full.width - side, height: full.height)
+        }
+
+        init(full: CGSize, insets: EdgeInsets, landscape: Bool, zoomed: Bool, typing: Bool, centre: CGPoint, aspect: CGFloat, strip: CGFloat) {
             self.insets = insets
             let big = full.height >= 600 // an iPad on its side, or a window on one
             if zoomed {
@@ -250,15 +295,22 @@ struct SessionView: View {
                 let room = typing ? full.height - insets.bottom - insets.top - bar - 8 : full.height
                 // An iPad keeps clear of its side insets; a big iPhone (iPhone Duo) fills edge to edge.
                 let side = Device.isPad ? 2 * max(insets.leading, insets.trailing) : 0
-                let height = max(min(room, (full.width - side) / aspect), 200)
+                // The strip at the right, for the status bar's column and the controls (not while typing: the
+                // keyboard covers most of it, and the controls go back above the Mac).
+                let strip = typing ? 0 : strip
+                let height = max(min(room, (full.width - side - strip) / aspect), 200)
                 let width = height * aspect
                 let y = typing ? insets.top + bar : (full.height - height) / 2
-                screen = CGRect(x: (full.width - width) / 2, y: y, width: width, height: height)
+                screen = CGRect(x: (full.width - strip - width) / 2, y: y, width: width, height: height)
                 touch = CGRect(origin: .zero, size: full)
                 fillsPhone = true
                 toolsY = 0
                 pad = .zero
-                if y - insets.top >= 54 { barY = insets.top + (y - insets.top) / 2 }
+                if strip > 0 {
+                    sideX = full.width - Device.sideStripCentre
+                } else if y - insets.top >= 54 {
+                    barY = insets.top + (y - insets.top) / 2
+                }
             } else if landscape {
                 // Edge to edge. Phones wider than the Mac fill the height with room to spare beside the
                 // Dynamic Island; a squarer phone (iPhone Duo) fills all of it, island and corners included.
@@ -286,7 +338,7 @@ struct SessionView: View {
     // MARK: Upright
 
     @ViewBuilder private func uprightControls(_ layout: Layout) -> some View {
-        if !typing && !controlsHidden {
+        if !typing && !controlsAreHidden {
             HStack {
                 tool("eye.slash", "Hide controls") { hideControls() }
                 Spacer()
@@ -357,9 +409,17 @@ struct SessionView: View {
         .tint(Desk.raised)
     }
 
+    /// An iPhone's large screen: an iPhone Duo unfolded, regular both ways.
+    private var onLargeScreen: Bool { !Device.isPad && horizontalSize == .regular && verticalSize == .regular }
+
+    /// Hidden controls stay hidden on the screen they were hidden on: folding an iPhone Duo moves the Mac to its
+    /// other screen, where they are back (and hidden again when it is unfolded).
+    private var controlsAreHidden: Bool { controlsHidden && hiddenOnLargeScreen == onLargeScreen }
+
     /// Hides the session's controls; four fingers on the screen bring them back. The first few times say so.
     private func hideControls() {
         controlsHidden = true
+        hiddenOnLargeScreen = onLargeScreen
         typing = false
         guard revealHintsShown < 3 else { return }
         revealHintsShown += 1
@@ -367,8 +427,40 @@ struct SessionView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { showRevealHint = false }
     }
 
+    /// What is left of the pill when it is tucked: a short bar at the top edge, brought back by a tap or a pull down.
+    private var pillHandle: some View {
+        Capsule().fill(Color.white.opacity(0.75))
+            .frame(width: 44, height: 5)
+            .shadow(color: .black.opacity(0.5), radius: 2)
+            .frame(width: 120, height: 22)
+            .contentShape(Rectangle())
+            .onTapGesture { untuckPill() }
+            .gesture(DragGesture(minimumDistance: 6).onEnded { if $0.translation.height > 0 { untuckPill() } })
+            .accessibilityElement()
+            .accessibilityLabel("Show controls")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { untuckPill() }
+            .transition(.opacity)
+    }
+
+    private func untuckPill() {
+        pillTucked = false
+        tuckPillLater()
+    }
+
+    /// Tucks the pill away once it has gone unused a few seconds (VoiceOver keeps it out).
+    private func tuckPillLater() {
+        pillTuck?.cancel()
+        guard !UIAccessibility.isVoiceOverRunning else { return }
+        pillTuck = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled, !showDetails, !confirmStop else { return }
+            pillTucked = true
+        }
+    }
+
     private func tool(_ symbol: String, _ label: String, tint: Color = Desk.text, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+        Button(action: { action(); if !pillTucked { tuckPillLater() } }) {
             Image(systemName: symbol)
                 .font(.system(size: 19, weight: .medium))
                 .foregroundStyle(tint)
@@ -385,31 +477,56 @@ struct SessionView: View {
         let top = layout.insets.top + (landscape ? 8 : 6)
         let pill = HStack(spacing: 4) {
             tool("eye.slash", "Hide controls", tint: .white) { hideControls() }
-            tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
-            pasteTool
-            tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
-            tool("info.circle", "Details", tint: .white) { showDetails = true }
+            floatingTools
             Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 22).padding(.horizontal, 4)
             tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
         }
         .padding(.horizontal, 8)
         .frame(height: 50)
         .deskGlass(in: Capsule())
-        if controlsHidden {
+        // Over the Mac's menu bar (on its side, no room beside the screen) the pill tucks away to a handle when idle.
+        let overMac = layout.barY == nil && landscape && !typing
+        if let sideX = layout.sideX {
+            // A column under the status bar's own, in the strip the Mac leaves. It is not over the Mac, so it
+            // has no button to hide it and is there whatever that button did before.
+            let room = layout.touch.height - Device.sideStripTop
+            VStack(spacing: 4) {
+                floatingTools
+                Rectangle().fill(Color.white.opacity(0.3)).frame(width: 22, height: 1).padding(.vertical, 4)
+                tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
+            }
+            .padding(.vertical, 8)
+            .frame(width: 50)
+            .deskGlass(in: Capsule())
+            .frame(width: 50, height: room, alignment: .top)
+            .position(x: sideX, y: Device.sideStripTop + room / 2)
+        } else if controlsAreHidden {
             EmptyView()
         } else if let barY = layout.barY {
             pill.position(x: layout.touch.midX, y: barY)
+        } else if overMac && pillTucked {
+            pillHandle.position(x: layout.touch.midX, y: layout.insets.top + 11)
         } else if landscape || typing {
             pill.position(x: layout.touch.midX, y: top + 25)
+                .onAppear { if overMac { tuckPillLater() } }
+                .onChange(of: overMac) { if $0 { tuckPillLater() } }
         } else {
             pill.position(x: layout.touch.midX, y: layout.touch.height - layout.insets.bottom - 34)
         }
         if zoomed { zoomMap(layout) }
     }
 
+    /// The controls a column has too.
+    @ViewBuilder private var floatingTools: some View {
+        tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
+        pasteTool
+        tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
+        tool("info.circle", "Details", tint: .white) { showDetails = true }
+    }
+
     /// The whole screen, small, with where the zoomed view is on it.
     private func zoomMap(_ layout: Layout) -> some View {
-        let width: CGFloat = 112, height = width / mac.aspect
+        let width: CGFloat = 112, height = width / aspect
         let viewW = min(layout.touch.width / layout.screen.width, 1) * width
         let viewH = min(layout.touch.height / layout.screen.height, 1) * height
         let left = (-layout.screen.minX / layout.screen.width) * width
@@ -435,9 +552,9 @@ struct SessionView: View {
         while !Task.isCancelled {
             var x: Int32 = 0, y: Int32 = 0
             if henge_vm_pointer(&x, &y) == 0 {
-                moveZoom(toward: CGPoint(x: CGFloat(x) / CGFloat(mac.screen.width), y: CGFloat(y) / CGFloat(mac.screen.height)))
+                moveZoom(toward: CGPoint(x: CGFloat(x) / CGFloat(macScreen.width), y: CGFloat(y) / CGFloat(macScreen.height)))
             }
-            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / mac.aspect)) { map = UIImage(cgImage: image) }
+            if tick % 60 == 0, let image = MacPreview.capture(width: 224, height: Int(224 / aspect)) { map = UIImage(cgImage: image) }
             tick += 1
             try? await Task.sleep(nanoseconds: 33_000_000)
         }
@@ -498,6 +615,7 @@ struct SessionView: View {
                 }
                 Section("Pointer") {
                     Picker("Size", selection: $cursorScale) {
+                        Text("Auto").tag(0)
                         Text("1×").tag(1)
                         Text("2×").tag(2)
                         Text("3×").tag(3)
@@ -506,7 +624,7 @@ struct SessionView: View {
                     Toggle("Sharp edges", isOn: $sharpCursor)
                     LabeledContent("Scroll speed", value: String(format: "%.1f×", scrollSpeed))
                     Slider(value: $scrollSpeed, in: 0.1...1.5)
-                    Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed changes apply immediately.")
+                    Text("Auto shows the pointer the size macOS draws it on a Retina Mac, and enlarges it on a 1x Mac, whose pointer is a few dots across on a phone. Enlarging it can look blurry. Scroll speed changes apply immediately.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Sharing") {
@@ -597,14 +715,24 @@ struct SessionView: View {
         var buffer = [CChar](repeating: 0, count: 256)
         JITBootstrap.releaseLingeringDebugger()
         Sharing.prepare()
+        // What the guest's display driver answers when macOS asks whether this is a built-in panel: only a
+        // built-in display gets macOS's panel artwork (rounded corners, insets), so a Mac shown on a monitor
+        // answers external there. It is read once per guest boot: moving the Mac between screens needs a boot.
+        let docked = UIApplication.shared.connectedScenes.contains {
+            ($0 as? UIWindowScene)?.session.role == .windowExternalDisplayNonInteractive
+        } || UIScreen.screens.count > 1 || display.isExternal
+        EngineTuning.session["HV_PVG_EXTERNAL"] = docked ? "1" : "0"
         EngineTuning.apply()
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
         if mac.isRetina {
-            henge_vm_set_display_mm(UInt32(Device.retinaMM.width), UInt32(Device.retinaMM.height))
+            let mm = Device.retinaMM(fill: mac.fillScreen ?? true)
+            henge_vm_set_display_mm(UInt32(mm.width), UInt32(mm.height))
         } else {
             henge_vm_set_display_mm(0, 0)
         }
         HengeLog.log("session", "screen \(mac.screen.width)x\(mac.screen.height) retina \(mac.isRetina)")
+        // Fit and Retina follow the space the Mac is shown in; a size picked for speed or 16:9 stays as picked.
+        display.begin(screen: mac.screen, follows: mac.isRetina || mac.screen == Device.fittingScreen, retina: mac.isRetina)
         var rc: Int32 = -1
         if InstantResume.enabled, let at = InstantResume.saved(for: mac, ramMB: ram, cpus: cpus) {
             HengeLog.log("resume", "picking up the Mac saved \(Int(Date().timeIntervalSince(at))) s ago")
@@ -628,6 +756,7 @@ struct SessionView: View {
         }
         bootRAM = ram
         started = Date()
+        display.setRunning(true)
         var used = mac
         used.lastUsed = started
         Machines.shared.update(used)
@@ -657,6 +786,7 @@ struct SessionView: View {
                 HengeLog.log("session", "thermal state: \(Self.thermalLabel(heat))")
             }
             if state == 2 {
+                display.setRunning(false)
                 typing = false
                 showDetails = false
                 confirmStop = false
@@ -671,6 +801,7 @@ struct SessionView: View {
                 }
                 break
             }
+            display.sync()
             tick += 1
             if tick % 10 == 0 {
                 let gpuFrames = henge_vm_gpu_frames()
