@@ -115,7 +115,7 @@ $(B)/test_dt_fixup: tests/test_dt_fixup.c host/dt_fixup.c host/dt_fixup.h | $(B)
 $(B)/test_%: tests/test_%.c tests/%_programs.S tests/harness.S tests/harness.h $(ENGINE)
 	$(CC) $(CFLAGS) -Itests tests/test_$*.c tests/$*_programs.S tests/harness.S $(ENGINE) -o $@
 
-test: all
+test: all test-install-disk-size
 	@ulimit -s 65520; for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done # a test keeps a whole HvCpu (2 MB of TLB and more) on its stack
 
 $(B):
@@ -275,3 +275,9 @@ $(B)/test_device_identity: ios/Henge/DeviceIdentity.swift tests/test_device_iden
 test-identity: $(B)/test_device_identity
 	$(B)/test_device_identity
 .PHONY: test-identity
+
+# Real installer preparation and interrupted-install recovery, with sparse disk images.
+# Requires macOS/Xcode (uses xcrun and Foundation).
+test-install-disk-size:
+	python3 tests/check_install_disk_size.py
+.PHONY: test-install-disk-size

@@ -9,6 +9,7 @@ struct InstallView: View {
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.recommended
     @State private var name = "Mac"
     @State private var ramGB = Device.suggestedRAMGB
+    @State private var diskGiB = Installer.defaultDiskGiB
     @State private var deleteAfter = false
     @State private var refresh = 0 // redraws the list when a download is deleted
     @State private var details = false
@@ -111,6 +112,22 @@ struct InstallView: View {
                     .padding(.bottom, 10)
             }
             Rectangle().fill(Desk.hairline).frame(height: 0.5)
+            Picker("Disk size", selection: $diskGiB) {
+                ForEach(Installer.supportedDiskGiB, id: \.self) { size in
+                    Text("\(size) GiB").tag(size)
+                }
+            }
+            .pickerStyle(.menu)
+            .font(.system(size: 16))
+            .padding(.horizontal, 17)
+            .padding(.vertical, 10)
+            Text("Choose the disk size for this new Mac. Storage is used as the disk fills up. The size cannot be changed here after installation.")
+                .font(.system(size: 13))
+                .foregroundStyle(Desk.dim)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 17)
+                .padding(.bottom, 10)
+            Rectangle().fill(Desk.hairline).frame(height: 0.5)
             Toggle("Delete the download after", isOn: $deleteAfter)
                 .font(.system(size: 16))
                 .padding(.horizontal, 17)
@@ -119,7 +136,7 @@ struct InstallView: View {
         .deskCard()
 
         Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
-            installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter)
+            installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter, diskGiB: diskGiB)
         }
         .buttonStyle(DeskButtonStyle(enabled: jitReady && !Device.chipTooOld))
         .disabled(!jitReady || Device.chipTooOld)
