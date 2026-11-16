@@ -32,6 +32,7 @@ struct SessionView: View {
     @State private var zoomed = false
     @State private var showDetails = false
     @State private var controlsHidden = false
+    @AppStorage("henge.sharing.automaticClipboard") private var automaticClipboard = false
     @State private var showRevealHint = false
     @State private var pointerRefused = false
     @AppStorage("henge.controls.hintsShown") private var revealHintsShown = 0
@@ -208,7 +209,7 @@ struct SessionView: View {
         }
         .modifier(ExternalMacDisplayModifier(presentation: MacPresentation(display: display, aspect: mac.aspect)))
         .task(id: bootAttempt) { await run() }
-        .task { await Sharing.followMacClipboard() }
+        .task(id: automaticClipboard) { await Sharing.followClipboard(automatic: automaticClipboard) }
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
@@ -292,7 +293,7 @@ struct SessionView: View {
                 Spacer()
                 tool("keyboard", "Keyboard") { typing = true }
                 Spacer()
-                pasteTool
+                pasteTool()
                 Spacer()
                 tool("plus.magnifyingglass", "Zoom in") { zoomed = true }
                 Spacer()
@@ -347,14 +348,8 @@ struct SessionView: View {
             .font(.system(size: 15))
     }
 
-    /// The system's paste button: iOS asks no permission for it, as it would if the app read the clipboard itself.
-    private var pasteTool: some View {
-        PasteButton(payloadType: String.self) { texts in
-            if let text = texts.first { Sharing.paste(text) }
-        }
-        .labelStyle(.iconOnly)
-        .buttonBorderShape(.circle)
-        .tint(Desk.raised)
+    private func pasteTool(tint: Color = Desk.text) -> some View {
+        tool("clipboard", "Paste from this device", tint: tint) { Sharing.pasteFromDevice() }
     }
 
     /// Hides the session's controls; four fingers on the screen bring them back. The first few times say so.
@@ -386,7 +381,7 @@ struct SessionView: View {
         let pill = HStack(spacing: 4) {
             tool("eye.slash", "Hide controls", tint: .white) { hideControls() }
             tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
-            pasteTool
+            pasteTool(tint: .white)
             tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
             tool("info.circle", "Details", tint: .white) { showDetails = true }
             Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 22).padding(.horizontal, 4)
@@ -511,6 +506,9 @@ struct SessionView: View {
                 }
                 Section("Sharing") {
                     LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
+                    Toggle("Sync this device’s clipboard to the Mac", isOn: $automaticClipboard)
+                    Text("While this Mac is open in Henge, copied text is sent to the Mac for ⌘V. Set up sharing below if needed. If iPadOS asks for paste permission, allow it.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     if !helperRunning {
                         Button("Type the Set Up Command") {
                             showDetails = false
