@@ -112,6 +112,8 @@ struct Trackpad: UIViewRepresentable {
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
             var moved = false
             let ts = Self.ms(event?.timestamp ?? touches.first?.timestamp ?? 0)
+            /* A drag with the iPad's own pointer, while it isn't locked: the Mac's pointer follows it. */
+            if let t = touches.first(where: { $0.type == .indirectPointer }) { AbsolutePointer.move(to: t.location(in: nil)) }
             for t in touches where t.type != .indirectPointer {
                 guard let i = fingers.firstIndex(where: { $0.touch == t }) else { continue }
                 let now = t.location(in: self), before = t.previousLocation(in: self)

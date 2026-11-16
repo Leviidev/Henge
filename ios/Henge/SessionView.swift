@@ -159,8 +159,18 @@ struct SessionView: View {
                 controlsHidden = false
                 showRevealHint = false
             }
-            .onAppear { shown = layout.shown }
+            .onContinuousHover(coordinateSpace: .local) { phase in
+                if case .active(let p) = phase { AbsolutePointer.move(to: p) }
+            }
+            .onAppear {
+                shown = layout.shown
+                AbsolutePointer.screen = display.isExternal ? nil : layout.screen
+            }
             .onChange(of: layout.shown) { shown = $0 }
+            .onChange(of: layout.screen) { AbsolutePointer.screen = display.isExternal ? nil : $0 }
+            .onChange(of: full) { _ in PointerLock.set(!pointerNeeded) } // a window filling the screen, or no longer
+            .onChange(of: display.isExternal) { AbsolutePointer.screen = $0 ? nil : layout.screen }
+            .onDisappear { AbsolutePointer.screen = nil }
         }
         .statusBarHidden(zoomed || Device.isPad)
         .persistentSystemOverlays(.hidden)
