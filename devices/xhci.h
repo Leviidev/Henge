@@ -58,6 +58,7 @@ typedef struct HvXhci {
         int ep_running[HV_XHCI_EPS];
     } slots[HV_XHCI_SLOTS + 1];
     /* keyboard reports waiting for an IN transfer (8 bytes each) */
+    int keyboard_jis;      /* device identity fixed until the next guest boot */
     pthread_mutex_t mu;
     uint8_t reports[HV_XHCI_REPORTS][8];
     uint32_t rhead, rtail;
