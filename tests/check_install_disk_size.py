@@ -37,8 +37,10 @@ enum Device {
 }
 enum HengeLog { static func log(_ category: String, _ text: String) {} }
 func message(_ text: String) -> NSError { NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: text]) }
+var forceAuxFailure = false
 func henge_make_aux(_ path: String) -> Int32 {
-    FileManager.default.createFile(atPath: path, contents: Data()) ? 0 : -1
+    if forceAuxFailure { return -1 }
+    return FileManager.default.createFile(atPath: path, contents: Data()) ? 0 : -1
 }
 """
 source += block(machines, "struct VirtualMac:")
@@ -82,14 +84,31 @@ for size in Installer.supportedDiskGiB {
     try "Test OS".write(to: mac.directory.appendingPathComponent(Machines.installedMarker), atomically: true, encoding: .utf8)
     made.append(mac)
 }
-let before = try fm.contentsOfDirectory(atPath: Machines.root.path)
+let before = Set(try fm.contentsOfDirectory(atPath: Machines.root.path))
 for invalid in [-1, 0, 32, 65, 1024, Int.max] {
     do {
         _ = try installer.prepare(name: "Invalid", ramMB: 4096, rom: rom, diskGiB: invalid)
         fatalError("invalid capacity accepted")
     } catch {}
 }
-precondition(try fm.contentsOfDirectory(atPath: Machines.root.path) == before, "invalid sizes must not create files")
+precondition(Set(try fm.contentsOfDirectory(atPath: Machines.root.path)) == before, "invalid sizes must not create files")
+// A failure after directory creation must not leave an unlisted partial Mac.
+do {
+    _ = try installer.prepare(name: "Missing ROM", ramMB: 4096,
+                              rom: Machines.root.appendingPathComponent("does-not-exist"), diskGiB: 128)
+    fatalError("missing ROM accepted")
+} catch {}
+precondition(Set(try fm.contentsOfDirectory(atPath: Machines.root.path)) == before,
+             "failed ROM copy must remove the new machine directory")
+// Inject a failure after creating and truncating the sparse disk.
+forceAuxFailure = true
+do {
+    _ = try installer.prepare(name: "Missing AUX", ramMB: 4096, rom: rom, diskGiB: 512)
+    fatalError("failed auxiliary creation accepted")
+} catch {}
+forceAuxFailure = false
+precondition(Set(try fm.contentsOfDirectory(atPath: Machines.root.path)) == before,
+             "failed auxiliary creation must remove the new machine directory")
 let recovered = Machines()
 recovered.removeLeftovers()
 precondition(recovered.all.count == made.count)
@@ -100,7 +119,21 @@ for mac in made {
 }
 recovered.removeLeftovers()
 precondition(recovered.all.count == made.count, "recovery must be idempotent")
-print("PASS: 64/128/256/512 GiB sparse disks, end-of-disk I/O, invalid sizes, and interrupted-install recovery")
+// A marked installed machine with an empty/corrupt disk must not be registered
+// as a 0-byte VM, and its files must not be discarded during startup cleanup.
+let brokenID = UUID()
+let brokenDirectory = Machines.directory(for: brokenID)
+try fm.createDirectory(at: brokenDirectory, withIntermediateDirectories: true)
+let brokenInfo = try JSONSerialization.data(withJSONObject: ["ecid": 123456])
+try brokenInfo.write(to: brokenDirectory.appendingPathComponent("machine.json"))
+try "Test OS".write(to: brokenDirectory.appendingPathComponent(Machines.installedMarker),
+                    atomically: true, encoding: .utf8)
+precondition(fm.createFile(atPath: brokenDirectory.appendingPathComponent("disk.img").path, contents: Data()))
+recovered.removeLeftovers()
+precondition(fm.fileExists(atPath: brokenDirectory.path), "bad installed disk must be preserved")
+precondition(!recovered.all.contains(where: { $0.id == brokenID }), "0-byte disk must not be registered")
+precondition(recovered.all.count == made.count, "bad installed disk must not affect good Macs")
+print("PASS: sparse 64/128/256/512 GiB disks, end-of-disk I/O, invalid sizes, failed preparation cleanup, interrupted-install recovery and invalid disk preservation")
 """
 # Swift assertion autoclosures cannot throw.
 source = source.replace("precondition(try ", "precondition(try! ")
