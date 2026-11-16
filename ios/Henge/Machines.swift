@@ -115,7 +115,14 @@ final class Machines: ObservableObject {
             if fm.fileExists(atPath: marker.path), let data = try? Data(contentsOf: item.appendingPathComponent("machine.json")),
                let info = try? JSONDecoder().decode(MachineFile.self, from: data),
                fm.fileExists(atPath: item.appendingPathComponent("disk.img").path) {
-                let diskBytes = (try? fm.attributesOfItem(atPath: item.appendingPathComponent("disk.img").path)[.size] as? NSNumber)?.int64Value ?? 0
+                // Do not register a zero-size VM or delete a finished install just
+                // because its disk attributes cannot be read. Leave the files for recovery.
+                guard let attributes = try? fm.attributesOfItem(atPath: item.appendingPathComponent("disk.img").path),
+                      let size = attributes[.size] as? NSNumber, size.int64Value > 0 else {
+                    HengeLog.log("machines", "cannot read installed Mac \(id) disk size: preserving files")
+                    continue
+                }
+                let diskBytes = size.int64Value
                 var mac = VirtualMac(id: id, name: info.name ?? "Mac", ecid: info.ecid, seed: info.seed ?? 0,
                                      ramMB: info.ramMB ?? Device.suggestedRAMGB * 1024, diskBytes: diskBytes)
                 let os = (try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
