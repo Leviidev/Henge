@@ -91,14 +91,14 @@ for invalid in [-1, 0, 32, 65, 1024, Int.max] {
         fatalError("invalid capacity accepted")
     } catch {}
 }
-precondition(Set(try fm.contentsOfDirectory(atPath: Machines.root.path)) == before, "invalid sizes must not create files")
+precondition(Set(try! fm.contentsOfDirectory(atPath: Machines.root.path)) == before, "invalid sizes must not create files")
 // A failure after directory creation must not leave an unlisted partial Mac.
 do {
     _ = try installer.prepare(name: "Missing ROM", ramMB: 4096,
                               rom: Machines.root.appendingPathComponent("does-not-exist"), diskGiB: 128)
     fatalError("missing ROM accepted")
 } catch {}
-precondition(Set(try fm.contentsOfDirectory(atPath: Machines.root.path)) == before,
+precondition(Set(try! fm.contentsOfDirectory(atPath: Machines.root.path)) == before,
              "failed ROM copy must remove the new machine directory")
 // Inject a failure after creating and truncating the sparse disk.
 forceAuxFailure = true
@@ -107,7 +107,7 @@ do {
     fatalError("failed auxiliary creation accepted")
 } catch {}
 forceAuxFailure = false
-precondition(Set(try fm.contentsOfDirectory(atPath: Machines.root.path)) == before,
+precondition(Set(try! fm.contentsOfDirectory(atPath: Machines.root.path)) == before,
              "failed auxiliary creation must remove the new machine directory")
 let recovered = Machines()
 recovered.removeLeftovers()
