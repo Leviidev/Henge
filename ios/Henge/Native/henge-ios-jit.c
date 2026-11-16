@@ -572,6 +572,16 @@ HENGE_EXPORT int henge_ios_take_high_room(void **base, size_t *bytes)
     return n;
 }
 
+/* A virtual Mac is about to start: the room is its RAM's. HengeVM takes the prewarmed region with
+   henge_ios_jit_get_mapping and never calls henge_ios_jit_allocate, so nothing else lets go of the hold; with it in
+   place only 0x7A-0x7B is free, less the JIT region's writable view when that lands there (2.5 GB on an iPad Pro M5). */
+HENGE_EXPORT void henge_ios_release_high_room(void)
+{
+    if (g_high_hold_given || !g_high_hold[0]) return;
+    henge_ios_release_high_hold();
+    HENGE_LOG("high hold released for the virtual Mac's memory");
+}
+
 static HengeDualMapping henge_prewarmed;
 static bool henge_prewarm_done;
 
@@ -999,6 +1009,7 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes)
     return henge_ios_jit_allocate_real(bytes);
 }
 int henge_ios_take_high_room(void **base, size_t *bytes) { (void)base, (void)bytes; return 0; }
+void henge_ios_release_high_room(void) {}
 bool henge_ios_jit_prewarm(size_t bytes) { (void)bytes; return false; }
 bool henge_ios_jit_prewarm_self(size_t bytes) { (void)bytes; return false; }
 bool henge_ios_jit_reserve_bottom(size_t end) { (void)end; return true; }
