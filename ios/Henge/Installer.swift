@@ -208,20 +208,28 @@ final class Installer: NSObject, ObservableObject {
         (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
         let fm = FileManager.default
         try fm.createDirectory(at: mac.directory, withIntermediateDirectories: true)
+        // If preparation throws, start() has not yet received a VirtualMac to clean up.
+        // Remove only this new machine's directory; leave finished installs untouched.
+        var prepared = false
+        defer {
+            if !prepared { try? fm.removeItem(at: mac.directory) }
+        }
         Machines.excludeFromBackup(Machines.root)
         try? fm.removeItem(at: mac.rom)
         try fm.copyItem(at: rom, to: mac.rom)
         guard fm.createFile(atPath: mac.disk.path, contents: nil) else { throw message("Cannot create the disk.") }
-        let h = try FileHandle(forWritingTo: mac.disk)
-        defer { try? h.close() }
-        try h.truncate(atOffset: UInt64(capacity)) // sparse: blocks are only used as macOS writes them
-        try h.close()
+        do {
+            let h = try FileHandle(forWritingTo: mac.disk)
+            defer { try? h.close() }
+            try h.truncate(atOffset: UInt64(capacity)) // sparse: blocks are only used as macOS writes them
+        }
         let diskSize = try fm.attributesOfItem(atPath: mac.disk.path)[.size] as? NSNumber
         guard diskSize?.int64Value == capacity else { throw message("Could not create the selected disk size.") }
         guard henge_make_aux(mac.aux.path) == 0 else { throw message("Cannot create the auxiliary storage.") }
         let info: [String: Any] = ["name": name, "ecid": ecid, "seed": 0, "ramMB": ramMB]
         try JSONSerialization.data(withJSONObject: info).write(to: mac.directory.appendingPathComponent("machine.json"))
         HengeLog.log("install", "new machine \(name): ECID \(ecid), \(diskGiB) GiB sparse disk")
+        prepared = true
         return mac
     }
 
