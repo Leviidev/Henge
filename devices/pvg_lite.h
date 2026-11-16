@@ -40,9 +40,11 @@ void hv_pvg_metal_cursor_moved(HvPvgMetal *m);
 /* Frames go to this CAMetalLayer from now on, drawn by the GPU. Any thread. */
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer);
 uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m);
+uint64_t hv_pvg_metal_last_present_ns(HvPvgMetal *m);
 void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t task, uint64_t first, uint64_t n, uint32_t *out);
 void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer);
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p);
+uint64_t hv_pvg_lite_last_present_ns(HvPvgLite *p);
 void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]);
 /* The display's shared state page, or NULL before the guest named it. */
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p);

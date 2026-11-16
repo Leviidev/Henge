@@ -212,6 +212,9 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
         uint64_t changed = (cpu->ttbr1_el1 ^ v) & ((cpu->tcr_el1 >> 22) & 1 ? ~0ull : 0x0000ffffffffffffull);
         cpu->ttbr1_el1 = v;
         if (changed) cpu->m->stats.flush_why[3]++, hv_tlb_flush(cpu);
+        /* Only with the MMU off, as XNU's start sets it: macOS 27's microkernel
+           iBoot rewrites it on every system call with the MMU on. */
+        if (changed && !(cpu->sctlr_el1 & 1) && cpu->m->ttbr1_hook) cpu->m->ttbr1_hook(cpu->m);
         return 0;
     }
     case R(3, 0, 2, 0, 2):
