@@ -28,7 +28,7 @@ typedef struct HvVmConfig {
     const char *product_name, *model_id;
     /* JIT memory the host already has (iOS: granted by a debugger), or NULL to map it here. */
     void *jit_rx, *jit_rw;
-    size_t jit_bytes;         /* 0: 768 MB */
+    size_t jit_bytes;         /* 0: 1536 MB */
 } HvVmConfig;
 
 /* Returns 0, or -1 with a reason in err. */
