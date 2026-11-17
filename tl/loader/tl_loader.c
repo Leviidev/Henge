@@ -63,12 +63,26 @@ struct TlImage {
     const struct dyld_info_command *dyldinfo;
     uint64_t entryoff;
     int has_main;
-    int initialized, visiting;
+    int initialized, visiting, objc_loaded, tlv_ready;
     pthread_key_t tlv_key;
     uint64_t tlv_start, tlv_size, tlv_init_size; /* vmaddrs */
+    uint64_t life_gen;
+    pthread_key_t tsd_keys[128];
+    int ntsd_keys;
+    mach_port_t spawned_threads[128];
+    int nspawned_threads;
+    struct {
+        void *at;
+        size_t len;
+        int in_room;
+    } vm_maps[512];
+    int nvm_maps;
     int ns;          /* the "process" it belongs to: 0 the program, 1.. what it started (processes as threads) */
     TlImage *next;
 };
+
+static pthread_mutex_t g_life_lock = PTHREAD_MUTEX_INITIALIZER;
+static void quiesce_image_locked(TlImage *im);
 
 static TlHost *g_host;
 uint64_t tl_missing_data(const char *sym);     /* tl_stubs.m: a stand-in if the name says it is data */
@@ -852,6 +866,28 @@ static void chromium_fixups(TlImage *im) {
     }
 }
 
+/* Bun's JavaScriptCore disables SharedArrayBuffer in Options::recomputeDependentOptions() when useJIT is false
+   (which happens on iOS where new PROT_EXEC mappings are refused), even though SharedArrayBuffer works in the
+   interpreter (LLInt). Keep useSharedArrayBuffer and allowSharedArrayBuffer enabled when JIT is off. */
+static uint8_t *find_section(TlImage *im, const char *seg, const char *name, uint64_t *size);
+static void bun_jsc_fixups(TlImage *im) {
+    uint64_t sz = 0;
+    uint8_t *text = find_section(im, "__TEXT", "__text", &sz);
+    if (!text || sz < 16) return;
+    const uint32_t *ins = (const uint32_t *)text;
+    size_t n = sz / 4;
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (ins[i] == 0x91048509u && ins[i + 1] == 0x7900013fu &&
+            ins[i + 2] == 0x3900011fu && ins[i + 3] == 0x3903611fu) {
+            uint32_t nop = 0xD503201Fu;
+            code_write((void *)(ins + i + 1), &nop, 4);
+            code_finish((void *)(ins + i + 1), 4);
+            tl_log("JSC::Options::recomputeDependentOptions in %s: keeping SharedArrayBuffer enabled without JIT", im->path);
+            return;
+        }
+    }
+}
+
 static void *cf_override(const char *sym);
 
 static uint64_t host_symbol(void *handle, const char *install_name, const char *sym, int *found) {
@@ -861,7 +897,8 @@ static uint64_t host_symbol(void *handle, const char *install_name, const char *
         if (s) { *found = 1; return (uint64_t)s; }
     }
     if (!install_name || strstr(install_name, "libSystem") || !strncmp(install_name, "/usr/lib/system/", 16) ||
-        strstr(install_name, "/libbsm.") || strstr(install_name, "/libsandbox.")) {
+        strstr(install_name, "/libbsm.") || strstr(install_name, "/libsandbox.") ||
+        strstr(install_name, "/Security.framework/")) {
         void *s = tl_runtime_lookup(sym);
         if (s) { *found = 1; return (uint64_t)s; }
     }
@@ -1328,9 +1365,17 @@ static int setup_tlv(TlImage *im, char *err, size_t errlen) {
     if (!descs) return 0;
     if (lo == UINT64_MAX) lo = hi = init_hi = 0;
     im->tlv_start = lo, im->tlv_size = hi - lo, im->tlv_init_size = init_hi > lo ? init_hi - lo : 0;
-    if (pthread_key_create(&im->tlv_key, free)) { set_err(err, errlen, "%s: no thread-local key", im->path); return -1; }
-    if (g_ntlv == (int)(sizeof g_tlv_images / sizeof *g_tlv_images)) { set_err(err, errlen, "too many images with thread-local variables"); return -1; }
-    g_tlv_images[g_ntlv++] = im;
+    if (!im->tlv_ready) {
+        if (pthread_key_create(&im->tlv_key, free)) { set_err(err, errlen, "%s: no thread-local key", im->path); return -1; }
+        int listed = 0;
+        for (int i = 0; i < g_ntlv; i++)
+            if (g_tlv_images[i] == im) { listed = 1; break; }
+        if (!listed) {
+            if (g_ntlv == (int)(sizeof g_tlv_images / sizeof *g_tlv_images)) { set_err(err, errlen, "too many images with thread-local variables"); return -1; }
+            g_tlv_images[g_ntlv++] = im;
+        }
+        im->tlv_ready = 1;
+    }
     for (uint64_t i = 0; i < ndescs; i++) {
         descs[i].thunk = (void *)&tl_tlv_get_addr;
         descs[i].key = im->tlv_key;
@@ -1413,7 +1458,8 @@ static void run_initializers(TlImage *im) {
         if (im->deps[i].tl) run_initializers(im->deps[i].tl);
     im->visiting = 0;
     im->initialized = 1;
-    if (has_objc(im)) {
+    if (has_objc(im) && !im->objc_loaded) {
+        im->objc_loaded = 1;
         void (*load)(const char *, const void *) = dlsym(RTLD_DEFAULT, "_objc_load_image");
         if (load) load(im->path, im->base);
     }
@@ -1501,6 +1547,22 @@ static void keep_own_categories(TlImage *im) {
         }
 }
 
+/* Re-unique selector references after resetting writable segments on an in-place reload. */
+static void reregister_selrefs(TlImage *im) {
+    static const char *const segs[] = {"__DATA", "__DATA_CONST"};
+    const char *(*reg)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+    if (!reg) return;
+    for (int s = 0; s < 2; s++) {
+        uint64_t sz = 0;
+        uint8_t *p = find_section(im, segs[s], "__objc_selrefs", &sz);
+        if (!p) continue;
+        for (uint64_t off = 0; off + 8 <= sz; off += 8) {
+            const char **slot = (const char **)(p + off);
+            if (*slot) *slot = reg(*slot);
+        }
+    }
+}
+
 /* Loads path and what it links; fixes up, registers and initializes whatever was new. Takes g_lock itself. */
 static TlImage *load_and_link(const char *path, int ns, char *err, size_t errlen) {
     pthread_mutex_lock(&g_lock);
@@ -1512,8 +1574,41 @@ static TlImage *load_and_link(const char *path, int ns, char *err, size_t errlen
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
+    TlImage *existing = NULL;
+    for (TlImage *it = g_images; it; it = it->next)
+        if (!strcmp(it->path, real) && it->ns == ns) { existing = it; break; }
+    if (existing && !find_section(existing, "__DATA", "__objc_classlist", NULL) &&
+        !find_section(existing, "__DATA_CONST", "__objc_classlist", NULL)) {
+        quiesce_image_locked(existing);
+        for (int i = 0; i < existing->nsegs; i++) {
+            TlSeg *g = &existing->segs[i];
+            if (!g->vmsize || (g->prot & VM_PROT_EXECUTE) || !(g->prot & VM_PROT_WRITE)) continue;
+            uint8_t *dst = (uint8_t *)(g->vmaddr + existing->slide);
+            uint64_t span = (g->vmsize + TL_PAGE - 1) & ~(TL_PAGE - 1);
+            uint64_t copy = g->filesize < g->vmsize ? g->filesize : g->vmsize;
+            memcpy(dst, existing->slice + g->fileoff, copy);
+            if (span > copy) memset(dst + copy, 0, span - copy);
+        }
+        if (fixup(existing, err, errlen) || setup_tlv(existing, err, errlen)) {
+            pthread_mutex_unlock(&g_lock);
+            return NULL;
+        }
+        reregister_selrefs(existing);
+        chromium_fixups(existing);
+        node_platform_fixups(existing);
+        bun_jsc_fixups(existing);
+        if (g_host->image_linked) g_host->image_linked(existing);
+        if (ns == 0 && existing->fmh->filetype == MH_EXECUTE) g_main = existing;
+        if (ns >= 0 && ns < TL_MAX_NS && existing->fmh->filetype == MH_EXECUTE) g_ns_main[ns] = existing;
+        existing->initialized = 0;
+        pthread_mutex_unlock(&g_lock);
+        run_initializers(existing);
+        return existing;
+    }
     TlImage *exe = load_one(real, err, errlen);
     if (!exe) { pthread_mutex_unlock(&g_lock); return NULL; }
+    if (ns == 0 && exe->fmh->filetype == MH_EXECUTE) g_main = exe;
+    if (ns >= 0 && ns < TL_MAX_NS && exe->fmh->filetype == MH_EXECUTE) g_ns_main[ns] = exe;
     int n = g_npending;
     TlImage *batch[512];
     memcpy(batch, g_pending, n * sizeof *batch);
@@ -1523,6 +1618,7 @@ static TlImage *load_and_link(const char *path, int ns, char *err, size_t errlen
     for (int i = 0; i < n; i++) {
         chromium_fixups(batch[i]);
         node_platform_fixups(batch[i]);
+        bun_jsc_fixups(batch[i]);
     }
     if (g_host->image_linked)
         for (int i = 0; i < n; i++) g_host->image_linked(batch[i]);
@@ -1561,6 +1657,11 @@ static TlImage *load_library_in(const char *path, int ns, char *err, size_t errl
 
 extern char **environ;
 
+void tl_set_main_args(int argc, char **argv) {
+    g_main_argc = argc;
+    g_main_argv = argv;
+}
+
 int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp) {
     if (!exe->has_main) return -1;
     /* As the kernel lays a program's start out: argv, NULL, the environment, NULL, the "apple" strings, NULL, in one
@@ -1575,7 +1676,11 @@ int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp) {
     if (ne) memcpy(v + argc + 1, env, (size_t)ne * sizeof *v);
     char *exe_path = NULL;
     if (asprintf(&exe_path, "executable_path=%s", exe->path) > 0) v[argc + ne + 2] = exe_path;
-    if (exe->ns == 0 && !g_main_argv) g_main_argc = argc, g_main_argv = (char **)v; /* _NSGetArgv's answer */
+    if (exe->ns == 0) g_main = exe, g_main_argc = argc, g_main_argv = (char **)v; /* _NSGetArgv's answer */
+    if (exe->ns >= 0 && exe->ns < TL_MAX_NS) g_ns_main[exe->ns] = exe;
+    extern int optind, optreset;
+    optind = 1;
+    optreset = 1;
     int (*entry)(int, const char **, const char **, const char **) = (void *)(exe->base + exe->entryoff);
     return entry(argc, v, v + argc + 1, v + argc + ne + 2);
 }
@@ -2799,10 +2904,67 @@ static int room_still_held(uint8_t *at, size_t len) {
 static TlRoomUse g_room_slack[16];
 static int g_room_nslack;
 
-static void *room_place_prot(size_t len, int prot);
-static void *room_place(size_t len) { return room_place_prot(len, PROT_NONE); }
+static TlImage *life_owner(void *ret_addr);
 
-static void *room_place_prot(size_t len, int prot) {
+static void record_vm_map(void *ret_addr, void *at, size_t len, int in_room) {
+    if (!at || at == MAP_FAILED || !len) return;
+    if (!in_room && len < (1u << 20)) return;
+    TlImage *owner = life_owner(ret_addr);
+    if (!owner) owner = g_main;
+    if (!owner) return;
+    pthread_mutex_lock(&g_life_lock);
+    if (owner->nvm_maps < (int)(sizeof owner->vm_maps / sizeof *owner->vm_maps)) {
+        owner->vm_maps[owner->nvm_maps].at = at;
+        owner->vm_maps[owner->nvm_maps].len = len;
+        owner->vm_maps[owner->nvm_maps].in_room = in_room;
+        owner->nvm_maps++;
+    }
+    pthread_mutex_unlock(&g_life_lock);
+}
+
+static void unrecord_vm_map(void *addr, size_t len) {
+    if (!addr || !len) return;
+    uintptr_t u_lo = (uintptr_t)addr, u_hi = u_lo + len;
+    pthread_mutex_lock(&g_life_lock);
+    int n = g_norder;
+    for (int k = 0; k < n; k++) {
+        TlImage *im = g_order[k];
+        if (!im || !im->nvm_maps) continue;
+        for (int i = 0; i < im->nvm_maps;) {
+            uintptr_t m_lo = (uintptr_t)im->vm_maps[i].at;
+            uintptr_t m_hi = m_lo + im->vm_maps[i].len;
+            if (u_lo >= m_hi || u_hi <= m_lo) { i++; continue; }
+            if (u_lo <= m_lo && u_hi >= m_hi) {
+                im->vm_maps[i] = im->vm_maps[--im->nvm_maps];
+                continue;
+            }
+            if (u_lo <= m_lo) {
+                im->vm_maps[i].at = (void *)u_hi;
+                im->vm_maps[i].len = (size_t)(m_hi - u_hi);
+                i++;
+            } else if (u_hi >= m_hi) {
+                im->vm_maps[i].len = (size_t)(u_lo - m_lo);
+                i++;
+            } else {
+                int in_room = im->vm_maps[i].in_room;
+                im->vm_maps[i].len = (size_t)(u_lo - m_lo);
+                if (im->nvm_maps < (int)(sizeof im->vm_maps / sizeof *im->vm_maps)) {
+                    im->vm_maps[im->nvm_maps].at = (void *)u_hi;
+                    im->vm_maps[im->nvm_maps].len = (size_t)(m_hi - u_hi);
+                    im->vm_maps[im->nvm_maps].in_room = in_room;
+                    im->nvm_maps++;
+                }
+                i++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_life_lock);
+}
+
+static void *room_place_prot(size_t len, int prot, void *ret_addr);
+static void *room_place(size_t len, void *ret_addr) { return room_place_prot(len, PROT_NONE, ret_addr); }
+
+static void *room_place_prot(size_t len, int prot, void *ret_addr) {
     /* V8 over-reserves its sandbox for alignment, asking size + 4 GB - a page and unmapping what lies outside the
        aligned block: the block alone is placed, and the unmap of the slack after it is ignored (it is not V8's). */
     size_t slack = 0;
@@ -2886,6 +3048,7 @@ static void *room_place_prot(size_t len, int prot) {
                 pthread_mutex_lock(&g_room_lock);
                 if (g_room_nslack < 16) g_room_slack[g_room_nslack++] = (TlRoomUse){c + len, slack};
                 pthread_mutex_unlock(&g_room_lock);
+                record_vm_map(ret_addr, c, len, 0);
                 return c;
             }
         }
@@ -2901,10 +3064,13 @@ static void *room_place_prot(size_t len, int prot) {
     void *r = mmap(map, maplen, prot, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
     tl_log("a %.3f GB reservation at %p in the held room%s%s: %s", (double)len / (1 << 30), at, how,
            slack ? " (its alignment slack left out)" : "", r == map ? "placed" : strerror(errno));
-    if (r == map && slack) {
-        pthread_mutex_lock(&g_room_lock);
-        if (g_room_nslack < 16) g_room_slack[g_room_nslack++] = (TlRoomUse){at + len, slack};
-        pthread_mutex_unlock(&g_room_lock);
+    if (r == map) {
+        record_vm_map(ret_addr, map, maplen, 1);
+        if (slack) {
+            pthread_mutex_lock(&g_room_lock);
+            if (g_room_nslack < 16) g_room_slack[g_room_nslack++] = (TlRoomUse){at + len, slack};
+            pthread_mutex_unlock(&g_room_lock);
+        }
     }
     return r == map ? at : NULL;
 }
@@ -2919,10 +3085,13 @@ static int rt_munmap(void *addr, size_t len) {
             }
         pthread_mutex_unlock(&g_room_lock);
     }
-    return munmap(addr, len);
+    int rc = munmap(addr, len);
+    if (rc == 0) unrecord_vm_map(addr, len);
+    return rc;
 }
 
 static void *rt_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    void *ra = __builtin_return_address(0);
     if (g_host && g_host->ios_kernel_rules && (prot & PROT_EXEC)) {
         tl_log("refused an executable mapping (iOS)");
         errno = EPERM;
@@ -2930,7 +3099,7 @@ static void *rt_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t 
     }
     if (g_host && g_host->high_rooms && len >= ((size_t)4 << 30) && prot == PROT_NONE && (flags & MAP_ANON) &&
         !(flags & MAP_FIXED)) {
-        void *r = room_place(len);
+        void *r = room_place(len, ra);
         if (r) return r;
     }
     uint64_t max = max_map_bytes();
@@ -2960,12 +3129,14 @@ static void *rt_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t 
            never-used tops of the big blocks, with the access asked for. */
         static int listed;
         if (len < ((size_t)256 << 20) && !listed++) log_high_space();
-        void *h = room_place_prot(len, prot);
+        void *h = room_place_prot(len, prot, ra);
         if (h) return h;
         tl_log("no room for %.3f GB anywhere:", (double)len / (1 << 30));
         log_free_address_space();
         errno = ENOMEM;
     }
+    if (r != MAP_FAILED && (flags & MAP_ANON) && !(flags & MAP_FIXED))
+        record_vm_map(ra, r, len, 0);
     if (r == MAP_FAILED && len < ((size_t)1 << 30) && g_host && g_host->high_rooms) {
         static int said;
         if (said++ < 20) tl_log("a %.1f MB mapping (prot %d, flags %#x, at %p) failed: %s", (double)len / (1 << 20), prot, flags, addr, strerror(errno));
@@ -2981,26 +3152,80 @@ static void *rt_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t 
     }
     return r;
 }
-#if TARGET_OS_OSX
-static kern_return_t rt_mach_vm_allocate(vm_map_t map, mach_vm_address_t *addr, mach_vm_size_t size, int flags) {
+
+static kern_return_t rt_vm_allocate(vm_map_t map, vm_address_t *addr, vm_size_t size, int flags) {
     uint64_t max = max_map_bytes();
     if (max && size > max) {
         tl_log("refused a %llu GB VM allocation (TL_MAX_MAP_GB)", (unsigned long long)(size >> 30));
         return KERN_NO_SPACE;
     }
-    return mach_vm_allocate(map, addr, size, flags);
+    kern_return_t kr = vm_allocate(map, addr, size, flags);
+    if (kr == KERN_SUCCESS && map == mach_task_self() && (flags & VM_FLAGS_ANYWHERE) && addr)
+        record_vm_map(__builtin_return_address(0), (void *)*addr, (size_t)size, 0);
+    return kr;
 }
-static kern_return_t rt_mach_vm_map(vm_map_t map, mach_vm_address_t *addr, mach_vm_size_t size, mach_vm_offset_t mask, int flags,
-                                    mem_entry_name_port_t obj, memory_object_offset_t off, boolean_t copy, vm_prot_t cur, vm_prot_t max_prot,
-                                    vm_inherit_t inh) {
+static kern_return_t rt_vm_deallocate(vm_map_t map, vm_address_t addr, vm_size_t size) {
+    kern_return_t kr = vm_deallocate(map, addr, size);
+    if (kr == KERN_SUCCESS && map == mach_task_self()) unrecord_vm_map((void *)addr, (size_t)size);
+    return kr;
+}
+static kern_return_t rt_vm_map(vm_map_t map, vm_address_t *addr, vm_size_t size, vm_address_t mask, int flags,
+                               mem_entry_name_port_t obj, vm_offset_t off, boolean_t copy, vm_prot_t cur, vm_prot_t max_prot,
+                               vm_inherit_t inh) {
     uint64_t max = max_map_bytes();
     if (max && size > max) {
         tl_log("refused a %llu GB VM map (TL_MAX_MAP_GB)", (unsigned long long)(size >> 30));
         return KERN_NO_SPACE;
     }
-    return mach_vm_map(map, addr, size, mask, flags, obj, off, copy, cur, max_prot, inh);
+    kern_return_t kr = vm_map(map, addr, size, mask, flags, obj, off, copy, cur, max_prot, inh);
+    if (kr == KERN_SUCCESS && map == mach_task_self() && (flags & VM_FLAGS_ANYWHERE) && !obj && addr)
+        record_vm_map(__builtin_return_address(0), (void *)*addr, (size_t)size, 0);
+    return kr;
 }
-#endif
+
+typedef kern_return_t (*tl_mach_vm_alloc_fn)(vm_map_t, uint64_t *, uint64_t, int);
+typedef kern_return_t (*tl_mach_vm_dealloc_fn)(vm_map_t, uint64_t, uint64_t);
+typedef kern_return_t (*tl_mach_vm_map_fn)(vm_map_t, uint64_t *, uint64_t, uint64_t, int, mem_entry_name_port_t, uint64_t,
+                                           boolean_t, vm_prot_t, vm_prot_t, vm_inherit_t);
+
+static kern_return_t rt_mach_vm_allocate(vm_map_t map, uint64_t *addr, uint64_t size, int flags) {
+    static tl_mach_vm_alloc_fn real_fn;
+    if (!real_fn) real_fn = dlsym(RTLD_DEFAULT, "mach_vm_allocate");
+    uint64_t max = max_map_bytes();
+    if (max && size > max) {
+        tl_log("refused a %llu GB VM allocation (TL_MAX_MAP_GB)", (unsigned long long)(size >> 30));
+        return KERN_NO_SPACE;
+    }
+    if (!real_fn) return KERN_FAILURE;
+    kern_return_t kr = real_fn(map, addr, size, flags);
+    if (kr == KERN_SUCCESS && map == mach_task_self() && (flags & VM_FLAGS_ANYWHERE) && addr)
+        record_vm_map(__builtin_return_address(0), (void *)(uintptr_t)*addr, (size_t)size, 0);
+    return kr;
+}
+static kern_return_t rt_mach_vm_deallocate(vm_map_t map, uint64_t addr, uint64_t size) {
+    static tl_mach_vm_dealloc_fn real_fn;
+    if (!real_fn) real_fn = dlsym(RTLD_DEFAULT, "mach_vm_deallocate");
+    if (!real_fn) return KERN_FAILURE;
+    kern_return_t kr = real_fn(map, addr, size);
+    if (kr == KERN_SUCCESS && map == mach_task_self()) unrecord_vm_map((void *)(uintptr_t)addr, (size_t)size);
+    return kr;
+}
+static kern_return_t rt_mach_vm_map(vm_map_t map, uint64_t *addr, uint64_t size, uint64_t mask, int flags,
+                                    mem_entry_name_port_t obj, uint64_t off, boolean_t copy, vm_prot_t cur, vm_prot_t max_prot,
+                                    vm_inherit_t inh) {
+    static tl_mach_vm_map_fn real_fn;
+    if (!real_fn) real_fn = dlsym(RTLD_DEFAULT, "mach_vm_map");
+    uint64_t max = max_map_bytes();
+    if (max && size > max) {
+        tl_log("refused a %llu GB VM map (TL_MAX_MAP_GB)", (unsigned long long)(size >> 30));
+        return KERN_NO_SPACE;
+    }
+    if (!real_fn) return KERN_FAILURE;
+    kern_return_t kr = real_fn(map, addr, size, mask, flags, obj, off, copy, cur, max_prot, inh);
+    if (kr == KERN_SUCCESS && map == mach_task_self() && (flags & VM_FLAGS_ANYWHERE) && !obj && addr)
+        record_vm_map(__builtin_return_address(0), (void *)(uintptr_t)*addr, (size_t)size, 0);
+    return kr;
+}
 
 static int rt_mprotect(void *addr, size_t len, int prot) {
     if (g_host && g_host->ios_kernel_rules && (prot & PROT_EXEC)) {
@@ -3073,16 +3298,195 @@ static void *cf_override(const char *sym) {
     return NULL;
 }
 
+static void rt_clear_cache(void *start, void *end) {
+    if (end > start) sys_icache_invalidate(start, (size_t)((uint8_t *)end - (uint8_t *)start));
+}
+static void rt_jit_write_protect(int enabled) { (void)enabled; }
+static int rt_sec_trust_stub(void) { return 0; }
+
+/* Tracks guest-registered TSD keys and spawned background threads per loaded executable so
+   in-process CLI runs on iOS can quiesce cleanly before thread exit or in-place reload. */
+static TlImage *life_owner(void *ret_addr) {
+    TlImage *im = tl_image_containing(ret_addr);
+    if (!im) return NULL;
+    TlImage *m = main_of(im->ns);
+    return m ? m : im;
+}
+
+static void quiesce_image_locked(TlImage *im) {
+    if (!im) return;
+    pthread_mutex_lock(&g_life_lock);
+    im->life_gen++;
+    mach_port_t self_port = pthread_mach_thread_np(pthread_self());
+    for (int i = 0; i < im->nspawned_threads; i++) {
+        mach_port_t t = im->spawned_threads[i];
+        if (t && t != self_port) thread_suspend(t);
+    }
+    im->nspawned_threads = 0;
+    for (int i = 0; i < im->ntsd_keys; i++) pthread_key_delete(im->tsd_keys[i]);
+    im->ntsd_keys = 0;
+    if (im->tlv_ready) {
+        pthread_key_delete(im->tlv_key);
+        im->tlv_ready = 0;
+    }
+    int nvm = im->nvm_maps;
+    struct {
+        void *at;
+        size_t len;
+        int in_room;
+    } maps[512];
+    if (nvm > (int)(sizeof maps / sizeof *maps)) nvm = (int)(sizeof maps / sizeof *maps);
+    if (nvm > 0) memcpy(maps, im->vm_maps, (size_t)nvm * sizeof *maps);
+    im->nvm_maps = 0;
+    pthread_mutex_unlock(&g_life_lock);
+
+    for (int i = 0; i < nvm; i++) {
+        void *at = maps[i].at;
+        size_t len = maps[i].len;
+        if (!at || !len) continue;
+        if (maps[i].in_room) {
+            mmap(at, len, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+            pthread_mutex_lock(&g_room_lock);
+            int w = 0;
+            uint8_t *lo = at, *hi = lo + len;
+            for (int j = 0; j < g_room_nused; j++) {
+                uint8_t *ulo = g_room_used[j].at, *uhi = ulo + g_room_used[j].len;
+                if (lo < uhi && ulo < hi) continue;
+                g_room_used[w++] = g_room_used[j];
+            }
+            g_room_nused = w;
+            if (g_room_pools && (uint8_t *)g_room_pools >= lo && (uint8_t *)g_room_pools < hi) g_room_pools = NULL;
+            if (g_room_nused == 0) g_room_nslack = 0;
+            pthread_mutex_unlock(&g_room_lock);
+        } else {
+            munmap(at, len);
+        }
+    }
+}
+
+void tl_quiesce_image(TlImage *im) {
+    quiesce_image_locked(im);
+}
+
+static int rt_pthread_key_create(pthread_key_t *key, void (*destructor)(void *)) {
+    int rc = pthread_key_create(key, destructor);
+    if (rc == 0 && key) {
+        TlImage *owner = life_owner(__builtin_return_address(0));
+        if (owner) {
+            pthread_mutex_lock(&g_life_lock);
+            if (owner->ntsd_keys < (int)(sizeof owner->tsd_keys / sizeof *owner->tsd_keys))
+                owner->tsd_keys[owner->ntsd_keys++] = *key;
+            pthread_mutex_unlock(&g_life_lock);
+        }
+    }
+    return rc;
+}
+
+static int rt_pthread_key_delete(pthread_key_t key) {
+    TlImage *owner = life_owner(__builtin_return_address(0));
+    if (owner) {
+        pthread_mutex_lock(&g_life_lock);
+        for (int i = 0; i < owner->ntsd_keys; i++) {
+            if (owner->tsd_keys[i] == key) {
+                owner->tsd_keys[i] = owner->tsd_keys[--owner->ntsd_keys];
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_life_lock);
+    }
+    return pthread_key_delete(key);
+}
+
+typedef struct TlThreadStart {
+    TlImage *owner;
+    uint64_t gen;
+    void *(*start)(void *);
+    void *arg;
+} TlThreadStart;
+
+typedef struct TlThreadCleanup {
+    TlImage *owner;
+    uint64_t gen;
+    mach_port_t port;
+} TlThreadCleanup;
+
+static void tl_thread_cleanup(void *opaque) {
+    TlThreadCleanup *c = opaque;
+    if (!c->owner) return;
+    pthread_mutex_lock(&g_life_lock);
+    if (c->owner->life_gen == c->gen) {
+        for (int i = 0; i < c->owner->nspawned_threads; i++) {
+            if (c->owner->spawned_threads[i] == c->port) {
+                c->owner->spawned_threads[i] = c->owner->spawned_threads[--c->owner->nspawned_threads];
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_life_lock);
+}
+
+static void *tl_thread_trampoline(void *opaque) {
+    TlThreadStart *ts = opaque;
+    TlImage *owner = ts->owner;
+    uint64_t gen = ts->gen;
+    void *(*start)(void *) = ts->start;
+    void *arg = ts->arg;
+    free(ts);
+    if (owner) {
+        pthread_mutex_lock(&g_life_lock);
+        uint64_t cur_gen = owner->life_gen;
+        pthread_mutex_unlock(&g_life_lock);
+        if (cur_gen != gen) return NULL;
+    }
+    TlThreadCleanup cleanup = {owner, gen, pthread_mach_thread_np(pthread_self())};
+    void *ret = NULL;
+    pthread_cleanup_push(tl_thread_cleanup, &cleanup);
+    ret = start(arg);
+    pthread_cleanup_pop(1);
+    return ret;
+}
+
+static int rt_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start)(void *), void *arg) {
+    TlImage *owner = life_owner(__builtin_return_address(0));
+    if (!owner) return pthread_create(thread, attr, start, arg);
+    TlThreadStart *ts = malloc(sizeof *ts);
+    if (!ts) return ENOMEM;
+    ts->owner = owner;
+    ts->start = start;
+    ts->arg = arg;
+    pthread_mutex_lock(&g_life_lock);
+    ts->gen = owner->life_gen;
+    pthread_t tmp = 0;
+    int rc = pthread_create(&tmp, attr, tl_thread_trampoline, ts);
+    if (rc == 0) {
+        if (thread) *thread = tmp;
+        if (owner->nspawned_threads < (int)(sizeof owner->spawned_threads / sizeof *owner->spawned_threads))
+            owner->spawned_threads[owner->nspawned_threads++] = pthread_mach_thread_np(tmp);
+    } else {
+        free(ts);
+    }
+    pthread_mutex_unlock(&g_life_lock);
+    return rc;
+}
+
 void *tl_runtime_lookup(const char *sym) {
     static const struct { const char *name; void *fn; } table[] = {
+        {"___clear_cache", (void *)rt_clear_cache},
+        {"_SecTrustSettingsRemoveTrustSettings", (void *)rt_sec_trust_stub},
+        {"_SecTrustSettingsSetTrustSettings", (void *)rt_sec_trust_stub},
+        {"_pthread_key_create", (void *)rt_pthread_key_create},
+        {"_pthread_key_delete", (void *)rt_pthread_key_delete},
+        {"_pthread_create", (void *)rt_pthread_create},
         {"_dlopen", (void *)rt_dlopen},
         {"_mmap", (void *)rt_mmap},
         {"_mprotect", (void *)rt_mprotect},
         {"_munmap", (void *)rt_munmap},
-#if TARGET_OS_OSX
+        {"_vm_allocate", (void *)rt_vm_allocate},
+        {"_vm_deallocate", (void *)rt_vm_deallocate},
+        {"_vm_map", (void *)rt_vm_map},
         {"_mach_vm_allocate", (void *)rt_mach_vm_allocate},
+        {"_mach_vm_deallocate", (void *)rt_mach_vm_deallocate},
         {"_mach_vm_map", (void *)rt_mach_vm_map},
-#endif
         {"_dlclose", (void *)rt_dlclose},
         {"_dlsym", (void *)rt_dlsym},
         {"_dladdr", (void *)rt_dladdr},
@@ -3158,9 +3562,11 @@ void *tl_runtime_lookup(const char *sym) {
         for (size_t i = 0; i < sizeof pat / sizeof *pat; i++)
             if (!strcmp(sym, pat[i].name) && !(skip && strstr(skip, pat[i].name))) return pat[i].fn;
     }
-    if (g_host && g_host->ios_kernel_rules &&
-        (!strcmp(sym, "_bootstrap_check_in") || !strcmp(sym, "_bootstrap_register") || !strcmp(sym, "_bootstrap_register2")))
-        return (void *)rt_bootstrap_refused;
+    if (g_host && g_host->ios_kernel_rules) {
+        if (!strcmp(sym, "_pthread_jit_write_protect_np")) return (void *)rt_jit_write_protect;
+        if (!strcmp(sym, "_bootstrap_check_in") || !strcmp(sym, "_bootstrap_register") || !strcmp(sym, "_bootstrap_register2"))
+            return (void *)rt_bootstrap_refused;
+    }
     if (g_host && g_host->no_processes)
         for (size_t i = 0; i < sizeof procs / sizeof *procs; i++)
             if (!strcmp(sym, procs[i].name)) return procs[i].fn;

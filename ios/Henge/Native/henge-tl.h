@@ -31,6 +31,11 @@ int henge_tl_info(const char *path, HengeTlInfo *info, char *err, size_t errlen)
    end of the JIT region and remaps part of it). Returns main's result (or the code it passed to exit), or -1 with a
    reason in err if it could not be loaded. Blocks until it returns. */
 int henge_tl_run(const char *path, const char *out_path, char *err, size_t errlen);
+int henge_tl_run_args(const char *path, const char *args_line, const char *out_path, char *err, size_t errlen);
+int henge_tl_terminal_exec(const char *cmdline, const char *out_path, char *err, size_t errlen);
+int henge_tl_is_running(void);
+void henge_tl_write_stdin(const char *text);
+const char *henge_tl_cwd(void);
 /* A Mac app ran in this launch: no Mac can start, and no other program run, until Henge is opened again. */
 int henge_tl_used(void);
 int henge_tl_ran_program(void);

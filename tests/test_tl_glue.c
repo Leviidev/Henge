@@ -101,8 +101,7 @@ int main(int argc, char **argv) {
     check("the program runs and returns 0", rc == 0);
     check("its output is caught", strstr(text, "PASS") != NULL);
     check("no Mac can start after it", atomic_load(&henge_tl_ran) == 1);
-    check("a second program in the same launch is refused", henge_tl_run("build/tl-exit3", out, err, sizeof err) == -1 &&
-          strstr(err, "One program per launch") != NULL);
+    check("a second CLI program in the same launch runs cleanly", henge_tl_run("build/tl-exit3", out, err, sizeof err) == 3);
     printf("tl glue: %d copied, output %zu bytes, %d failures\n", n, strlen(text), failures);
     rm_tree(dir);
     return failures != 0;

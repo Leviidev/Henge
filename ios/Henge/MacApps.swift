@@ -159,6 +159,22 @@ struct MacAppsView: View {
                         .padding(.horizontal, 4).padding(.bottom, 12)
                     if let busy = store.busy { NoticeRow(symbol: "arrow.down.circle.fill", text: busy) }
                     if let problem = store.problem { NoticeRow(symbol: "exclamationmark.triangle.fill", text: problem, tint: Desk.warn) }
+                    NavigationLink {
+                        MacTerminalView()
+                    } label: {
+                        HStack(spacing: 14) {
+                            Image(systemName: "terminal.fill").font(.system(size: 22)).foregroundStyle(Desk.accent).frame(width: 34)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Mac Terminal").font(.system(size: 17, weight: .semibold)).foregroundStyle(Desk.text)
+                                Text("Run shell commands, claude, or agy without macOS").font(.system(size: 13)).foregroundStyle(Desk.dim).lineLimit(1)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(Desk.faint)
+                        }
+                        .padding(16).deskCard()
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 12)
                     if store.apps.isEmpty && store.busy == nil {
                         VStack(spacing: 10) {
                             Image(systemName: "shippingbox").font(.system(size: 34)).foregroundStyle(Desk.faint)
@@ -214,6 +230,8 @@ struct MacAppRunView: View {
     let app: MacApp
     @ObservedObject private var store = MacAppsStore.shared
     @Environment(\.dismiss) private var dismiss
+    @State private var arguments = ""
+    @State private var stdinText = ""
     @State private var running = false
     @State private var output = ""
     @State private var result: String?
@@ -238,10 +256,32 @@ struct MacAppRunView: View {
                 .font(.system(size: 15)).padding(17).deskCard()
 
                 if app.canRun {
+                    DeskHeading("Arguments")
+                    TextField("e.g. --version, --help, -p \"hello\"", text: $arguments)
+                        .font(.system(size: 14, design: .monospaced))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .onSubmit { if !running && henge_tl_is_running() == 0 { run() } }
+                        .padding(14).deskCard()
                     Button(running ? "Running…" : "Run") { run() }
-                        .buttonStyle(DeskButtonStyle()).disabled(running || (result == nil && henge_tl_ran_program() != 0)).padding(.top, 16)
-                    Text("Programs run inside Henge, one per launch. After one has run, quit Henge and open it again to run another or to start a Mac.")
+                        .buttonStyle(DeskButtonStyle()).disabled(running || henge_tl_is_running() != 0).padding(.top, 16)
+                    Text("Command-line programs can run multiple times inside Henge without booting macOS. Quit and reopen Henge before starting a full Mac VM.")
                         .font(.system(size: 13)).foregroundStyle(Desk.dim).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
+                    if running {
+                        HStack(spacing: 8) {
+                            TextField("Send to stdin…", text: $stdinText)
+                                .font(.system(size: 13, design: .monospaced))
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .onSubmit { sendStdin() }
+                                .padding(10).deskCard()
+                            Button("Send") { sendStdin() }
+                                .font(.system(size: 13, weight: .semibold))
+                            Button("^D") { henge_tl_write_stdin("") }
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .padding(.top, 12)
+                    }
                     if result != nil || !output.isEmpty {
                         DeskHeading("Output")
                         VStack(alignment: .leading, spacing: 8) {
@@ -269,23 +309,171 @@ struct MacAppRunView: View {
         .confirmationDialog("Delete \(app.name)?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { store.delete(app); dismiss() }
         }
+        .task(id: running) {
+            guard running else { return }
+            let out = MacAppsStore.output(for: app)
+            while !Task.isCancelled && running {
+                if let text = try? String(contentsOf: out, encoding: .utf8) {
+                    output = String(text.suffix(20000))
+                }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+        }
+    }
+
+    private func sendStdin() {
+        let line = stdinText + "\n"
+        stdinText = ""
+        henge_tl_write_stdin(line)
     }
 
     private func run() {
         running = true
         result = nil
         output = ""
-        let exe = app.executable, out = MacAppsStore.output(for: app)
-        HengeLog.log("macapps", "running \(app.name) (\(exe))")
+        let exe = app.executable, out = MacAppsStore.output(for: app), args = arguments
+        HengeLog.log("macapps", "running \(app.name) (\(exe) \(args))")
         Task.detached(priority: .userInitiated) {
             var err = [CChar](repeating: 0, count: 512)
-            let rc = henge_tl_run(exe, out.path, &err, err.count)
+            let rc = henge_tl_run_args(exe, args, out.path, &err, err.count)
             let text = (try? String(contentsOf: out, encoding: .utf8)) ?? ""
             let why = String(cString: err)
             HengeLog.log("macapps", "\(exe) returned \(rc)\(why.isEmpty ? "" : ": \(why)")")
             await MainActor.run {
                 output = String(text.suffix(20000))
                 result = rc == -1 && !why.isEmpty ? "Could not run it: \(why)" : "Finished with code \(rc)."
+                running = false
+            }
+        }
+    }
+}
+
+/// Interactive terminal running Mac CLI binaries and coding agents directly on iOS via tl/.
+struct MacTerminalView: View {
+    @State private var command = ""
+    @State private var stdinText = ""
+    @State private var output = ""
+    @State private var cwd = String(cString: henge_tl_cwd())
+    @State private var running = false
+
+    private static var transcriptURL: URL {
+        MacAppsStore.folder.appendingPathComponent("terminal output.txt")
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(output.isEmpty ? "Ready. Type a command (e.g. help, ls, agy --version, claude --version)." : output)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(14)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .deskCard()
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(["help", "ls -la", "agy --version", "claude --version", "env"], id: \.self) { preset in
+                        Button(preset) { execute(preset) }
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .deskCard(radius: 10)
+                            .disabled(running)
+                    }
+                    Button("clear") { execute("clear") }
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .deskCard(radius: 10)
+                        .disabled(running)
+                }
+            }
+
+            if running {
+                HStack(spacing: 8) {
+                    TextField("Send stdin line…", text: $stdinText)
+                        .font(.system(size: 14, design: .monospaced))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .onSubmit { sendStdin() }
+                        .padding(12).deskCard()
+                    Button("Send") { sendStdin() }
+                        .font(.system(size: 14, weight: .semibold))
+                    Button("^D") { henge_tl_write_stdin("") }
+                        .font(.system(size: 14, weight: .semibold))
+                }
+            } else {
+                HStack(spacing: 8) {
+                    TextField("\(URL(fileURLWithPath: cwd).lastPathComponent) $ ", text: $command)
+                        .font(.system(size: 14, design: .monospaced))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .onSubmit { submit() }
+                        .padding(12).deskCard()
+                    Button("Run") { submit() }
+                        .font(.system(size: 14, weight: .semibold))
+                        .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(Desk.page)
+        .navigationTitle("Mac Terminal")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            try? FileManager.default.createDirectory(at: MacAppsStore.folder, withIntermediateDirectories: true)
+            refreshTranscript()
+        }
+        .task(id: running) {
+            guard running else { return }
+            while !Task.isCancelled && running {
+                refreshTranscript()
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+        }
+    }
+
+    private func refreshTranscript() {
+        if let text = try? String(contentsOf: Self.transcriptURL, encoding: .utf8) {
+            output = String(text.suffix(30000))
+        }
+        cwd = String(cString: henge_tl_cwd())
+    }
+
+    private func sendStdin() {
+        let line = stdinText + "\n"
+        stdinText = ""
+        henge_tl_write_stdin(line)
+    }
+
+    private func submit() {
+        let line = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return }
+        command = ""
+        execute(line)
+    }
+
+    private func execute(_ cmdline: String) {
+        guard !running else { return }
+        running = true
+        let out = Self.transcriptURL
+        HengeLog.log("macapps", "term: \(cmdline)")
+        Task.detached(priority: .userInitiated) {
+            var err = [CChar](repeating: 0, count: 512)
+            let rc = henge_tl_terminal_exec(cmdline, out.path, &err, err.count)
+            let why = String(cString: err)
+            if rc != 0 && !why.isEmpty {
+                let note = "error (\(rc)): \(why)\n"
+                if let h = try? FileHandle(forWritingTo: out) {
+                    _ = try? h.seekToEnd()
+                    try? h.write(contentsOf: Data(note.utf8))
+                    try? h.close()
+                }
+            }
+            await MainActor.run {
+                refreshTranscript()
                 running = false
             }
         }
