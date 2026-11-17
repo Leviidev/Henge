@@ -114,7 +114,10 @@ enum Autopilot {
         case "snap": // the Mac's screen, full size, into Documents/snap.jpg (or NAME.jpg): "snap", "snap safari"
             let name = arg.isEmpty ? "snap" : arg
             let url = docs.appendingPathComponent("\(name).jpg")
-            if let image = MacPreview.capture(width: 1920, height: 1080),
+            var mw: UInt32 = 0, mh: UInt32 = 0
+            henge_vm_display_size(&mw, &mh)
+            let snapW = mw > 0 ? Int(mw) : 1920, snapH = mh > 0 ? Int(mh) : 1080
+            if let image = MacPreview.capture(width: snapW, height: snapH),
                let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.9), (try? data.write(to: url, options: .atomic)) != nil {
                 HengeLog.log("autopilot", "snap \(url.lastPathComponent), \(data.count / 1024) KB")
             } else {

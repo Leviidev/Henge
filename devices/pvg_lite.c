@@ -172,6 +172,13 @@ void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
     display_h = height;
 }
 
+/* The display mode's size: what the pointer's position (+0xe00) and its picture are measured in, whatever the size
+   of the surface macOS scans out (a scaled resolution chosen in its Displays settings draws a bigger or smaller one). */
+void hv_pvg_lite_mode(uint32_t *width, uint32_t *height) {
+    *width = display_w;
+    *height = display_h;
+}
+
 static void display_set_page(HvPvgLite *p, uint64_t pa) {
     uint8_t *d = hv_phys_ptr(p->m, pa, 0x4000);
     if (!d) return;
