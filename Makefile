@@ -6,13 +6,14 @@ B = build
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
        $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
-DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
+DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/pvg_surface.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o
 ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown \
+        $(B)/test_pvg_surface $(B)/test_pvg_mapper
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -102,6 +103,21 @@ test-vm-lifecycle: $(B)/test_vm_lifecycle
 
 $(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) -fobjc-arc $^ $(METAL_LIBS) -o $@
+
+$(B)/test_pvg_surface: tests/test_pvg_surface.c devices/pvg_surface.c devices/pvg_surface.h | $(B)
+	$(CC) $(CFLAGS) tests/test_pvg_surface.c devices/pvg_surface.c -o $@
+
+$(B)/test_pvg_mapper: tests/test_pvg_mapper.c $(ENGINE) $(B)/gicv3.o $(B)/pvg_lite.o
+	$(CC) $(CFLAGS) -Wno-unused-parameter $^ -framework CoreFoundation -o $@
+
+test-pvg-surface: $(B)/test_pvg_surface
+	$(B)/test_pvg_surface
+
+test-pvg: $(B)/test_pvg_surface $(B)/test_pvg_mapper $(B)/test_pvg_lifecycle
+	$(B)/test_pvg_surface
+	$(B)/test_pvg_mapper
+	$(B)/test_pvg_lifecycle
+.PHONY: test-pvg-surface test-pvg
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@

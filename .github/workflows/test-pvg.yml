@@ -1,0 +1,30 @@
+name: PVG regression tests
+
+on:
+  push:
+    paths:
+      - 'devices/pvg*'
+      - 'tests/test_pvg*'
+      - 'Makefile'
+      - '.github/workflows/test-pvg.yml'
+  pull_request:
+    paths:
+      - 'devices/pvg*'
+      - 'tests/test_pvg*'
+      - 'Makefile'
+      - '.github/workflows/test-pvg.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test surface page tables, mapper ordering and Metal lifecycle
+        run: make test-pvg
+      - name: Compile app and renderers for iOS and macOS
+        run: bash ios/scripts/check_display.sh

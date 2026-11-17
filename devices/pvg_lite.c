@@ -90,6 +90,8 @@ struct HvPvgLite {
     int metal_tried;
     uint32_t stamps_pending; /* channels Metal finished, for the next poll */
     uint64_t vblanks;        /* refresh events sent (HV_PVG_VBLANK) */
+    uint64_t mapper_seen;    /* entries already handed to Metal, device lock held */
+    uint32_t mapper_waiting; /* GPU completions still holding the guest's pages */
 };
 
 /* What the guest's GetDeviceInfo asks for: key, value pairs, as the framework
@@ -681,7 +683,7 @@ static void do_channel(HvPvgLite *p, uint32_t ch) {
 static void do_mapper(HvPvgLite *p) {
     if (p->tally) {
         uint64_t ring = p->io_regs[0], table = p->io_regs[0x10 / 8], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+        for (uint64_t i = __atomic_load_n(&p->io_regs[0x20 / 8], __ATOMIC_ACQUIRE); i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
             uint32_t *t = table ? hv_phys_ptr(p->m, table, 64) : NULL;
             if (!e || !t) continue;
@@ -696,15 +698,40 @@ static void do_mapper(HvPvgLite *p) {
             }
         }
     }
-    if (p->metal) {
-        uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8], want = p->io_regs[0x18 / 8];
-        for (uint64_t i = p->io_regs[0x20 / 8]; i < want && size; i++) {
+    HvPvgMetal *metal = atomic_load_explicit(&p->metal, memory_order_acquire);
+    uint64_t want = p->io_regs[0x18 / 8];
+    if (metal) {
+        uint64_t ring = p->io_regs[0], size = p->io_regs[0x8 / 8];
+        uint64_t done = __atomic_load_n(&p->io_regs[0x20 / 8], __ATOMIC_ACQUIRE);
+        uint64_t from = p->mapper_seen;
+        if ((int64_t)(from - done) < 0 || (int64_t)(from - want) > 0) from = done;
+        if (from == want && __atomic_load_n(&p->mapper_waiting, __ATOMIC_ACQUIRE)) return;
+        int unmaps = 0;
+        for (uint64_t i = from; i < want && size; i++) {
             uint32_t *e = hv_phys_ptr(p->m, ring + (i % size) * 16, 16);
-            if (e && e[0] == 2) hv_pvg_metal_unmap(p->metal, e[1]);
+            if (e && e[0] == 2) hv_pvg_metal_unmap(metal, e[1]), unmaps++;
+        }
+        p->mapper_seen = want;
+        /* An unmap answer lets the guest reuse these pages immediately. Wait
+           for GPU writes already queued, and keep later answers behind it. */
+        if (unmaps || __atomic_load_n(&p->mapper_waiting, __ATOMIC_ACQUIRE)) {
+            __atomic_fetch_add(&p->mapper_waiting, 1, __ATOMIC_ACQ_REL);
+            hv_pvg_metal_after_gpu(metal, p, want);
+            return;
         }
     }
-    p->io_regs[0x20 / 8] = p->io_regs[0x18 / 8];
+    __atomic_store_n(&p->io_regs[0x20 / 8], want, __ATOMIC_RELEASE);
     hv_gicv3_pend(p->gic, p->iosfc_irq);
+}
+
+/* Called by a GPU completion; a later callback must never move the ring back. */
+void hv_pvg_lite_mapper_done(HvPvgLite *p, uint64_t index) {
+    uint64_t now = __atomic_load_n(&p->io_regs[0x20 / 8], __ATOMIC_ACQUIRE);
+    while ((int64_t)(index - now) > 0 &&
+           !__atomic_compare_exchange_n(&p->io_regs[0x20 / 8], &now, index, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+    __atomic_fetch_sub(&p->mapper_waiting, 1, __ATOMIC_ACQ_REL);
+    hv_gicv3_pend(p->gic, p->iosfc_irq);
+    if (p->m->ncpus == 1) hv_machine_wake(p->m);
 }
 
 /* Device work no doorbell took care of: a channel that had to wait for another one's work. */
@@ -784,13 +811,15 @@ static uint64_t iosfc_read(void *opaque, uint64_t off, unsigned size) {
     HvPvgLite *p = opaque;
     (void)size;
     if (off == 0x1028) return 1;
+    if (off == 0x1020) return __atomic_load_n(&p->io_regs[0x20 / 8], __ATOMIC_ACQUIRE);
     return off >= 0x1000 && off < 0x1040 ? p->io_regs[(off - 0x1000) / 8] : 0;
 }
 
 static void iosfc_write(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvPvgLite *p = opaque;
     (void)size;
-    if (off >= 0x1000 && off < 0x1040) p->io_regs[(off - 0x1000) / 8] = v;
+    if (off == 0x1020) __atomic_store_n(&p->io_regs[0x20 / 8], v, __ATOMIC_RELEASE);
+    else if (off >= 0x1000 && off < 0x1040) p->io_regs[(off - 0x1000) / 8] = v;
     if (off == 0x1018) do_mapper(p);
 }
 
@@ -852,6 +881,9 @@ int hv_pvg_lite_set_state(HvPvgLite *p, const void *in, size_t len) {
     const PvgState *s = in;
     memcpy(p->regs, s->regs, sizeof s->regs);
     memcpy(p->io_regs, s->io_regs, sizeof s->io_regs);
+    /* Snapshot callers have quiesced the GPU; pending callbacks aren't saved. */
+    p->mapper_seen = s->io_regs[0x20 / 8];
+    __atomic_store_n(&p->mapper_waiting, 0, __ATOMIC_RELEASE);
     p->root_rp = s->root_rp, p->status = s->status, p->chan_pending = s->chan_pending;
     p->draining = s->draining, p->stamps_pending = s->stamps_pending;
     p->root_pending = s->root_pending, p->iosfc_pending = s->iosfc_pending, p->old_driver = s->old_driver;

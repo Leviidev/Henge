@@ -16,6 +16,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #include <string.h>
 #include <sys/utsname.h>
+#include "pvg_surface.h"
 
 /* 1080p shrunk onto a phone would make a normal pointer a few dots across; an iPad's screen needs less. */
 static int cursor_scale(void) {
@@ -920,6 +921,10 @@ static void sync_iosurface(HvObject *s) {
    {mapping id, tag, size, ref, description}. Its descriptor: page list at +0
    (physical >> 12, bit 0 present, one per 16 KB), first-page offset +0x60,
    allocation +0x18, bytes per row +0x30. */
+static const void *surface_phys(void *opaque, uint64_t pa, uint64_t length) {
+    return hv_pvg_lite_phys(opaque, pa, length);
+}
+
 /* A guest surface (IOSurface) from its description: its pages in one host buffer (or a real IOSurface for planes). */
 - (HvObject *)newSurface:(uint64_t)mapping {
     NSNumber *key = @(mapping);
@@ -946,6 +951,10 @@ static void sync_iosurface(HvObject *s) {
         memcpy(&a32, desc + 0x10, 4), memcpy(&r32, desc + 0x1c, 4);
         alloc = a32, row = r32, first = 0;
     }
+    if (!alloc || alloc > UINT64_MAX - first - 0x3fff) {
+        [self complain:[NSString stringWithFormat:@"surface %llu: invalid allocation %llu", mapping, alloc]];
+        return nil;
+    }
     surface = [HvObject new];
     if (compact) memcpy(surface->described, desc, sizeof surface->described);
     surface->length = (alloc + first + 0x3fff) & ~0x3fffull;
@@ -961,20 +970,29 @@ static void sync_iosurface(HvObject *s) {
     surface->surface_w = (uint32_t)sw, surface->surface_h = (uint32_t)sh;
     uint64_t n = surface->length >> 14;
     vm_address_t base = 0;
-    const uint32_t *pages = (list & 1) ? hv_pvg_lite_phys(lite, (uint64_t)(list & ~1u) << 12, n * 4) : NULL;
+    uint32_t *pages = hv_pvg_surface_pages(lite, surface_phys, list, n);
     if (!pages || vm_allocate(mach_task_self(), &base, surface->length, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        free(pages);
         [self complain:[NSString stringWithFormat:@"surface %llu has no pages", mapping]];
         return nil;
     }
     surface->mapped = (uint8_t *)base;
+    uint64_t mapped = 0;
     for (uint64_t i = 0; i < n; i++) {
         if (!(pages[i] & 1)) continue;
         uint8_t *src = hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000);
         if (!src) continue;
         vm_address_t to = base + (i << 14);
         vm_prot_t cur, max;
-        vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
+        kern_return_t kr = vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS) {
+            free(pages);
+            [self complain:[NSString stringWithFormat:@"surface %llu: page %llu remap failed (%d)", mapping, i, kr]];
+            return nil;
+        }
+        mapped++;
     }
+    if (n > 4096) fprintf(stderr, "hengevm: pvg-metal: surface %llu: two-level page list, %llu/%llu pages mapped\n", mapping, mapped, n);
     surface->object = [device newBufferWithBytesNoCopy:surface->mapped length:surface->length options:MTLResourceStorageModeShared
                                            deallocator:^(void *at, NSUInteger size) { vm_deallocate(mach_task_self(), (vm_address_t)at, size); }];
     surface->mapping_in_buffer = surface->object != nil;
@@ -1017,6 +1035,7 @@ static void sync_iosurface(HvObject *s) {
             sync_iosurface(surface);
         }
     }
+    free(pages);
     fprintf(stderr, "hengevm: pvg-metal: surface %llu: %llux%llu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", mapping, (unsigned long long)sw, (unsigned long long)sh, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], planes);
         return surface;
 }
@@ -2875,6 +2894,31 @@ void hv_pvg_metal_unmap(HvPvgMetal *m, uint32_t mapping) {
         }
         [r->surfaces removeObjectForKey:@(mapping)];
         [r->mapped_textures removeObjectForKey:@(mapping)];
+    });
+}
+
+void hv_pvg_metal_after_gpu(HvPvgMetal *m, HvPvgLite *lite, uint64_t index) {
+    HvReplay *r = (__bridge HvReplay *)m;
+    dispatch_group_enter(r->completions); /* destroy/quiesce must drain this callback too */
+    dispatch_async(r->worker, ^{
+        @autoreleasepool {
+            /* The worker has submitted all earlier work. An empty command
+               buffer on the same Metal queue completes after those writes. */
+            id<MTLCommandBuffer> cb = [r->queue commandBuffer];
+            if (!cb) {
+                [r->last_cb waitUntilCompleted];
+                hv_pvg_lite_mapper_done(lite, index);
+                dispatch_group_leave(r->completions);
+                return;
+            }
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+                (void)done;
+                hv_pvg_lite_mapper_done(lite, index);
+                dispatch_group_leave(r->completions);
+            }];
+            [cb commit];
+            r->last_cb = cb;
+        }
     });
 }
 
