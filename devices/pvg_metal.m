@@ -15,6 +15,7 @@
 #import <TargetConditionals.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <string.h>
+#include <math.h>
 #include <sys/utsname.h>
 
 /* 1080p shrunk onto a phone would make a normal pointer a few dots across; an iPad's screen needs less. */
@@ -2270,6 +2271,45 @@ static const uint8_t *half_to_byte(void) {
     return attached;
 }
 
+/* Blends a cursor bitmap onto a w x h BGRA buffer, scaling position, hot spot, and size
+   from the display mode's pixel grid to the buffer's pixel grid. Returns 1 if drawn. */
+static int blend_cursor(uint8_t *bgra, uint32_t w, uint32_t h, uint32_t where, const uint8_t *src_bgra,
+                        uint32_t cw0, uint32_t ch0, uint32_t src_stride, int hx, int hy,
+                        int *out_x0, int *out_y0, int *out_x1, int *out_y1) {
+    if (!bgra || !src_bgra || !w || !h || !cw0 || !ch0 || where == 0xffffffff) return 0;
+    uint32_t mw = 0, mh = 0;
+    hv_pvg_lite_mode(&mw, &mh);
+    const float kx = (float)w / (float)(mw ? mw : w);
+    const float ky = (float)h / (float)(mh ? mh : h);
+    const float scale = (float)cursor_scale();
+    int x = (int)lrintf(((float)(where & 0xffff) - (float)hx * scale) * kx);
+    int y = (int)lrintf(((float)(where >> 16) - (float)hy * scale) * ky);
+    int cw = (int)lrintf((float)cw0 * scale * kx);
+    int ch = (int)lrintf((float)ch0 * scale * ky);
+    if (cw <= 0 || ch <= 0) return 0;
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + cw > (int)w ? (int)w : x + cw, y1 = y + ch > (int)h ? (int)h : y + ch;
+    if (x1 <= x0 || y1 <= y0) return 0;
+    for (int py = y0; py < y1; py++) {
+        uint32_t sy = (uint32_t)(((uint64_t)(py - y) * ch0) / (uint32_t)ch);
+        if (sy >= ch0) sy = ch0 - 1;
+        const uint8_t *row = src_bgra + (size_t)sy * src_stride;
+        uint8_t *dst = bgra + (size_t)py * w * 4 + (size_t)x0 * 4;
+        for (int px = x0; px < x1; px++, dst += 4) {
+            uint32_t sx = (uint32_t)(((uint64_t)(px - x) * cw0) / (uint32_t)cw);
+            if (sx >= cw0) sx = cw0 - 1;
+            const uint8_t *src = row + (size_t)sx * 4;
+            uint32_t keep = 255u - src[3];
+            for (int c = 0; c < 3; c++) {
+                uint32_t v = src[c] + (dst[c] * keep + 127) / 255;
+                dst[c] = (uint8_t)(v > 255 ? 255 : v);
+            }
+        }
+    }
+    if (out_x0) *out_x0 = x0, *out_y0 = y0, *out_x1 = x1, *out_y1 = y1;
+    return 1;
+}
+
 /* Puts back what the pointer covered, and draws it where the shared page says it is now. */
 - (void)drawCursor {
     if ([self hasDisplayLayer]) {
@@ -2288,26 +2328,11 @@ static const uint8_t *half_to_byte(void) {
         if (where != last) fprintf(stderr, "pvgcursor at %u,%u shown %d flag %d\n", where & 0xffff, where >> 16, cursor_shown, page[0xe04]);
         last = where;
     }
-    if (where == 0xffffffff) return;
-    /* Bigger than the guest draws it. The hot spot stays where it points. */
-    const int scale = cursor_scale();
-    int x = (int)(where & 0xffff) - cursor_hot_x * scale, y = (int)(where >> 16) - cursor_hot_y * scale;
-    int cw = (int)cursor_w * scale, ch = (int)cursor_h * scale;
-    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-    int x1 = x + cw > (int)w ? (int)w : x + cw, y1 = y + ch > (int)h ? (int)h : y + ch;
-    if (x1 <= x0 || y1 <= y0) return;
-    for (int py = y0; py < y1; py++) {
-        const uint8_t *row = cursor + (size_t)((py - y) / scale) * cursor_stride;
-        uint8_t *dst = frame + (size_t)py * w * 4 + (size_t)x0 * 4;
-        for (int px = x0; px < x1; px++, dst += 4) {
-            const uint8_t *src = row + (size_t)((px - x) / scale) * 4;
-            uint32_t keep = 255u - src[3];
-            dst[0] = (uint8_t)(src[0] + (dst[0] * keep + 127) / 255);
-            dst[1] = (uint8_t)(src[1] + (dst[1] * keep + 127) / 255);
-            dst[2] = (uint8_t)(src[2] + (dst[2] * keep + 127) / 255);
-        }
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (blend_cursor(frame, w, h, where, cursor, cursor_w, cursor_h, cursor_stride,
+                     cursor_hot_x, cursor_hot_y, &x0, &y0, &x1, &y1)) {
+        drawn_x = x0, drawn_y = y0, drawn_w = x1 - x0, drawn_h = y1 - y0;
     }
-    drawn_x = x0, drawn_y = y0, drawn_w = x1 - x0, drawn_h = y1 - y0;
 }
 
 static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
@@ -2407,8 +2432,12 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
     BOOL half = surface->fourcc == 'RGhA';
-    if (!screen_tex) fprintf(stderr, "hengevm: display scanout format %s (%ux%u)\n",
-                             half ? "RGBA16Float" : "BGRA8Unorm", surface->surface_w, surface->surface_h);
+    if (!screen_tex || surface->surface_w != screen_w || surface->surface_h != screen_h) {
+        uint32_t mw = 0, mh = 0;
+        hv_pvg_lite_mode(&mw, &mh);
+        fprintf(stderr, "hengevm: display scanout format %s (%ux%u, mode %ux%u)\n",
+                half ? "RGBA16Float" : "BGRA8Unorm", surface->surface_w, surface->surface_h, mw, mh);
+    }
     if (!surface->scanout) {
         MTLTextureDescriptor *t = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:half ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm
                                                                                      width:surface->surface_w height:surface->surface_h mipmapped:NO];
@@ -2535,9 +2564,15 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         const uint8_t *page = hv_pvg_lite_display_page(lite);
         uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
         if (ctex && where != 0xffffffff && (shown || page[0xe04])) {
+            /* The pointer is placed and sized in the display mode's pixels, like a hardware cursor plane; with a scaled
+               resolution chosen in macOS the surface is another size, and both go by the ratio (else the pointer
+               drifts away from where macOS has it, more the further from the top left corner). */
+            uint32_t mw = 0, mh = 0;
+            hv_pvg_lite_mode(&mw, &mh);
+            const float kx = mw ? (float)W / (float)mw : 1, ky = mh ? (float)H / (float)mh : 1;
             const float scale = cursor_scale();
-            float x = (float)(where & 0xffff) - hx * scale, y = (float)(where >> 16) - hy * scale;
-            float cw = cw0 * scale, ch = ch0 * scale;
+            float x = ((float)(where & 0xffff) - hx * scale) * kx, y = ((float)(where >> 16) - hy * scale) * ky;
+            float cw = cw0 * scale * kx, ch = ch0 * scale * ky;
             float r[4] = {x / W * 2 - 1, 1 - (y + ch) / H * 2, cw / W * 2, ch / H * 2};
             [e setRenderPipelineState:cursor_pipe];
             [e setVertexBytes:r length:sizeof r atIndex:0];
@@ -2885,9 +2920,10 @@ int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t w, uint32_t h) 
     if (!m || !w || !h) return -1;
     HvReplay *r = (__bridge HvReplay *)m;
     os_unfair_lock_lock(&r->screen_lock);
-    id<MTLTexture> tex = r->screen_tex;
-    BOOL half = r->screen_half;
-    uint32_t W = r->screen_w, H = r->screen_h;
+    id<MTLTexture> tex = r->screen_tex, ctex = r->cursor_tex;
+    BOOL half = r->screen_half, shown = r->cursor_shown;
+    uint32_t W = r->screen_w, H = r->screen_h, cw0 = r->cursor_w, ch0 = r->cursor_h;
+    int hx = r->cursor_hot_x, hy = r->cursor_hot_y;
     os_unfair_lock_unlock(&r->screen_lock);
     id<MTLBuffer> buffer = tex.buffer;
     if (!buffer || !W || !H || buffer.storageMode == MTLStorageModePrivate) return -1;
@@ -2913,6 +2949,16 @@ int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t w, uint32_t h) 
             }
             for (int c = 0; c < 3; c++) out[c] = (uint8_t)((sum[c] + 2) / 4);
             out[3] = 255;
+        }
+    }
+    const uint8_t *page = hv_pvg_lite_display_page(r->lite);
+    uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
+    if (ctex && cw0 && ch0 && where != 0xffffffff && (shown || (page && page[0xe04]))) {
+        uint8_t *cbuf = malloc((size_t)cw0 * ch0 * 4);
+        if (cbuf) {
+            [ctex getBytes:cbuf bytesPerRow:(NSUInteger)cw0 * 4 fromRegion:MTLRegionMake2D(0, 0, cw0, ch0) mipmapLevel:0];
+            blend_cursor(bgra, w, h, where, cbuf, cw0, ch0, cw0 * 4, hx, hy, NULL, NULL, NULL, NULL);
+            free(cbuf);
         }
     }
     return 0;
