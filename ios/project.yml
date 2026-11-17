@@ -110,7 +110,7 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make ios-lib build/henge-agent.gz build/tl-samples.dmg
+          make ios-lib build/henge-agent.gz build/tl-samples.dmg build/henge-touch-agent.tar.gz
           ./tools/build_ios_restore.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:
@@ -118,7 +118,7 @@ targets:
         # What runs inside macOS for the clipboard and shared folder (tools/henge-agent.m).
         script: |
           set -e
-          cp "$SRCROOT/../build/henge-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-agent.gz"
+          cp "$SRCROOT/../build/henge-agent.gz" "$SRCROOT/../build/henge-touch-agent.tar.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/"
           rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
           cp -X "$SRCROOT/../build/tl-samples.dmg" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
         basedOnDependencyAnalysis: false
