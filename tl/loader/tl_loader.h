@@ -84,6 +84,10 @@ void tl_main_bundle_for_everyone(void);
 void tl_adopt_ns_bundle(int ns, const char *app_path);
 /* The adopted bundle (an NSBundle *), or NULL: for host code acting for the app (Henge's AppKit). */
 void *tl_main_bundle(void);
+/* Sets main's argc/argv before tl_load so initializers (ProgramVars) observe the current invocation. */
+void tl_set_main_args(int argc, char **argv);
+/* Suspends any background threads and deletes TSD/TLV keys registered by this image before thread exit or reload. */
+void tl_quiesce_image(TlImage *image);
 /* Calls the executable's main. */
 int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp);
 

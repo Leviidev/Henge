@@ -145,19 +145,47 @@ enum Autopilot {
             var err = [CChar](repeating: 0, count: 512)
             let n = henge_tl_import_dmg(dmg.path, MacAppsStore.folder.path, &err, err.count)
             HengeLog.log("autopilot", "tlsamples: \(n) copied \(String(cString: err))")
-        case "tl": // "tl Hello (C)": run a program from Documents/Mac Apps (or a path) through the translation layer; output to the log
-            let url = arg.hasPrefix("/") ? URL(fileURLWithPath: arg) : MacAppsStore.folder.appendingPathComponent(arg)
-            guard let app = MacApp(url: url) else { HengeLog.log("autopilot", "tl: \(url.path) is not a Mac app or program"); break }
+        case "tl": // "tl Hello (C)" or "tl claude --version": run a program from Documents/Mac Apps (or a path) through the translation layer; output to the log
+            for _ in 0..<240 where !JITBootstrap.ready { try? await Task.sleep(nanoseconds: 500_000_000) }
+            let rawURL = arg.hasPrefix("/") ? URL(fileURLWithPath: arg) : MacAppsStore.folder.appendingPathComponent(arg)
+            let resolved: (app: MacApp, args: String)? = {
+                if let exact = MacApp(url: rawURL) { return (exact, "") }
+                let split = arg.split(separator: " ", maxSplits: 1).map(String.init)
+                guard !split.isEmpty else { return nil }
+                let prog = split[0]
+                let rest = split.count > 1 ? split[1] : ""
+                let url = prog.hasPrefix("/") ? URL(fileURLWithPath: prog) : MacAppsStore.folder.appendingPathComponent(prog)
+                if let app = MacApp(url: url) { return (app, rest) }
+                if prog == "agy", let agy = MacApp(url: MacAppsStore.folder.appendingPathComponent("antigravity")) {
+                    return (agy, rest)
+                }
+                return nil
+            }()
+            guard let resolved else { HengeLog.log("autopilot", "tl: \(arg) is not a Mac app or program"); break }
+            let app = resolved.app, argsLine = resolved.args
             let out = MacAppsStore.output(for: app)
             let exe = app.executable
             let (rc, why) = await Task.detached { () -> (Int32, String) in
                 var err = [CChar](repeating: 0, count: 512)
-                let rc = henge_tl_run(exe, out.path, &err, err.count)
+                let rc = henge_tl_run_args(exe, argsLine, out.path, &err, err.count)
                 return (rc, String(cString: err))
             }.value
             let text = (try? String(contentsOf: out, encoding: .utf8)) ?? ""
-            HengeLog.log("autopilot", "tl: \(app.name) returned \(rc) \(why)")
+            HengeLog.log("autopilot", "tl: \(app.name) \(argsLine) returned \(rc) \(why)")
             for line in text.prefix(4000).split(separator: "\n").prefix(40) { HengeLog.log("tl-out", String(line)) }
+        case "term": // "term ls", "term agy --version": run a command in the built-in Mac Terminal translation layer
+            try? FileManager.default.createDirectory(at: MacAppsStore.folder, withIntermediateDirectories: true)
+            let out = MacAppsStore.folder.appendingPathComponent("terminal output.txt")
+            let beforeLen = ((try? Data(contentsOf: out))?.count) ?? 0
+            let (rc, why) = await Task.detached { () -> (Int32, String) in
+                var err = [CChar](repeating: 0, count: 512)
+                let rc = henge_tl_terminal_exec(arg, out.path, &err, err.count)
+                return (rc, String(cString: err))
+            }.value
+            let data = (try? Data(contentsOf: out)) ?? Data()
+            let delta = data.count > beforeLen ? String(decoding: data.dropFirst(beforeLen), as: UTF8.self) : ""
+            HengeLog.log("autopilot", "term: \(arg) returned \(rc) \(why)")
+            for line in delta.prefix(4000).split(separator: "\n").prefix(40) { HengeLog.log("tl-out", String(line)) }
         case "log": // already in the log; the wall clock too, to line it up with things measured elsewhere
             HengeLog.log("autopilot", String(format: "at %.3f", Date().timeIntervalSince1970))
         case "stop":
