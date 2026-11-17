@@ -43,11 +43,26 @@ struct Trackpad: UIViewRepresentable {
         private let buzz = UIImpactFeedbackGenerator(style: .medium)
         private var tapsClick: Bool { VolumeClicks.inputMode == .touchscreen }
 
+        /* Physical mouse / trackpad fallback when pointer lock is unavailable or refused. */
+        private var lastHover: CGPoint?
+        private var hoverRestX: Float = 0, hoverRestY: Float = 0
+        private var indirectTouches: Set<UITouch> = []
+        private var indirectPressedButton: Int32?
+        private var lastIndirectScroll = CGPoint.zero
+        private var indirectScrollRestX: Float = 0, indirectScrollRestY: Float = 0
+
         override init(frame: CGRect) {
             super.init(frame: frame)
             isMultipleTouchEnabled = true
             backgroundColor = .clear
             addInteraction(UIPointerInteraction(delegate: self))
+            let hover = UIHoverGestureRecognizer(target: self, action: #selector(hovered(_:)))
+            addGestureRecognizer(hover)
+            let scroll = UIPanGestureRecognizer(target: self, action: #selector(indirectScrolled(_:)))
+            scroll.allowedScrollTypesMask = .all
+            scroll.allowedTouchTypes = []
+            scroll.cancelsTouchesInView = false
+            addGestureRecognizer(scroll)
         }
 
         /// Over the Mac there is only the Mac's pointer, if iPadOS hasn't locked its own away.
@@ -77,6 +92,20 @@ struct Trackpad: UIViewRepresentable {
         private static func ms(_ t: TimeInterval) -> UInt32 { UInt32(truncatingIfNeeded: Int(t * 1000)) }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let indirect = touches.filter { $0.type == .indirectPointer }
+            if !indirect.isEmpty {
+                for t in indirect {
+                    indirectTouches.insert(t)
+                    lastHover = t.location(in: self)
+                }
+                if indirectPressedButton == nil,
+                   CACurrentMediaTime() - HardwareMouse.lastGCMouseButtonTime > 0.1,
+                   !HardwareMouse.shared.hasHeldButton {
+                    let button: Int32 = event?.buttonMask.contains(.secondary) == true ? 1 : 0
+                    indirectPressedButton = button
+                    henge_vm_mouse_button(button, 1)
+                }
+            }
             let touches = touches.filter { $0.type != .indirectPointer }
             guard !touches.isEmpty else { return }
             if fingers.isEmpty {
@@ -110,6 +139,13 @@ struct Trackpad: UIViewRepresentable {
         }
 
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            for t in touches where t.type == .indirectPointer {
+                let now = t.location(in: self), prev = t.previousLocation(in: self)
+                lastHover = now
+                if CACurrentMediaTime() - HardwareMouse.lastGCMouseMoveTime > 0.1 {
+                    sendRelativeMove(dx: now.x - prev.x, dy: now.y - prev.y)
+                }
+            }
             var moved = false
             let ts = Self.ms(event?.timestamp ?? touches.first?.timestamp ?? 0)
             for t in touches where t.type != .indirectPointer {
@@ -131,6 +167,15 @@ struct Trackpad: UIViewRepresentable {
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { lift(touches) }
 
         private func lift(_ touches: Set<UITouch>) {
+            let indirect = touches.filter { $0.type == .indirectPointer }
+            if !indirect.isEmpty {
+                indirectTouches.subtract(indirect)
+                if indirectTouches.isEmpty, let button = indirectPressedButton {
+                    indirectPressedButton = nil
+                    henge_vm_mouse_button(button, 0)
+                    StickyKeys.shared.releaseAll()
+                }
+            }
             var lifted: [Int32] = []
             fingers.removeAll { finger in
                 guard touches.contains(finger.touch), finger.touch.type != .indirectPointer else { return false }
@@ -184,6 +229,63 @@ struct Trackpad: UIViewRepresentable {
         private func cancelHold() {
             holdTimer?.invalidate()
             holdTimer = nil
+        }
+
+        private func sendRelativeMove(dx: CGFloat, dy: CGFloat) {
+            let configured = UserDefaults.standard.object(forKey: HardwareMouse.speedKey)
+            let speed = Float(configured == nil ? 1.0 : UserDefaults.standard.double(forKey: HardwareMouse.speedKey))
+            hoverRestX += Float(dx) * speed
+            hoverRestY += Float(dy) * speed
+            let ix = hoverRestX.rounded(), iy = hoverRestY.rounded()
+            guard ix != 0 || iy != 0 else { return }
+            hoverRestX -= ix
+            hoverRestY -= iy
+            henge_vm_mouse_move(Int32(ix), Int32(iy))
+        }
+
+        @objc private func hovered(_ g: UIHoverGestureRecognizer) {
+            let p = g.location(in: self)
+            switch g.state {
+            case .began:
+                lastHover = p
+            case .changed:
+                defer { lastHover = p }
+                guard let prev = lastHover,
+                      CACurrentMediaTime() - HardwareMouse.lastGCMouseMoveTime > 0.1 else { return }
+                sendRelativeMove(dx: p.x - prev.x, dy: p.y - prev.y)
+            case .ended, .cancelled, .failed:
+                lastHover = nil
+            default:
+                break
+            }
+        }
+
+        @objc private func indirectScrolled(_ g: UIPanGestureRecognizer) {
+            if g.state == .began {
+                lastIndirectScroll = .zero
+                indirectScrollRestX = 0
+                indirectScrollRestY = 0
+                return
+            }
+            let t = g.translation(in: self)
+            let dx = t.x - lastIndirectScroll.x, dy = t.y - lastIndirectScroll.y
+            lastIndirectScroll = t
+            if g.state == .ended || g.state == .cancelled || g.state == .failed {
+                lastIndirectScroll = .zero
+            }
+            guard CACurrentMediaTime() - HardwareMouse.lastGCMouseScrollTime > 0.1 else { return }
+            let defaults = UserDefaults.standard
+            let configured = defaults.object(forKey: HardwareMouse.scrollSpeedKey) == nil
+                ? 0.3 : defaults.double(forKey: HardwareMouse.scrollSpeedKey)
+            let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
+            let way: Float = defaults.bool(forKey: HardwareMouse.reverseKey) ? -1 : 1
+            indirectScrollRestX += Float(dx) * scale * way * 0.5
+            indirectScrollRestY += Float(dy) * scale * way * 0.5
+            let sx = indirectScrollRestX.rounded(), sy = indirectScrollRestY.rounded()
+            guard sx != 0 || sy != 0 else { return }
+            indirectScrollRestX -= sx
+            indirectScrollRestY -= sy
+            henge_vm_mouse_scroll(Int32(sx), Int32(sy))
         }
     }
 }

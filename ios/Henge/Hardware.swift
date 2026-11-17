@@ -137,16 +137,28 @@ enum PointerLock {
 
     static func set(_ on: Bool) {
         wanted = on
+        var visited: Set<ObjectIdentifier> = []
         let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
         for window in windows {
             guard let root = window.rootViewController else { continue }
-            let kind: AnyClass = type(of: root)
-            if patched.insert(ObjectIdentifier(kind)).inserted {
-                let answer: @convention(block) (UIViewController) -> Bool = { _ in wanted }
-                class_replaceMethod(kind, #selector(getter: UIViewController.prefersPointerLocked), imp_implementationWithBlock(answer), "B@:")
-            }
-            root.setNeedsUpdateOfPrefersPointerLocked()
+            patch(root, visited: &visited)
         }
+    }
+
+    static func refresh() {
+        set(wanted)
+    }
+
+    private static func patch(_ vc: UIViewController, visited: inout Set<ObjectIdentifier>) {
+        guard visited.insert(ObjectIdentifier(vc)).inserted else { return }
+        let kind: AnyClass = type(of: vc)
+        if patched.insert(ObjectIdentifier(kind)).inserted {
+            let answer: @convention(block) (UIViewController) -> Bool = { _ in wanted }
+            class_replaceMethod(kind, #selector(getter: UIViewController.prefersPointerLocked), imp_implementationWithBlock(answer), "B@:")
+        }
+        for child in vc.children { patch(child, visited: &visited) }
+        if let presented = vc.presentedViewController { patch(presented, visited: &visited) }
+        vc.setNeedsUpdateOfPrefersPointerLocked()
     }
 
     /// iPadOS only locks the pointer to an app that fills the screen: in a window (Stage Manager, or iPadOS 26's windows)
@@ -166,10 +178,14 @@ final class HardwareMouse {
     static let speedKey = "henge.mouse.speed"
     static let reverseKey = "henge.mouse.reverse"
     static let scrollSpeedKey = "henge.mouse.scrollSpeed"
+    private(set) static var lastGCMouseMoveTime: TimeInterval = 0
+    private(set) static var lastGCMouseButtonTime: TimeInterval = 0
+    private(set) static var lastGCMouseScrollTime: TimeInterval = 0
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
     private var buttons = PhysicalMouseButtons(swapsRightAndMiddle: false)
+    var hasHeldButton: Bool { !buttons.held.isEmpty }
     private var buttonsLogged = 0
     private var restX: Float = 0, restY: Float = 0
     private var speed: Float = 1
@@ -178,10 +194,10 @@ final class HardwareMouse {
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
 
     func start() {
+        stopListeners()
         let defaults = UserDefaults.standard
         speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
         reverse = defaults.bool(forKey: Self.reverseKey)
-        releaseButtons()
         let swapButtons = defaults.bool(forKey: PhysicalMouseButtons.swapKey)
         buttons = PhysicalMouseButtons(swapsRightAndMiddle: swapButtons)
         buttonsLogged = 0
@@ -190,7 +206,10 @@ final class HardwareMouse {
         lastScrollSecond = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
-            if let mouse = note.object as? GCMouse { self?.attach(mouse) }
+            if let mouse = note.object as? GCMouse {
+                self?.attach(mouse)
+                PointerLock.refresh()
+            }
         })
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] note in
             guard let self, let mouse = note.object as? GCMouse else { return }
@@ -208,6 +227,10 @@ final class HardwareMouse {
 
     func stop() {
         PointerLock.set(false)
+        stopListeners()
+    }
+
+    private func stopListeners() {
         releaseButtons()
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
@@ -239,6 +262,7 @@ final class HardwareMouse {
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
     private func moved(_ dx: Float, _ dy: Float) {
+        Self.lastGCMouseMoveTime = CACurrentMediaTime()
         restX += dx * speed
         restY -= dy * speed
         let x = restX.rounded(), y = restY.rounded()
@@ -249,6 +273,7 @@ final class HardwareMouse {
     }
 
     private func button(_ physicalButton: Int32, _ pressed: Bool) {
+        Self.lastGCMouseButtonTime = CACurrentMediaTime()
         guard let guestButton = buttons.event(physicalButton, pressed: pressed) else { return }
         if buttonsLogged < 32 {
             buttonsLogged += 1
@@ -267,6 +292,7 @@ final class HardwareMouse {
         // each call; sending both values doubles the scroll and adds sideways drift.
         let verticalChanged = first != lastScrollFirst
         let horizontalChanged = second != lastScrollSecond
+        if verticalChanged || horizontalChanged { Self.lastGCMouseScrollTime = CACurrentMediaTime() }
         lastScrollFirst = first
         lastScrollSecond = second
         let mostlyVertical = abs(first) > 2 * abs(second)
