@@ -10,10 +10,19 @@ struct SettingsView: View {
     @AppStorage(VolumeClicks.modeKey) private var volumeMode = VolumeClicks.Mode.delayHold
     @AppStorage(VolumeClicks.swapKey) private var swapButtons = false
     @AppStorage(PhysicalMouseButtons.swapKey) private var swapMouseButtons = false
+    @AppStorage(AbsolutePointer.followKey) private var followAssistiveTouch = true
+    @AppStorage(AbsolutePointer.madeiraKey) private var madeiraMouse = true
     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
+    @AppStorage(EngineTuning.profileKey) private var profile = false
+    @AppStorage(EngineTuning.syncWaitKey) private var syncWait = true
+    @AppStorage(EngineTuning.vblankKey) private var vblank = false
+    @AppStorage(EngineTuning.windowKey) private var el0window = false
+    @AppStorage(EngineTuning.linux3DKey) private var linux3D = true
+    @AppStorage(EngineTuning.linuxGPUAsyncKey) private var linuxGPUAsync = false
+    @AppStorage(Microphone.key) private var microphone = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
     @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
     @AppStorage(InstantResume.key) private var instantResume = false
@@ -22,7 +31,7 @@ struct SettingsView: View {
     /// The second footer paragraph: how you click, given the selected input mode.
     private var inputDescription: String {
         if inputMode == .touchscreen {
-            return "Tap to click once. Tap then hold to begin dragging. Quickly tap with two fingers to right-click."
+            return "Tap to click. Hold until the phone ticks, then move to drag (windows, selections). Hold and lift without moving to right-click. Tap, then tap and hold, also drags."
         }
         switch volumeMode {
         case .delayHold:
@@ -83,6 +92,18 @@ struct SettingsView: View {
                     .listRowBackground(Desk.card)
                 }
                 if !Device.isPad {
+                    Section("Mouse") {
+                        Toggle("One pointer that follows the mouse", isOn: $followAssistiveTouch)
+                        Toggle("Madeira's way (follow iOS's pointer)", isOn: $madeiraMouse)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Mouse speed")
+                            Slider(value: $mouseSpeed, in: 0.5...3)
+                        }
+                        Toggle("Reverse scrolling", isOn: $reverseScrolling)
+                        Text("A mouse works through AssistiveTouch. With one pointer on, Henge draws the Mac's pointer right where the mouse is, as Madeira does, so it never trails behind. Changes apply the next time Henge starts.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .listRowBackground(Desk.card)
                     Section("Trackpad") {
                         Picker("Input mode", selection: $inputMode) {
                             Text("Touchscreen").tag(VolumeClicks.InputMode.touchscreen)
@@ -103,6 +124,19 @@ struct SettingsView: View {
                     }
                     .listRowBackground(Desk.card)
                 }
+                Section("Sound") {
+                    Toggle("Microphone", isOn: $microphone)
+                        .onChange(of: microphone) { on in
+                            if on {
+                                Microphone.requestPermission { _ in Microphone.configureSession() }
+                            } else {
+                                Microphone.configureSession()
+                            }
+                        }
+                    Text("The Mac gets this device's microphone as a sound input. It is recorded only while an app on the Mac is listening. Without headphones the Mac can hear its own sound. Applies the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
                 Section("Performance") {
                     Picker("Mac refresh rate", selection: $refreshRate) {
                         Text("30 Hz").tag(30)
@@ -113,6 +147,10 @@ struct SettingsView: View {
                     Toggle("Faster disk writes", isOn: $fastFlush)
                     Toggle("Quicker wake from idle", isOn: $wfiSpin)
                     Toggle("Superblocks (experimental)", isOn: $superblocks)
+                    Toggle("CPUs sleep while waiting for each other", isOn: $syncWait)
+                    Toggle("Display refresh events (experimental)", isOn: $vblank)
+                    Toggle("Direct app memory (prototype, may crash)", isOn: $el0window)
+                    Toggle("Engine profile in the log (diagnosis)", isOn: $profile)
                     Picker("Code cache", selection: $codeCacheMB) {
                         Text("512 MB").tag(512)
                         Text("1 GB").tag(1024)
@@ -121,6 +159,15 @@ struct SettingsView: View {
                     Text("A bigger code cache empties less often and takes more memory (about 1.75 times its size); Henge picks one by its memory limit: 1.5 GB where there is plenty, 512 MB where there is little. Applies the next time Henge opens. If JIT stops turning on, or a Mac closes Henge during setup, choose a smaller one.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Text("macOS draws a frame for every refresh: 30 Hz leaves the most of the emulated CPU to apps, at the cost of choppier animation; 60 Hz is smoother. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section("Linux") {
+                    Toggle("3D graphics on the GPU", isOn: $linux3D)
+                    Text("A Linux machine's OpenGL runs on the phone's GPU (virgl, drawn with Metal through ANGLE) when this build of Henge carries the GPU libraries. Off, Linux draws with the CPU. Applies the next time a Linux machine starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Toggle("Don't wait for the GPU (experimental)", isOn: $linuxGPUAsync)
+                    Text("Linux's 3D drawing is queued for the GPU while Linux keeps running, instead of Linux stopping until each piece is drawn. Faster, but it may leave some things undrawn (icons). Applies the next time a Linux machine starts.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)

@@ -16,6 +16,18 @@ enum Sharing {
     /// Before a Mac starts.
     static func prepare() {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        // The app's log in the folder too, so the Mac (and whoever reads its share) sees it as it is written: a hard
+        // link to the same file in Documents, nothing copied. henge-prev.log, the run before (a crash's log), likewise.
+        // Linked again at every start, since each launch begins a new henge.log (HengeLog.start).
+        let logs = HengeLog.logFileURL.deletingLastPathComponent()
+        for name in ["henge.log", "henge-prev.log"] {
+            let source = logs.appendingPathComponent(name), link = folder.appendingPathComponent(name)
+            try? FileManager.default.removeItem(at: link)
+            if FileManager.default.fileExists(atPath: source.path) {
+                do { try FileManager.default.linkItem(at: source, to: link) }
+                catch { HengeLog.log("share", "\(name) not linked into the shared folder: \(error.localizedDescription)") }
+            }
+        }
         // A Unix socket's path can't be long, so the short temporary folder.
         let socket = (NSTemporaryDirectory() as NSString).appendingPathComponent("s.sock")
         henge_vm_share(folder.path, socket, Bundle.main.path(forResource: "henge-agent", ofType: "gz"))

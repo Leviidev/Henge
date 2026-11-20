@@ -20,6 +20,12 @@ xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk ip
     -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > "$DD.buildlog" 2>&1 || {
     # Never package what an older build left behind.
     grep -E "error:|BUILD" "$DD.buildlog" | sort -u
+    echo "==> context of the first errors:" >&2
+    grep -n -m 3 -B 40 -A 12 -E "error:" "$DD.buildlog" | cut -c1-400 >&2 || true
+    echo "==> other failure lines:" >&2
+    grep -n -E " error |Error [0-9]+|\*\*\* \[|Undefined symbols|symbol\(s\) not found|Command [A-Za-z]+ failed|cannot find|No such file" "$DD.buildlog" | grep -v "^[0-9]*:export " | head -40 | cut -c1-400 >&2 || true
+    echo "==> end of the build log:" >&2
+    grep -v "^export \|^    export " "$DD.buildlog" | tail -60 | cut -c1-400 >&2 || true
     echo "==> the build failed; nothing packaged" >&2
     exit 1
 }

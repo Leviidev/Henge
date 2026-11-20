@@ -45,7 +45,7 @@ enum InstantResume {
     /// Henge stopped being active (the app switcher, a call, Control Center, going home): stop the Mac where it is
     /// while the GPU is still Henge's, so what only the GPU holds goes back into the Mac's memory.
     static func pause() {
-        guard enabled, henge_vm_state() == 1 else { return }
+        guard enabled, henge_vm_state() == 1, henge_vm_is_linux() == 0 else { return } /* a Linux machine runs on */
         queue.async {
             var buffer = [CChar](repeating: 0, count: 256)
             if henge_vm_pause(&buffer, buffer.count) != 0 { HengeLog.log("resume", "not paused: \(String(cString: buffer))") }
@@ -54,7 +54,7 @@ enum InstantResume {
 
     /// Henge is in the background: write the paused Mac out, in case iOS closes Henge. It stays paused.
     static func suspend(_ mac: VirtualMac, ramMB: UInt64, cpus: Int) {
-        guard enabled, henge_vm_state() == 1 || henge_vm_state() == 4 else { return }
+        guard enabled, henge_vm_state() == 1 || henge_vm_state() == 4, henge_vm_is_linux() == 0 else { return }
         let path = file(for: mac).path, id = ident(for: mac, ramMB: ramMB, cpus: cpus)
         var task = UIBackgroundTaskIdentifier.invalid
         task = UIApplication.shared.beginBackgroundTask(withName: "Henge save") {

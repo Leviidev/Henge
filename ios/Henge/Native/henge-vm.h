@@ -9,6 +9,13 @@
    (henge_ios_jit_prewarm), and starts it. 0, or -1 with a reason in err. */
 int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                   int cpus, char *err, size_t errlen);
+/* Boots the Linux machine (docs/linux-machine.md): an uncompressed arm64 kernel Image, an initrd (NULL or "" for
+   none), the kernel command line (NULL: root file system on disk, /dev/vda), the root disk image, and the screen
+   (a framebuffer; 0 x 0 for 1280 x 800), which henge_vm_boot_display hands out. 0, or -1 with a reason in err. */
+int henge_vm_boot_linux(const char *kernel, const char *initrd, const char *cmdline, const char *disk, uint64_t ram_mb,
+                        int cpus, uint32_t fb_width, uint32_t fb_height, char *err, size_t errlen);
+/* The running machine is the Linux one: it cannot be saved (instant resume) yet. */
+int henge_vm_is_linux(void);
 /* Installs macOS from an IPSW onto a new machine (blank disk and auxiliary
    storage): boots the ROM in DFU mode and runs the restore over its USB port,
    as Virtualization.framework's installer does. workdir is scratch space.
@@ -97,6 +104,12 @@ void henge_vm_mouse_scroll(int dx, int dy);
 void henge_vm_touch(int finger, int phase, int x, int y, uint32_t ts_ms);
 void henge_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void henge_vm_touch_button(int down); /* the pad's full press (a click) */
+/* Put the Mac's pointer at x, y, each 0..1 across its screen: for an iPad pointer iPadOS won't lock. */
+void henge_vm_pointer_at(double x, double y);
+/* Draw the Mac's pointer at x, y (0..1 across its screen) at once, instead of where the Mac has it; negative: the Mac's place. */
+void henge_vm_cursor_at(double x, double y);
+/* 1: the Mac's pointer is not drawn (an iPhone mouse through AssistiveTouch, whose own pointer shows instead). */
+void henge_vm_hide_cursor(int hidden);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
@@ -109,6 +122,8 @@ int henge_vm_snapshot(uint8_t *bgra, int width, int height);
 void henge_vm_set_display_layer(void *layer);
 /// How many frames have gone to it.
 uint64_t henge_vm_gpu_frames(void);
+/* A Linux machine's display, so far: out[0] screen updates, out[1] 3D command buffers, out[2] their bytes. */
+void henge_vm_linux_stats(uint64_t *out);
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
 void henge_vm_free_display(const uint8_t *pixels);
 

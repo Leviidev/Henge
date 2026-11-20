@@ -17,7 +17,7 @@ settings:
     ENABLE_BITCODE: NO
     SWIFT_VERSION: "5.0"
     SWIFT_OPTIMIZATION_LEVEL: "-O"
-    GCC_OPTIMIZATION_LEVEL: "2"
+    GCC_OPTIMIZATION_LEVEL: "3"
     CLANG_C_LANGUAGE_STANDARD: c11
 
 targets:
@@ -121,6 +121,22 @@ targets:
           cp "$SRCROOT/../build/henge-agent.gz" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/henge-agent.gz"
           rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
           cp -X "$SRCROOT/../build/tl-samples.dmg" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/tl-samples.dmg"
+        basedOnDependencyAnalysis: false
+      - name: Embed the GPU libraries
+        # The Linux machine's 3D: virglrenderer, libepoxy and ANGLE (scripts/build-gpu-deps.sh), when built.
+        # The engine loads them when a Linux machine starts (devices/vgpu_virgl.c); without them it is 2D.
+        script: |
+          set -e
+          [ -d "$SRCROOT/deps-gpu/Frameworks" ] || exit 0
+          for SRC in "$SRCROOT"/deps-gpu/Frameworks/*.framework; do
+            DST="$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/$(basename "$SRC")"
+            rm -rf "$DST"
+            mkdir -p "$(dirname "$DST")"
+            ditto "$SRC" "$DST"
+            if [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ] && [ "$CODE_SIGNING_ALLOWED" != "NO" ]; then
+              codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --timestamp=none "$DST"
+            fi
+          done
         basedOnDependencyAnalysis: false
       - name: Embed StikJIT
         # As in Husk: the helper links StikJIT; it lives in the app's Frameworks
