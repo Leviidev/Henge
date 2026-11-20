@@ -59,6 +59,22 @@ PROGRAM loop
     b.lt 2b
 END loop
 
+// Hundreds of one-branch blocks, run three times round: under a small code cache
+// (test_jit's ring) segments are taken back while the blocks in the others still
+// have exits chained into them, the back edge included.
+PROGRAM hop
+    mov x0, #0
+    mov x5, #3
+0:
+    .rept 300
+    add x0, x0, #1
+    b 1f
+1:
+    .endr
+    subs x5, x5, #1
+    b.ne 0b
+END hop
+
 PROGRAM condbr
     mov x0, #0
     mov x1, #5
@@ -264,6 +280,31 @@ PROGRAM pac
     retab
 2:  mov x10, x30
 END pac
+
+// Direct branches to another 16 KB page (a call, a B and a B.cond, there and back):
+// they leave through the cross-page paths (put_branch_exit's checked chain, put_xjump).
+PROGRAM xpage
+    mov x9, x30
+    add x0, x1, x2
+    bl _xpage_far_fn
+    eor x3, x0, x4
+    b _xpage_far
+_xpage_back:
+    add x11, x6, x3
+    mov x30, x9
+END xpage
+
+    .p2align 14
+_xpage_far_fn:
+    add x0, x0, #7
+    mul x12, x0, x5
+    ret
+_xpage_far:
+    add x6, x6, x0
+    cmp x8, x8
+    b.eq _xpage_back
+    movz x6, #0xdead
+    b _xpage_back
 
     .p2align 14
 _jit_programs_finish:

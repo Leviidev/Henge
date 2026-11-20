@@ -271,21 +271,21 @@ _hv_helper_thunk:
     b _hv_helper_entry
 
 // hv_chain_thunk: a chainable exit's slow side. The site did `str x30, [x28, #x30]`
-// and `blr`; x30 points at {slot address, target VA}. Follows the slot when
+// and `blr`; x30 points at the slot's address (the slot holds {chained block, target VA}). Follows the slot when
 // chained beyond the stub's B (out of range), else leaves for the dispatcher,
 // naming the slot (last_stub) unless an exit was asked for.
 _hv_chain_thunk:
     mov x7, x30
     ldr x30, [x28, #240]
+    ldr x6, [x7]                  // the slot (HV_SLOT): {chained block, target}
     ldr w15, [x28, #CPU_EXIT_REQ]
     cbnz w15, 1f
-    ldr x6, [x7]
     ldr x15, [x6]
     cbz x15, 2f
     ret x15
 2:  str x6, [x28, #CPU_LAST_STUB]
 1:  stp x0, x1, [x28]
-    ldr x0, [x7, #8]
+    ldr x0, [x6, #8]              // the target, from the slot
     str x0, [x28, #CPU_PC]
     ldr x1, [x28, #CPU_EXIT]
     br x1

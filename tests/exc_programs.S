@@ -166,6 +166,97 @@ PROGRAM p_sysregs
     mrs x23, cntv_ctl_el0      // enabled and already expired: ISTATUS set
 END p_sysregs
 
+// Inline sysreg fast/slow paths and EL0 permission gates.
+PROGRAM p_sysreg_fast
+    SETUP
+    // Preserve NZCV = 0xa0000000 across inline UAO / SCTLR / TTBR1 writes.
+    mov x0, #0xa0000000
+    msr nzcv, x0
+
+    // UAO immediate (#1 then #0) and register (x1 = 1<<23 -> read back -> 0)
+    .inst 0xd500417f             // msr uao, #1
+    mrs x1, S3_0_C4_C2_4
+    .inst 0xd500407f             // msr uao, #0
+    mrs x2, S3_0_C4_C2_4
+    mov x15, #(1 << 23)
+    msr S3_0_C4_C2_4, x15
+    mrs x3, S3_0_C4_C2_4
+    msr S3_0_C4_C2_4, xzr
+
+    // Storage & masked sysregs via stolen + regular registers
+    mov x15, #0x1234
+    msr contextidr_el1, x15
+    mrs x4, contextidr_el1
+    mov x6, #0x5678
+    msr actlr_el1, x6
+    mrs x5, actlr_el1
+    mov x7, #0x9abc
+    msr amair_el1, x7
+    mrs x6, amair_el1
+    mov x18, #0xdef0
+    msr mdscr_el1, x18
+    mrs x7, mdscr_el1
+
+    // VBAR_EL1 write masks off bits [10:0]
+    mrs x8, vbar_el1
+    orr x9, x8, #0x3ff
+    msr vbar_el1, x9
+    mrs x9, vbar_el1
+    msr vbar_el1, x8
+
+    // CNTKCTL_EL1 mirrors [1:0] into cpu->el0_cnt
+    mov x10, #3
+    msr cntkctl_el1, x10
+    mrs x10, cntkctl_el1
+
+    // Identification, OSLSR, PAuth key, PMU, impdef (no traps at EL1)
+    mrs x11, dczid_el0
+    mrs x12, S2_0_C1_C1_4      // osdsr / oslsr_el1
+    msr S3_0_C2_C1_0, x15      // APIAKeyLo_EL1 write ignored
+    mrs x13, S3_0_C2_C1_0      // reads 0
+    msr S3_3_C9_C12_0, x15     // PMCR_EL0 write ignored
+    mrs x14, S3_3_C9_C12_0     // reads 0
+    msr S3_6_C15_C0_0, x15     // impdef write ignored
+    mrs x15, S3_6_C15_C0_0     // reads 0
+
+    // TTBR1_EL1 unchanged write stays inline; SCTLR_EL1 PAC bit (31) stays inline
+    mrs x16, ttbr1_el1
+    msr ttbr1_el1, x16
+    mrs x17, sctlr_el1
+    mov x27, #(1 << 31)
+    orr x27, x17, x27
+    orr x27, x27, #(1 << 5)    // RES0 bit 5 must stay clear on read-back
+    msr sctlr_el1, x27
+    mrs x18, sctlr_el1
+    mrs x19, nzcv              // must still be 0xa0000000
+
+    // Slow paths: WXN change on SCTLR_EL1 (bit 19) and TTBR1_EL1 value change trap via OOL_MSR
+    mov x27, #(1 << 19)
+    orr x27, x18, x27
+    msr sctlr_el1, x27
+    mrs x20, sctlr_el1
+    eor x21, x16, #0x1000
+    msr ttbr1_el1, x21
+    mrs x21, ttbr1_el1
+    // Restore original TTBR1_EL1 / SCTLR_EL1 for check clarity -> kept in x20/x21
+END p_sysreg_fast
+
+PROGRAM p_sysreg_el0
+    SETUP
+    // Verify DCZID_EL0 and CNTFRQ_EL0 (with CNTKCTL=1) succeed at EL0, while APIAKeyLo_EL1 / UAO trap.
+    mov x0, #1
+    msr cntkctl_el1, x0
+    mrs x0, cntfrq_el0         // EL1 read first
+    adr x1, 1f
+    msr elr_el1, x1
+    msr spsr_el1, xzr          // EL0t
+    eret
+1:  mrs x1, dczid_el0          // always allowed at EL0
+    mrs x2, cntfrq_el0         // allowed because CNTKCTL=1
+    mrs x3, S3_0_C2_C1_0       // must UNDEF at EL0 (x20=ESR, x24=exc count, x25=vec)
+    mrs x4, S3_0_C4_C2_4       // UAO must UNDEF at EL0
+END p_sysreg_el0
+
 // The test raises the IRQ line before running; it is masked until DAIFClr.
 PROGRAM p_irq
     SETUP
@@ -242,6 +333,29 @@ PROGRAM p_smc_nomaint
 4:  mov x0, #2
 5:
 END p_smc_nomaint
+
+// TTBR0_EL1 read back after a write, CONTEXTIDR_EL1 both ways (also through the stolen x18 and XZR),
+// DCZID_EL0: the registers translated MRS / MSR reach in the HvCpu beyond one load's reach.
+PROGRAM p_farregs
+    SETUP
+    movz x1, #0x1234, lsl #16
+    movk x1, #5, lsl #48
+    msr ttbr0_el1, x1
+    mrs x2, ttbr0_el1
+    mov x3, #0x77
+    msr contextidr_el1, x3
+    mrs x4, contextidr_el1
+    mov x18, #0x99
+    msr contextidr_el1, x18
+    mov x18, #0
+    mrs x18, contextidr_el1
+    mov x5, x18
+    mrs x6, dczid_el0
+    msr contextidr_el1, xzr
+    mrs x7, contextidr_el1
+    mov x8, #0x2a
+    msr contextidr_el1, x8
+END p_farregs
 
     .p2align 14
 _exc_programs_finish:
