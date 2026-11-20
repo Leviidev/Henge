@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include "exception.h"
 
 #include <sched.h>
@@ -81,7 +82,12 @@ void hv_raise_sync(HvCpu *cpu, uint32_t ec, uint32_t iss, uint64_t far, uint64_t
 void hv_raise_undef(HvCpu *cpu, uint64_t pc) {
     static int reported;
     if (cpu->el == 0 && ((pc >> 55) & 1) && reported++ < 3) hv_debug_el0_in_kernel(cpu, "undef");
-    if (cpu->m->log) {
+    /* An app's own undefined instructions (Linux: every program reads the ID registers, which its kernel answers)
+       are logged only the first few times: each line is a write on this CPU's thread, thousands a second. */
+    static _Atomic unsigned el0_logged;
+    int quiet = cpu->el == 0 && atomic_fetch_add(&el0_logged, 1) >= 16;
+    if (quiet && atomic_load(&el0_logged) == 17) fprintf(stderr, "undefined: more at EL0 are not logged\n");
+    if (cpu->m->log && !quiet) {
         uint32_t insn = 0;
         uint64_t pa;
         if (!hv_mmu_access(cpu, pc, HV_ACC_EXEC, cpu->el, &pa)) hv_phys_read(cpu->m, pa, &insn, 4);

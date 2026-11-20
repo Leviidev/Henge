@@ -1,0 +1,54 @@
+# .github/workflows/ios-gpu-deps.yml
+#
+# Builds the Linux machine's 3D renderer for iOS (ios/scripts/build-gpu-deps.sh:
+# ANGLE, libepoxy and virglrenderer as frameworks) and keeps them in the
+# Actions cache under a key from the script, where the app's build
+# (build-henge.yml) picks them up. Also uploaded as an artifact.
+#
+# On pushes to the Linux machine's branch that change the script or this file,
+# and by hand once it is on the default branch.
+
+name: iOS GPU libraries
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "ios/scripts/build-gpu-deps.sh"
+      - ".github/workflows/ios-gpu-deps.yml"
+      - "ios/patches/**"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cached already?
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ios/deps-gpu
+          key: ios-gpu-deps-${{ hashFiles('ios/scripts/build-gpu-deps.sh', 'ios/patches/**') }}
+
+      - name: Tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: brew install meson ninja pkg-config
+
+      - name: Build ANGLE, libepoxy, virglrenderer for iOS
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ios/scripts/build-gpu-deps.sh ios/deps-gpu
+
+      - name: What there is
+        run: |
+          cat ios/deps-gpu/VERSIONS
+          du -sh ios/deps-gpu/Frameworks/*
+          for f in ios/deps-gpu/Frameworks/*.framework; do echo "$f"; otool -L "$f/$(basename "$f" .framework)" | tail -n +2; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-gpu-deps-${{ github.sha }}
+          path: ios/deps-gpu
+          retention-days: 30

@@ -1,0 +1,73 @@
+diff --git a/src/vrend/vrend_formats.c b/src/vrend/vrend_formats.c
+index 40ed4d5..1e3e200 100644
+--- a/src/vrend/vrend_formats.c
++++ b/src/vrend/vrend_formats.c
+@@ -21,6 +21,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  *
+  **************************************************************************/
++#include <stdlib.h>
+ #include <epoxy/gl.h>
+ 
+ #include "vrend_renderer.h"
+@@ -645,10 +646,24 @@ void vrend_check_texture_storage(struct vrend_format_table *table)
+    }
+ }
+ 
++/* Henge: OpenGL ES 3.0 (ANGLE on Metal) has no multisampled textures, so no format passes the test below and
++ * the guest gets one sample, which Chrome's GPU process refuses (ES 3.0 asks for 4). Unless
++ * VIRGL_NO_FAKE_MSAA is set, every format that can be rendered to is called multisample-capable instead, and
++ * vrend_resource_alloc_texture makes such resources single-sampled: drawing works, without antialiasing. */
++bool vrend_fake_msaa;
++
+ void vrend_check_texture_multisample(struct vrend_format_table *table,
+                                      bool enable_storage)
+ {
+    bool is_desktop_gl = epoxy_is_desktop_gl();
++   if (!is_desktop_gl && epoxy_gl_version() < 31 && !getenv("VIRGL_NO_FAKE_MSAA")) {
++      vrend_fake_msaa = true;
++      for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++)
++         if (table[i].internalformat != 0 &&
++             (table[i].bindings & (VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_DEPTH_STENCIL)))
++            table[i].flags |= VIRGL_TEXTURE_CAN_MULTISAMPLE;
++      return;
++   }
+    for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++) {
+       bool function_available =
+          (table[i].flags & VIRGL_TEXTURE_CAN_TEXTURE_STORAGE) ? enable_storage : is_desktop_gl;
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 7ea111b..38e6f62 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8956,12 +8956,17 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+          const char *renderer_str = (const char *)glGetString(GL_RENDERER);
+          bool is_metal_backend = (renderer_str && strstr(renderer_str, "Metal"));
+          
+-         if (is_metal_backend && !vrend_state.use_gles && !has_feature(feat_storage_multisample)) {
++         extern bool vrend_fake_msaa;
++         if (vrend_fake_msaa ||
++             (is_metal_backend && !vrend_state.use_gles && !has_feature(feat_storage_multisample))) {
+             /* Metal backend: No MSAA support, downgrade to regular texture */
+             virgl_debug("[VREND] Metal backend: MSAA texture requested (samples=%d, target=0x%x), downgrading to non-MSAA\n",
+                         pr->nr_samples, gr->target);
+             gr->target = (gr->target == GL_TEXTURE_2D_MULTISAMPLE) ? GL_TEXTURE_2D : GL_TEXTURE_2D_ARRAY;
+             pr->nr_samples = 0;
++            /* the multisample target was never valid here on ES 3.0: bind the texture to the plain one */
++            while (glGetError() != GL_NO_ERROR) {}
++            glBindTexture(gr->target, gr->gl_id);
+          } else if (format_can_texture_storage) {
+             if (gr->target == GL_TEXTURE_2D_MULTISAMPLE) {
+                glTexStorage2DMultisample(gr->target, pr->nr_samples,
+@@ -13154,7 +13159,11 @@ angle_done:
+    const char *version = (const char *)glGetString(GL_VERSION);
+    bool is_metal = (version && strstr(version, "Metal"));
+    bool is_angle = (version && strstr(version, "ANGLE"));
+-   if ((is_metal || is_angle) && caps->v1.max_samples > 1) {
++   extern bool vrend_fake_msaa;
++   if (vrend_fake_msaa) {
++      virgl_debug("[VREND CAPS] ES 3.0 host: 4 samples reported, resources made single-sampled\n");
++      caps->v1.max_samples = 4;
++   } else if ((is_metal || is_angle) && caps->v1.max_samples > 1) {
+       virgl_debug("[VREND CAPS] %s backend: Overriding max_samples %u -> 1 for fake_sw_msaa\n", 
+                   is_angle ? "ANGLE" : "Metal",
+                   caps->v1.max_samples);

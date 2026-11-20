@@ -1,13 +1,15 @@
 # Light build: one clang call per file, no parallel jobs needed.
 CC = clang
-CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices
+# ENGINE_DEFS: build-time engine settings for experiments, such as ENGINE_DEFS=-DHV_TLB_BITS=12 (core/cpu.h).
+ENGINE_DEFS ?= -DHV_TLB_BITS=13
+CFLAGS = -std=c11 -Wall -Wextra -O3 -g -Icore -Ihost -Idevices $(ENGINE_DEFS)
 B = build
 
 CORE = $(B)/classify.o $(B)/operands.o $(B)/translate.o $(B)/dispatch.o $(B)/mmu.o $(B)/memop.o \
-       $(B)/exception.o $(B)/sysreg.o $(B)/machine.o
+       $(B)/exception.o $(B)/sysreg.o $(B)/machine.o $(B)/window.o
 HOST = $(B)/jit_region.o $(B)/enter.o $(B)/disk.o
 DEV = $(B)/pvg_lite.o $(B)/pvg_metal.o $(B)/gicv3.o $(B)/timer.o $(B)/pl011.o $(B)/pl031.o $(B)/cfg.o $(B)/bdif.o $(B)/pcie.o \
-      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o
+      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_net.o $(B)/virtio_input.o $(B)/virtio_snd.o $(B)/virtio_usb.o $(B)/virtio_balloon.o $(B)/xhci.o $(B)/vmapple.o $(B)/aes.o $(B)/pl061.o $(B)/metallib.o $(B)/fdt.o $(B)/linuxvirt.o $(B)/virtio_gpu.o $(B)/vgpu_virgl.o $(B)/vgpu_metal.o
 ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
@@ -26,8 +28,10 @@ $(B)/hengevm-ref: host/hvf_ref.c host/hvf_ref.entitlements $(ENGINE) $(DEV)
 # marked obsolete in macOS 27 without a documented replacement.
 $(B)/pvg_metal.o: devices/pvg_metal.m devices/*.h core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations -c $< -o $@
+$(B)/vgpu_metal.o: devices/vgpu_metal.m devices/*.h core/*.h host/*.h | $(B)
+	$(CC) $(CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations -c $< -o $@
 $(B)/pvg_mac.o: devices/pvg_mac.m devices/*.h core/*.h host/*.h | $(B)
-	$(CC) -fobjc-arc -O2 -g -Wall -mmacosx-version-min=15.2 -Icore -Ihost -Idevices -c $< -o $@
+	$(CC) -fobjc-arc -O3 -g -Wall -mmacosx-version-min=15.2 -Icore -Ihost -Idevices -c $< -o $@
 
 # User-mode NAT for the NIC: Homebrew's libslirp (brew install libslirp).
 SLIRP_CFLAGS = $(shell pkg-config --cflags slirp)
@@ -39,7 +43,7 @@ $(B)/dns_proxy.o: host/dns_proxy.c host/dns_proxy.h core/machine.h | $(B)
 
 RB = $(B)/restore
 RESTORE_PKGS = libplist-2.0 libusbmuxd-2.0 libimobiledevice-1.0 libimobiledevice-glue-1.0 libtatsu-1.0 libzip libcurl
-RESTORE_CFLAGS = -O2 -w -DHAVE_CONFIG_H -Ithird_party/restore_config -Ithird_party -Ithird_party/libusb-1.0 \
+RESTORE_CFLAGS = -O3 -w -DHAVE_CONFIG_H -Ithird_party/restore_config -Ithird_party -Ithird_party/libusb-1.0 \
                  -Ithird_party/libirecovery/include $(shell pkg-config --cflags $(RESTORE_PKGS) 2>/dev/null)
 RESTORE_LIBS = $(shell pkg-config --libs $(RESTORE_PKGS) 2>/dev/null) -lz
 IRECV_SRC = third_party/libirecovery/src/libirecovery.c
@@ -50,7 +54,7 @@ RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(ID
 # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
 $(B)/henge-agent: tools/henge-agent.m
 	@mkdir -p $(B)
-	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit $< -o $@
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O3 -framework AppKit $< -o $@
 	codesign -f -s - $@
 
 # Compressed in the app: tools that sign an IPA would try to sign a bare Mach-O too.
@@ -65,8 +69,10 @@ $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/
 	    -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework CoreFoundation \
 	    -framework AppKit -framework QuartzCore -o $@
 
-# mmu.c: no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
+# mmu.c and window.c (which its TLB drops call): no SIMD (hv_tlb_refill runs with the guest's SIMD registers live).
 $(B)/mmu.o: core/mmu.c core/*.h host/*.h | $(B)
+	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
+$(B)/window.o: core/window.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -mgeneral-regs-only -c $< -o $@
 $(B)/%.o: core/%.c core/*.h host/*.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -85,6 +91,10 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
+
+# Translated-code density on real arm64 binaries (nothing runs): build/density <mach-o>...
+$(B)/density: tests/density.c $(ENGINE)
+	$(CC) $(CFLAGS) tests/density.c $(ENGINE) -o $@
 
 $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 	$(CC) $(CFLAGS) $^ -o $@
@@ -133,19 +143,30 @@ IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
 # ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
-IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
+IOS_CFLAGS = -std=c11 -Wall -Wextra -O3 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp $(ENGINE_DEFS)
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/dt_fixup.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+# The Linux machine's 3D (devices/vgpu_virgl.c) when the GPU libraries were built (ios/scripts/build-gpu-deps.sh):
+# virglrenderer on ANGLE, loaded at run time from the app's frameworks.
+ifneq ($(wildcard ios/deps-gpu/include/virgl/virglrenderer.h),)
+IOS_CFLAGS += -DHV_VIRGL -DHV_VIRGL_ANGLE -DHV_VIRGL_DLOPEN -Iios/deps-gpu/include/virgl -Iios/deps-gpu/include
+endif
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/fault_bench.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/dt_fixup.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
-IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
+IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o $(IB)/devices/vgpu_metal.o
 
 $(IB)/core/mmu.o: core/mmu.c core/*.h host/*.h devices/*.h
+	@mkdir -p $(dir $@)
+	$(IOS_CC) $(IOS_CFLAGS) -mgeneral-regs-only -c $< -o $@
+$(IB)/core/window.o: core/window.c core/*.h host/*.h devices/*.h
 	@mkdir -p $(dir $@)
 	$(IOS_CC) $(IOS_CFLAGS) -mgeneral-regs-only -c $< -o $@
 $(IB)/%.o: %.c core/*.h host/*.h devices/*.h
 	@mkdir -p $(dir $@)
 	$(IOS_CC) $(IOS_CFLAGS) -c $< -o $@
 $(IB)/devices/pvg_metal.o: devices/pvg_metal.m devices/*.h core/*.h host/*.h
+	@mkdir -p $(dir $@)
+	$(IOS_CC) $(IOS_CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations -c $< -o $@
+$(IB)/devices/vgpu_metal.o: devices/vgpu_metal.m devices/*.h core/*.h host/*.h
 	@mkdir -p $(dir $@)
 	$(IOS_CC) $(IOS_CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations -c $< -o $@
 $(IB)/host/enter.o: host/enter.S
@@ -162,7 +183,7 @@ TL_SHIM = $(wildcard tl/shim/appkit/*.m)
 TL_SHIM_IOS_OBJ = $(patsubst %,$(IB)/%.o,$(TL_SHIM))
 $(IB)/tl/%.o: tl/% tl/loader/*.h tl/dmg/*.h tl/shim/appkit/*.h
 	@mkdir -p $(dir $@)
-	$(IOS_CC) -O2 -g -Wall -Wno-unused-parameter -fblocks $(if $(filter %.m,$<),-fobjc-arc) -c $< -o $@
+	$(IOS_CC) -O3 -g -Wall -Wno-unused-parameter -fblocks $(if $(filter %.m,$<),-fobjc-arc) -c $< -o $@
 $(IB)/tl/shim/hk_symbols.c: $(TL_SHIM_IOS_OBJ) tl/shim/tools/hk_symbols.sh
 	@mkdir -p $(dir $@)
 	tl/shim/tools/hk_symbols.sh $@ $(TL_SHIM_IOS_OBJ)
@@ -173,6 +194,12 @@ $(IB)/libhengetl.a: $(TL_IOS_OBJ) $(TL_SHIM_IOS_OBJ) $(IB)/tl/shim/hk_symbols.o
 	xcrun --sdk iphoneos libtool -static -o $@ $(TL_IOS_OBJ) $(TL_SHIM_IOS_OBJ) $(IB)/tl/shim/hk_symbols.o
 ios-lib: $(IB)/libhengevm.a $(IB)/libhengetl.a
 .PHONY: ios-lib
+
+# ENGINE_DEFS can change the HvCpu layout, so every engine object is rebuilt when it changes: mixing objects
+# built under two settings links without complaint and breaks at run time.
+DEFS_STAMP = $(B)/engine-defs.stamp
+$(shell mkdir -p $(B); [ -f $(DEFS_STAMP) ] && [ "$$(cat $(DEFS_STAMP))" = "$(ENGINE_DEFS)" ] || printf '%s' "$(ENGINE_DEFS)" > $(DEFS_STAMP))
+$(ENGINE) $(DEV) $(IOS_OBJ): $(DEFS_STAMP)
 
 # The app's glue to it (ios/Henge/Native/henge-tl.c) on the Mac: import a disk image, describe what it holds, run a program.
 $(B)/test_tl_glue: tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c | $(B)
@@ -189,20 +216,20 @@ $(B)/test_tl_app: tests/test_tl_app.m ios/Henge/Native/henge-tl-app.m ios/Henge/
 	  -lz -lbz2 -lcompression -o $@
 # Sample Mac programs for the app's Mac apps screen, as a disk image (read by the same import path as anyone's).
 $(B)/tl-samples.dmg: tests/tl/exit3.c tl/tests/hello.c tl/tests/fnd.m tl/tests/swifty.swift tl/tests/cxx.cpp tl/tests/fw.m tl/tests/fwapp.m | $(B)
-	make -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET make -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
 	rm -rf $(B)/tl-samples $@ && mkdir -p $(B)/tl-samples
 	cp tl/build/hello "$(B)/tl-samples/Hello (C)"
 	cp tl/build/fnd "$(B)/tl-samples/Foundation sample"
 	cp tl/build/swifty "$(B)/tl-samples/Swift sample"
 	cp tl/build/cxx "$(B)/tl-samples/C++ sample"
 	ditto tl/build/FW.app "$(B)/tl-samples/Framework sample.app"
-	hdiutil create -quiet -srcfolder $(B)/tl-samples -volname "Henge Samples" -fs HFS+ -format UDZO $@
+	for i in 1 2 3 4 5; do rm -f $@; hdiutil create -quiet -srcfolder $(B)/tl-samples -volname "Henge Samples" -fs HFS+ -format UDZO $@ && break; echo "hdiutil failed (try $$i), again"; sleep 5; done; test -f $@
 	xattr -c $@ # codesign refuses an app holding a file with Finder information
 
 $(B)/tl-exit3: tests/tl/exit3.c | $(B)
 	$(CC) -target arm64-apple-macos13 -O1 $< -o $@
 test-tl-glue: $(B)/test_tl_glue $(B)/tl-exit3
-	make -C tl all test-dmg >/dev/null
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET make -C tl all test-dmg >/dev/null
 	$(B)/test_tl_glue
 	$(B)/test_tl_glue exit3
 .PHONY: test-tl-glue
@@ -267,6 +294,47 @@ $(B)/test_jit_advice: ios/Henge/JIT/JITNetworkAdvice.swift tests/test_jit_advice
 test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
+
+# Click language: the shipped GestureEngine.swift compiled unchanged,
+# exercised headlessly over the click arbitration streams.
+$(B)/test_gesture_engine: ios/Henge/GestureEngine.swift tests/test_gesture_engine.swift | $(B)
+	xcrun --sdk macosx swiftc $^ -o $@
+
+test-gesture-engine: $(B)/test_gesture_engine
+	$(B)/test_gesture_engine
+.PHONY: test-gesture-engine
+
+# Linux machine (devices/linuxvirt.c) test tool, built for an arm64 Linux host:
+# natively there, or on an x86 host with a cross compiler, run under qemu-aarch64:
+#   make linux-test   (LXCC=aarch64-linux-gnu-gcc by default)
+#   qemu-aarch64 -cpu max build/linux/hengelinux --kernel Image --initrd initrd.gz
+# host/linux/ stands in for the few Mach and Apple headers the engine includes.
+# LX_VIRGL=1 adds 3D for virtio-gpu through the host's virglrenderer (linked dynamically then: EGL, Mesa).
+LXCC ?= aarch64-linux-gnu-gcc
+LXB = $(B)/linux
+LXFLAGS = -std=gnu11 -O2 -g -Wall -Wno-unused-parameter -Ihost/linux -include host/linux/compat.h -Icore -Ihost -Idevices
+LX_SRC = $(filter-out core/window.c,$(wildcard core/*.c)) host/linux/window_stub.c host/jit_region.c host/disk.c host/linux/ulock.c devices/gicv3.c devices/timer.c \
+         devices/pl011.c devices/pl031.c devices/pcie.c devices/virtio.c devices/virtio_blk.c devices/virtio_net.c \
+         devices/virtio_input.c devices/virtio_snd.c devices/xhci.c devices/fdt.c devices/linuxvirt.c devices/virtio_gpu.c devices/vgpu_virgl.c tools/hengelinux.c
+LX_OBJ = $(patsubst %.c,$(LXB)/%.o,$(LX_SRC)) $(LXB)/enter.o
+ifeq ($(LX_VIRGL),1)
+LXFLAGS += -DHV_VIRGL $(shell pkg-config --cflags virglrenderer egl)
+LX_LINK = $(shell pkg-config --libs virglrenderer egl)
+else
+LX_LINK = -static
+endif
+$(LXB)/%.o: %.c core/*.h host/*.h devices/*.h host/linux/*.h host/linux/*/*.h
+	@mkdir -p $(dir $@)
+	$(LXCC) $(LXFLAGS) -c $< -o $@
+# enter.S names its symbols the Mach-O way (_hv_enter); ELF has no leading underscore.
+$(LXB)/enter.o: host/enter.S
+	@mkdir -p $(LXB)
+	sed 's/\b_hv_/hv_/g' $< > $(LXB)/enter.S
+	$(LXCC) -c $(LXB)/enter.S -o $@
+$(LXB)/hengelinux: $(LX_OBJ)
+	$(LXCC) $(filter -static,$(LX_LINK)) -o $@ $(LX_OBJ) -lpthread -latomic $(filter-out -static,$(LX_LINK))
+linux-test: $(LXB)/hengelinux
+.PHONY: linux-test
 
 # The host identity table and the icon-snapping for the guest's About This Mac.
 $(B)/test_device_identity: ios/Henge/DeviceIdentity.swift tests/test_device_identity.swift | $(B)

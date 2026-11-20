@@ -93,6 +93,30 @@ jobs:
         working-directory: Henge
         run: zsh tools/build_ios_restore.sh
 
+      # The Linux machine's 3D: the GPU libraries the iOS GPU libraries workflow built (same key, same path),
+      # when it has run for this version of its script. Without them the Linux machine's GPU is 2D.
+      - name: GPU libraries (from the iOS GPU libraries workflow)
+        id: gpu-deps
+        uses: actions/cache/restore@v4
+        with:
+          path: ios/deps-gpu
+          key: ios-gpu-deps-${{ hashFiles('Henge/ios/scripts/build-gpu-deps.sh', 'Henge/ios/patches/**') }}
+
+      - name: Use the GPU libraries
+        if: steps.gpu-deps.outputs.cache-hit == 'true'
+        run: |
+          rm -rf Henge/ios/deps-gpu
+          mv ios/deps-gpu Henge/ios/deps-gpu
+          cat Henge/ios/deps-gpu/VERSIONS
+          ls Henge/ios/deps-gpu/Frameworks
+
+      - name: Compile the Linux screen's Metal shaders (they are otherwise only compiled on the phone)
+        working-directory: Henge
+        run: |
+          python3 -c 'import re,sys; s=open("devices/vgpu_metal.m").read(); b=s[s.index("shaders ="):s.index("\";\n", s.index("shaders ="))+1]; src="".join(re.findall(r"\"((?:[^\"\\]|\\.)*)\"", b)); open("/tmp/vgpu.metal","w").write(src.encode().decode("unicode_escape"))'
+          cat /tmp/vgpu.metal
+          xcrun -sdk iphoneos metal -c /tmp/vgpu.metal -o /tmp/vgpu.air
+
       - name: Build the engine
         working-directory: Henge
         run: make ios-lib

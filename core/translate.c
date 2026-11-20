@@ -1,12 +1,15 @@
 #include "translate.h"
 
+#include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 
 #include "classify.h"
 #include "memop.h"
 #include "mmu.h"
+#include "window.h"
 #include "operands.h"
+#include "sysreg.h"
 
 /* A block has two parts. The hot part is the code that runs every time: the translated
    instructions. The cold part is what hardly ever does: exits not chained yet, memory slow
@@ -33,7 +36,7 @@ typedef struct {
     uint8_t cold; /* the instruction is in the cold part */
 } LitFix;
 
-enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS, OOL_GROUP };
+enum { OOL_EXIT, OOL_SLOW, OOL_SYS, OOL_MRS, OOL_MSR, OOL_GROUP };
 
 typedef struct {
     uint32_t at;        /* the branch that jumps here */
@@ -89,6 +92,7 @@ typedef struct {
     struct { uint32_t slot, at, flags, stub, cond_at; uint64_t target; uint8_t cold, stub_cold, has_cond; } site[MAX_OOL]; /* chainable exits: their slot, the B chaining patches, its stub, where to; the hot part's conditional branch to it if chaining may patch that too */
     int site_direct;    /* the exit just written needs nothing done before its B: no check, no restores */
     uint32_t nsite;
+    uint32_t place_seg;
     uint32_t pool_at;    /* where the literal pool is, in the cold part */
     uint32_t flags;
     int slow_mem;
@@ -320,11 +324,25 @@ static void put_xjump(Emit *e, uint64_t target, int check) {
         put_ijc_jump(e, 1);
         return;
     }
+    uint32_t data = (e->flags & 0x7fffffffu) | (check ? 1u << 31 : 0);
+    if (e->npool + 2 <= MAX_LITS && e->nfix < MAX_LITS) {
+        /* The site's 16 bytes go in the literal pool, with the cold code: the thunk only reads them
+           (flags at [x7], the target at [x7, #8]), so the hot part keeps just the three instructions. */
+        uint32_t info = e->npool;
+        e->pool[info] = data;
+        e->pool[info + 1] = target;
+        e->npool += 2;
+        e->fix[e->nfix++] = (LitFix){e->n, FIX_ADR, info, (uint8_t)(e->in_cold && !e->flat)};
+        put(e, 0x10000007u);             /* adr x7, data */
+        put(e, LDR_X(15, 28, HV_CPU_XJUMP_THUNK));
+        put(e, BR_X(15));
+        return;
+    }
     if (!(e->n & 1)) put(e, 0xd503201f); /* nop: the data after the br starts 8-byte aligned */
     put(e, 0x10000007u | 3u << 5);       /* adr x7, data */
     put(e, LDR_X(15, 28, HV_CPU_XJUMP_THUNK));
     put(e, BR_X(15));
-    put(e, (e->flags & 0x7fffffffu) | (check ? 1u << 31 : 0));
+    put(e, data);
     put(e, 0);
     put(e, (uint32_t)target);
     put(e, (uint32_t)(target >> 32));
@@ -397,9 +415,18 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     uint32_t slot_index = ~0u;
     int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
     uint64_t xa = same_page ? 0 : cross_addend(e, target);
-    if (same_page || xa) {
-        slot_index = __atomic_fetch_add(&e->m->nslots, 1, __ATOMIC_RELAXED); /* translations run in parallel */
-        if (slot_index >= e->m->max_slots) slot_index = ~0u; /* out of slots until the next flush: no chaining */
+    /* Only an exit the block keeps a site for (nsite) gets a slot: placing records where its code is, which is how
+       an eviction knows the slot is free again once that code is gone. */
+    if ((same_page || xa) && e->nsite < MAX_OOL) {
+        /* Translations run in parallel. The counters are looked at before they are bumped, so that a long run with
+           no eviction or flush cannot take them round past 2^32 and hand out a slot in use. */
+        HvMachine *m = e->m;
+        uint32_t k = __atomic_load_n(&m->slot_take, __ATOMIC_RELAXED) < m->nslot_free ? __atomic_fetch_add(&m->slot_take, 1, __ATOMIC_RELAXED) : ~0u;
+        if (k < m->nslot_free) slot_index = m->slot_free[k]; /* freed by the last eviction */
+        else if (__atomic_load_n(&m->nslots, __ATOMIC_RELAXED) < m->max_slots) {
+            slot_index = __atomic_fetch_add(&m->nslots, 1, __ATOMIC_RELAXED);
+            if (slot_index >= m->max_slots) slot_index = ~0u;
+        } /* else out of slots until an eviction or flush: no chaining */
     }
     if (slot_index == ~0u) {
         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
@@ -410,12 +437,19 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
         }
         return;
     }
-    uint64_t *slot = &e->m->slots[slot_index];
+    uint64_t *slot = HV_SLOT(e->m, slot_index);
     *slot = 0;
-    e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
-    e->m->slot_cond[slot_index] = NULL;
+    slot[1] = target; /* hv_chain_thunk reads it there, so the stub holds only the slot's address */
+    e->m->slot_site[slot_index] = 0; /* until placed: what it held is a dropped block's */
+    e->m->slot_stub[slot_index] = 0;
+    e->m->slot_cond[slot_index] = 0;
     e->m->slot_xa[slot_index] = xa;
     e->m->slot_xpa[slot_index] = 0;
+    e->m->slot_xnext[slot_index] = 0;
+    e->m->slot_xprev[slot_index] = 0;
+    e->m->slot_tseg[slot_index] = 0;
+    e->m->slot_tprev[slot_index] = 0;
+    e->m->slot_tnext[slot_index] = 0;
     uint32_t to_exit = ~0u;
     if (check) {
         put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
@@ -455,12 +489,11 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     if (check) link_here(e, to_exit, p0);
     put(e, STR_X(30, 28, HV_CPU_X(30)));
     put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
-    if ((e->n & 1) == 0) put(e, 0xd503201f);                         /* nop: the data starts 8-byte aligned */
     put(e, BLR_X(15));
+    /* The slot's address after the BLR, where hv_chain_thunk finds it (an unaligned 8-byte load is fine there); the
+       target is in the slot. Was the slot and the target, 8-byte aligned: 5 words a stub instead of 7 to 8. */
     put(e, (uint32_t)(uintptr_t)slot);
     put(e, (uint32_t)((uintptr_t)slot >> 32));
-    put(e, (uint32_t)target);
-    put(e, (uint32_t)(target >> 32));
     if (xa) {
         link_here(e, to_miss, p0);
         if (use_xjump()) put_xjump(e, target, 0); /* exit_req was checked above if it had to be */
@@ -482,7 +515,7 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op);
    from where the helper would resume (bits 31..19, in words). */
 static void put_helper_refill(Emit *e, uint64_t pc, uint32_t insn, uint32_t rflags, uint32_t retry) {
     put_helper(e, pc, insn, HV_OP_MEM);
-    uint32_t resume = e->n - 1; /* the ldr x0, [x28] the helper comes back to */
+    uint32_t resume = e->n; /* where BLR returns (thunk already reloads x0) */
     uint32_t back = resume - retry;
     if (back < (1u << 13) && rflags < (1u << 11)) e->pool[e->npool - 1] = (uint64_t)insn | (uint64_t)(HV_OP_MEM | rflags << 8 | back << 19) << 32;
 }
@@ -499,7 +532,6 @@ static void put_helper(Emit *e, uint64_t pc, uint32_t insn, uint32_t op) {
     e->fix[e->nfix++] = (LitFix){e->n, FIX_ADR, info, (uint8_t)(e->in_cold && !e->flat)};
     put(e, 0x10000006u); /* adr x6, info */
     put(e, BLR_X(15));
-    put(e, LDR_X(0, 28, 0));
 }
 
 /* d = n + imm for |imm| < 2^24; n and d are general registers, never SP. */
@@ -1067,6 +1099,27 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
        makes an access that runs into the next page miss. Uses no flags. */
     int el_idx = g_el;
     uint32_t slow = ~0u;
+    /* HV_EL0_WINDOW (window.c): user memory is mapped at win_base + VA, so the access runs on that address
+       when the VA is below 2^bits. A page not mapped there faults; the handler maps it if the TLB entry
+       allows the access, or else sends the context to Lfull, the usual TLB path, through the ADR XZR
+       marker that follows the access (it reads the marker's target). */
+    int win_bits = hv_window_enabled();
+    int win = win_bits && !role && g_el == 0 && (op.kind == HV_MEM_SINGLE || op.kind == HV_MEM_PAIR) && !vec_kind && !rmw &&
+              !op.align && !e->slow_mem;
+    /* A pair's host address goes in its own register: Lfull needs the guest one again. When that is A, T
+       (free after the addend) holds it instead, unless T stands in for Rt. */
+    int host = A;
+    if (win && op.kind == HV_MEM_PAIR && addr == A) {
+        if (!op.vec && is_stolen(op.rt)) win = 0;
+        else host = T;
+    }
+    uint32_t win_full = 0, win_skip = 0;
+    if (win) {
+        put(e, UBFM_X(U, addr, (uint32_t)win_bits, 63)); /* lsr U, addr, #bits */
+        win_skip = e->n;
+        put(e, CBZ_X(U)); /* to the window access, over Lfull */
+        win_full = e->n;
+    }
     if (!role) {
     uint32_t tlb = put_tlb_slot(e, T, addr, el_idx);
     put(e, LDR_X(U, T, tlb + (op.store ? 8 : 0)));
@@ -1096,9 +1149,17 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     slow = e->nool - 1;
     put(e, LDR_X(U, T, tlb + 24));
     }
+    uint32_t win_join = 0;
+    if (win) {
+        win_join = e->n;
+        put(e, B_OP); /* Lfull's way to the access */
+        link_here(e, win_skip, e->in_cold);
+        put(e, LDR_X(U, 28, HV_CPU_WIN_BASE));
+        plink(e, win_join, e->in_cold, e->n, e->in_cold);
+    }
     /* Single loads and stores take [addr, addend] directly; the rest want the host address in A. */
     int reg_offset = op.kind == HV_MEM_SINGLE || op.kind == HV_MEM_LITERAL || op.kind == HV_MEM_LDRA;
-    if (!reg_offset && !role) put(e, ADD_LSL(A, addr, U, 0));
+    if (!reg_offset && !role) put(e, ADD_LSL(host, addr, U, 0));
     if (role) {
         int64_t scale = 1ll << op.size;
         int fits = pair ? gimm % scale == 0 && gimm / scale >= -64 && gimm / scale < 64
@@ -1131,7 +1192,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     switch (op.kind) {
     case HV_MEM_PAIR: {
         uint32_t opc = op.vec ? op.size - 2u : (op.sign ? 1u : op.size == 3 ? 2u : 0u);
-        out = opc << 30 | 0x29000000u | (uint32_t)op.vec << 26 | (uint32_t)op.load << 22 | rt2 << 10 | A << 5 | rt;
+        out = opc << 30 | 0x29000000u | (uint32_t)op.vec << 26 | (uint32_t)op.load << 22 | rt2 << 10 | (uint32_t)host << 5 | rt;
         if (role) out |= ((uint32_t)(gimm >> op.size) & 0x7f) << 15;
         break;
     }
@@ -1165,6 +1226,10 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         break;
     }
     put(e, out);
+    if (win) { /* adr xzr, Lfull: executes as nothing; the fault handler reads where it points */
+        int64_t off = ((int64_t)win_full - (int64_t)e->n) * 4;
+        put(e, 0x10000000u | ((uint32_t)off & 3) << 29 | ((uint32_t)(off >> 2) & 0x7ffff) << 5 | 31u);
+    }
 
     if (rmw) {
         if (rs_stolen && op.kind == HV_MEM_CAS) put(e, STR_X(rs, 28, slot_of(op.rs)));
@@ -1364,12 +1429,47 @@ static void put_pstate_bit(Emit *e, int rt, int bit, int read) {
    the new flags' branch cache. PAN: the bit, then likewise. Returns 0 if not
    handled, 1 if the block carries on, 2 if it ended. */
 static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
-    if (!(e->flags & HV_BLOCK_EL1) || e->no_ijc) return 0;
+    /* MSR SCTLR_EL1, Xt at EL1: xnu writes it on every kernel entry and exit of a process whose PAC keys differ (its
+       EnIA/IB/DA/DB bits), which a busy app does hundreds of thousands of times a second (League of Legends on the
+       phone, 2026-11-13: 586K a second, each through the helper). Only M, WXN, E0E and EE change what translations
+       mean (hv_sysreg_msr flushes for them): when none of those changes, the store is the whole write, done here; when
+       one does, the helper as before. The value is fixed up as hv_sysreg_msr does (ITD and SED set, CP15BEN clear).
+       HV_SCTLR_HELPER=1: always the helper. */
+    if ((e->flags & HV_BLOCK_EL1) && ((insn >> 19) & 3) && !((insn >> 21) & 1) &&
+        ((insn >> 5) & 0xffff) == (3u << 14 | 0u << 11 | 1u << 7 | 0u << 3 | 0u)) {
+        static int helper_only = -1;
+        if (helper_only < 0) helper_only = getenv("HV_SCTLR_HELPER") != NULL;
+        if (!helper_only) {
+            int rt = insn & 0x1f;
+            if (rt == 31) put(e, 0xd2800006u);                                       /* movz x6, #0 */
+            else if (is_stolen(rt)) put(e, LDR_X(6, 28, slot_of(rt)));
+            else put(e, MOV_X(6, rt));
+            put(e, 0xb27904c6u);                                                     /* orr x6, x6, #0x180 */
+            put(e, 0x927af8c6u);                                                     /* and x6, x6, #~0x20 */
+            put(e, LDR_X(7, 28, HV_CPU_SCTLR_EL1));
+            put(e, 0xca0600e7u);                                                     /* eor x7, x7, x6 */
+            static const uint32_t bits[4] = {0, 19, 24, 25};
+            uint32_t at[4];
+            for (int i = 0; i < 4; i++) {
+                at[i] = e->n;
+                put(e, 0x37000007u | bits[i] << 19);                                 /* tbnz x7, #bit, helper */
+            }
+            put(e, STR_X(6, 28, HV_CPU_SCTLR_EL1));
+            uint32_t skip = e->n;
+            put(e, B_OP);                                                            /* b done */
+            for (int i = 0; i < 4; i++)
+                if (at[i] < MAX_WORDS) patch_branch(&e->w[at[i]], (int64_t)e->n - at[i]);
+            put_helper(e, pc, insn, HV_OP_MSR);
+            if (skip < MAX_WORDS) patch_branch(&e->w[skip], (int64_t)e->n - skip);
+            return 1;
+        }
+    }
+    if (!(e->flags & HV_BLOCK_EL1) || e->no_ijc || e->m->log >= 3) return 0;
     int imm_form = ((insn >> 19) & 3) == 0;
     uint32_t field = ((insn >> 16) & 7) << 3 | ((insn >> 5) & 7), imm = (insn >> 8) & 0xf;
     uint32_t reg = (insn >> 5) & 0xffff;
     int daif_reg = !imm_form && reg == (3u << 14 | 3u << 11 | 4u << 7 | 2u << 3 | 1u); /* MSR DAIF, Xt */
-    if ((imm_form && (field == 036 || field == 037)) || daif_reg) {
+    if (!e->no_ijc && ((imm_form && (field == 036 || field == 037)) || daif_reg)) {
         if (daif_reg) {
             int rt = insn & 0x1f;
             if (rt == 31) put(e, 0xd2800006u);                                        /* movz x6, #0 */
@@ -1390,6 +1490,64 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
         }
         return 1;
     }
+    if (imm_form && field == 003) { /* MSR UAO, #imm */
+        uint8_t s = 15;
+        spill(e, &s, 1);
+        put(e, LDR_X(s, 28, HV_CPU_PSTATE_EXTRA));
+        put(e, ((imm & 1) ? 0xb2690000u : 0x9268f800u) | (uint32_t)s << 5 | s);
+        put(e, STR_X(s, 28, HV_CPU_PSTATE_EXTRA));
+        unspill(e, &s, 1);
+        return 1;
+    }
+    if (!imm_form && reg == SR(3, 0, 1, 0, 0)) {
+        /* SCTLR_EL1 writes usually only flip PAC enables (EnIA/IB/DA/DB); only M/WXN/E0E/EE need the helper. */
+        int rt = insn & 0x1f;
+        uint32_t used = (rt < 31 && !is_stolen(rt)) ? (1u << rt) : 0;
+        uint8_t s[3];
+        for (int i = 0; i < 3; i++) s[i] = (uint8_t)pick(&used);
+        uint8_t V = s[0], C = s[1], M = s[2];
+        spill(e, s, 3);
+        int r = rt;
+        if (rt != 31 && is_stolen(rt)) {
+            put(e, LDR_X(V, 28, slot_of(rt)));
+            r = V;
+        }
+        put(e, 0xb2790400u | (uint32_t)r << 5 | V);             /* orr V, r_or_xzr, #0x180 */
+        put(e, 0x927af800u | (uint32_t)V << 5 | V);             /* and V, V, #~0x20 */
+        put(e, LDR_X(C, 28, HV_CPU_SCTLR_EL1));
+        put(e, 0xca000000u | (uint32_t)V << 16 | (uint32_t)C << 5 | C); /* eor C, C, V */
+        put(e, 0xd2800020u | M);                                /* movz M, #1 */
+        put(e, 0xf2a06100u | M);                                /* movk M, #0x0308, lsl #16 */
+        put(e, 0x8a000000u | (uint32_t)M << 16 | (uint32_t)C << 5 | C); /* and C, C, M */
+        put(e, CBNZ_X(C));
+        put_ool(e, (Ool){.kind = OOL_MSR, .pc = pc, .insn = insn, .nrestore = 3, .restore = {V, C, M}});
+        put(e, STR_X(V, 28, HV_CPU_SCTLR_EL1));
+        unspill(e, s, 3);
+        return 1;
+    }
+    if (!imm_form && reg == SR(3, 0, 2, 0, 1)) {
+        /* TTBR1_EL1 is frequently rewritten unchanged on context switches: trap only if it changes. */
+        int rt = insn & 0x1f;
+        uint32_t used = (rt < 31 && !is_stolen(rt)) ? (1u << rt) : 0;
+        uint8_t s[2] = {(uint8_t)pick(&used), 0};
+        int need2 = rt != 31 && is_stolen(rt);
+        if (need2) s[1] = (uint8_t)pick(&used);
+        spill(e, s, need2 ? 2 : 1);
+        put(e, LDR_X(s[0], 28, HV_CPU_TTBR1_EL1));
+        if (rt != 31) {
+            int r = rt;
+            if (need2) {
+                put(e, LDR_X(s[1], 28, slot_of(rt)));
+                r = s[1];
+            }
+            put(e, 0xca000000u | (uint32_t)r << 16 | (uint32_t)s[0] << 5 | s[0]);
+        }
+        put(e, CBNZ_X(s[0]));
+        put_ool(e, (Ool){.kind = OOL_MSR, .pc = pc, .insn = insn, .nrestore = (uint8_t)(need2 ? 2 : 1), .restore = {s[0], s[1]}});
+        unspill(e, s, need2 ? 2 : 1);
+        return 1;
+    }
+    if (e->no_ijc) return 0;
     if (!imm_form && reg == (3u << 14 | 0u << 11 | 4u << 7 | 2u << 3 | 0u)) { /* MSR SPSel, Xt: bit 0 picks, at run time */
         int rt = insn & 0x1f;
         uint32_t flags = e->flags, to_set = 0;
@@ -1450,7 +1608,11 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
 #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
 static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) {
     static int type = -1;
+#ifdef __linux__
+    type = 0; /* no commpage on a Linux host (tools/hengelinux): the helper reads the counter */
+#else
     if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
+#endif
     if (type == 0) return 0; /* the kernel's own path: leave it to the helper */
     int rt = insn & 0x1f;
     if (rt == 31) return 1;
@@ -1477,7 +1639,7 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) 
 }
 
 static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
-    if (((insn >> 19) & 3) == 0) return 0; /* MSR (immediate) */
+    if (((insn >> 19) & 3) == 0 || e->m->log >= 3) return 0; /* MSR (immediate) or sysreg trace */
     int read = (insn >> 21) & 1, rt = insn & 0x1f;
     uint32_t reg = (insn >> 5) & 0xffff;
     int el1 = (e->flags & HV_BLOCK_EL1) != 0, spx = (e->flags & HV_BLOCK_SPX) != 0;
@@ -1507,30 +1669,133 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         else return 0;
         return 1;
     case SR(3, 0, 13, 0, 4): /* TPIDR_EL1 */
+    case SR(3, 0, 13, 0, 1): /* CONTEXTIDR_EL1 */
     case SR(3, 0, 4, 0, 1):  /* ELR_EL1 */
-    case SR(3, 0, 4, 0, 0): { /* SPSR_EL1 */
+    case SR(3, 0, 4, 0, 0):  /* SPSR_EL1 */
+    case SR(3, 0, 5, 2, 0):  /* ESR_EL1 */
+    case SR(3, 0, 6, 0, 0):  /* FAR_EL1 */
+    case SR(3, 0, 7, 4, 0):  /* PAR_EL1 */
+    case SR(3, 0, 1, 0, 1):  /* ACTLR_EL1 */
+    case SR(3, 0, 10, 3, 0): /* AMAIR_EL1 */
+    case SR(2, 0, 0, 2, 2): { /* MDSCR_EL1 */
         if (!el1) return 0;
-        uint32_t off = reg == SR(3, 0, 13, 0, 4) ? HV_CPU_TPIDR_EL1 : reg == SR(3, 0, 4, 0, 1) ? HV_CPU_ELR_EL1 : HV_CPU_SPSR_EL1;
+        uint32_t off = reg == SR(3, 0, 13, 0, 4) ? HV_CPU_TPIDR_EL1
+                     : reg == SR(3, 0, 13, 0, 1) ? HV_CPU_CONTEXTIDR_EL1
+                     : reg == SR(3, 0, 4, 0, 1)  ? HV_CPU_ELR_EL1
+                     : reg == SR(3, 0, 4, 0, 0)  ? HV_CPU_SPSR_EL1
+                     : reg == SR(3, 0, 5, 2, 0)  ? HV_CPU_ESR_EL1
+                     : reg == SR(3, 0, 6, 0, 0)  ? HV_CPU_FAR_EL1
+                     : reg == SR(3, 0, 7, 4, 0)  ? HV_CPU_PAR_EL1
+                     : reg == SR(3, 0, 1, 0, 1)  ? HV_CPU_ACTLR_EL1
+                     : reg == SR(3, 0, 10, 3, 0) ? HV_CPU_AMAIR_EL1
+                                                 : HV_CPU_MDSCR_EL1;
         if (read) put_load_field(e, rt, off);
         else put_store_field(e, rt, off);
         return 1;
     }
-    case SR(3, 0, 1, 0, 0): /* SCTLR_EL1, ESR_EL1, FAR_EL1: reads (writes have side effects or are rare) */
-    case SR(3, 0, 5, 2, 0):
-    case SR(3, 0, 6, 0, 0): {
+    case SR(3, 0, 12, 0, 0): /* VBAR_EL1 (writes clear low 11 bits) */
+        if (!el1) return 0;
+        if (read) put_load_field(e, rt, HV_CPU_VBAR_EL1);
+        else if (rt == 31) put_store_field(e, 31, HV_CPU_VBAR_EL1);
+        else {
+            uint8_t s = 15;
+            spill(e, &s, 1);
+            int r = rt;
+            if (is_stolen(rt)) {
+                put(e, LDR_X(s, 28, slot_of(rt)));
+                r = s;
+            }
+            put(e, 0x9275d000u | (uint32_t)r << 5 | s); /* and s, r, #~0x7ff */
+            put(e, STR_X(s, 28, HV_CPU_VBAR_EL1));
+            unspill(e, &s, 1);
+        }
+        return 1;
+    case SR(3, 0, 14, 1, 0): /* CNTKCTL_EL1 (also mirrors EL0 enables in el0_cnt) */
+        if (!el1) return 0;
+        if (read) put_load_field(e, rt, HV_CPU_CNTKCTL_EL1);
+        else {
+            put_store_field(e, rt, HV_CPU_CNTKCTL_EL1);
+            if (rt == 31) {
+                put(e, 0xb9000000u | (HV_CPU_EL0_CNT / 4) << 10 | 28u << 5 | 31u);
+            } else {
+                uint8_t s = 15;
+                spill(e, &s, 1);
+                int r = rt;
+                if (is_stolen(rt)) {
+                    put(e, LDR_X(s, 28, slot_of(rt)));
+                    r = s;
+                }
+                put(e, 0x12000400u | (uint32_t)r << 5 | s); /* and w15, wR, #3 */
+                put(e, 0xb9000000u | (HV_CPU_EL0_CNT / 4) << 10 | 28u << 5 | s);
+                unspill(e, &s, 1);
+            }
+        }
+        return 1;
+    case SR(3, 0, 1, 0, 0):  /* SCTLR_EL1 (writes use translate_msr_inline) */
+    case SR(3, 0, 2, 0, 0):  /* TTBR0_EL1 (writes switch process) */
+    case SR(3, 0, 2, 0, 1):  /* TTBR1_EL1 (writes use translate_msr_inline) */
+    case SR(3, 0, 2, 0, 2):  /* TCR_EL1 (writes flush TLB) */
+    case SR(3, 0, 10, 2, 0): /* MAIR_EL1 (writes flush TLB) */
+    case SR(3, 0, 1, 0, 2):  /* CPACR_EL1 (writes change block FP flags) */
+    case SR(3, 0, 0, 0, 5):  /* MPIDR_EL1 */
+    case SR(3, 3, 14, 3, 2): { /* CNTV_CVAL_EL0 (EL0 gated by CNTKCTL, writes arm timer) */
         if (!read || !el1) return 0;
-        uint32_t off = reg == SR(3, 0, 1, 0, 0) ? HV_CPU_SCTLR_EL1 : reg == SR(3, 0, 5, 2, 0) ? HV_CPU_ESR_EL1 : HV_CPU_FAR_EL1;
+        uint32_t off = reg == SR(3, 0, 1, 0, 0)  ? HV_CPU_SCTLR_EL1
+                     : reg == SR(3, 0, 2, 0, 0)  ? HV_CPU_TTBR0_EL1
+                     : reg == SR(3, 0, 2, 0, 1)  ? HV_CPU_TTBR1_EL1
+                     : reg == SR(3, 0, 2, 0, 2)  ? HV_CPU_TCR_EL1
+                     : reg == SR(3, 0, 10, 2, 0) ? HV_CPU_MAIR_EL1
+                     : reg == SR(3, 0, 1, 0, 2)  ? HV_CPU_CPACR_EL1
+                     : reg == SR(3, 0, 0, 0, 5)  ? HV_CPU_MPIDR
+                                                 : HV_CPU_CNTV_CVAL;
         put_load_field(e, rt, off);
         return 1;
     }
-    case SR(3, 0, 2, 0, 2): /* TCR_EL1, PAR_EL1: reads (writes change translation; PAR is written by AT) */
-    case SR(3, 0, 7, 4, 0):
+    case SR(3, 0, 0, 0, 0): /* MIDR_EL1 */
         if (!read || !el1) return 0;
-        put_load_field(e, rt, reg == SR(3, 0, 2, 0, 2) ? HV_CPU_TCR_EL1 : HV_CPU_PAR_EL1);
+        put_const_to(e, rt, HV_MIDR);
+        return 1;
+    case SR(2, 0, 1, 1, 4): /* OSLSR_EL1 */
+        if (!read || !el1) return 0;
+        put_const_to(e, rt, 0x8);
+        return 1;
+    case SR(3, 3, 0, 0, 7): /* DCZID_EL0 */
+        if (!read) return 0;
+        put_const_to(e, rt, 4);
+        return 1;
+    case SR(3, 3, 0, 0, 1): /* CTR_EL0 */
+        if (!read) return 0;
+        if (!el1) {
+            put(e, LDR_X(6, 28, HV_CPU_SCTLR_EL1));
+            put(e, 0x36000000u | (15u << 19) | 6); /* tbz x6, #15, ool (UCT) */
+            put_ool(e, (Ool){.kind = OOL_MRS, .pc = pc, .insn = insn});
+            uint32_t slow = e->nool - 1;
+            put_const_to(e, rt, HV_CTR_EL0);
+            e->ool[slow].join = e->n;
+        } else {
+            put_const_to(e, rt, HV_CTR_EL0);
+        }
+        return 1;
+    case SR(3, 3, 14, 0, 0): /* CNTFRQ_EL0 */
+        if (!read) return 0;
+        if (!el1) {
+            put(e, 0xb9400000u | (HV_CPU_EL0_CNT / 4) << 10 | 28 << 5 | 6); /* ldr w6, [x28, #el0_cnt] */
+            put(e, 0x34000006u);                                             /* cbz w6, ool */
+            put_ool(e, (Ool){.kind = OOL_MRS, .pc = pc, .insn = insn});
+            uint32_t slow = e->nool - 1;
+            put_const_to(e, rt, HV_CNTFRQ);
+            e->ool[slow].join = e->n;
+        } else {
+            put_const_to(e, rt, HV_CNTFRQ);
+        }
         return 1;
     case SR(3, 0, 4, 2, 3): /* PAN: a block is translated for one PAN state (HV_BLOCK_PAN) and every write ends it */
         if (!read || !el1) return 0;
         put_const_to(e, rt, (e->flags & HV_BLOCK_PAN) ? HV_PSTATE_PAN : 0);
+        return 1;
+    case SR(3, 0, 4, 2, 4): /* UAO */
+        if (!el1) return 0;
+        put_pstate_bit(e, rt, 23, read);
         return 1;
     case SR(3, 0, 4, 1, 0): /* SP_EL0: only while it is banked (SPSel = 1) */
         if (!el1 || !spx) return 0;
@@ -1554,8 +1819,21 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         put_pstate_bit(e, rt, reg == SR(3, 3, 4, 2, 5) ? 24 : 12, read);
         return 1;
     default:
-        return 0;
+        break;
     }
+    if (el1) {
+        uint32_t op0 = reg >> 14, op1 = (reg >> 11) & 7, crn = (reg >> 7) & 15, crm = (reg >> 3) & 15;
+        /* PAuth keys (CRn 2, CRm 1..3), Debug (op0 2: MDSCR/OSLSR handled above), PMU (op0 3, CRn 9), Apple impdef (op0 3, CRn 15). */
+        int pauth = op0 == 3 && op1 == 0 && crn == 2 && crm >= 1 && crm <= 3;
+        int debug = op0 == 2;
+        int pmu = op0 == 3 && crn == 9;
+        int impdef = op0 == 3 && crn == 15 && !e->m->log;
+        if (pauth || debug || pmu || impdef) {
+            if (read) put_const_to(e, rt, 0);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int is_fp_insn(uint32_t insn) {
@@ -1810,6 +2088,9 @@ static void emit_ool(Emit *e) {
                 e->site[e->nsite - 1].has_cond = 1;
                 e->site[e->nsite - 1].cond_at = site_at;
             }
+        } else if (o->kind == OOL_MSR) {
+            put_helper(e, o->pc, o->insn, HV_OP_MSR);
+            put_exit(e, o->pc + 4);
         } else {
             put_helper(e, o->pc, o->insn, o->kind == OOL_SYS ? HV_OP_SYS : o->kind == OOL_MRS ? HV_OP_MRS : HV_OP_MEM);
             put(e, B_OP);
@@ -1832,6 +2113,10 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
     e->ngrp = 0;
     memset(e->gid, -1, sizeof e->gid);
     if (e->nogroup || e->slow_mem) return;
+    /* HV_WINDOW_NOGROUP: user blocks leave every access to the window (an A/B against grouping's one TLB check). */
+    static int win_nogroup = -1;
+    if (win_nogroup < 0) win_nogroup = getenv("HV_WINDOW_NOGROUP") != NULL;
+    if (win_nogroup && hv_window_enabled() && !(e->flags & HV_BLOCK_EL1)) return;
     int cur[32];
     int64_t delta[32];
     for (int r = 0; r < 32; r++) cur[r] = -1, delta[r] = 0;
@@ -1947,8 +2232,13 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
 int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail) {
     /* HV_GROUPS=1: group accesses (off by default: measured no faster, and the
        plain copies make the code about 15% bigger, so the JIT region fills sooner). */
-    if (hv_knob[HV_K_GROUPS] && translate_emit(m, b, code, avail, 0) == 0) return 0;
-    return translate_emit(m, b, code, avail, 1);
+    if (hv_knob[HV_K_GROUPS]) {
+        if (translate_emit(m, b, code, avail, 0) == 0) return 0;
+        hv_translate_discard_slots(m);
+    }
+    if (translate_emit(m, b, code, avail, 1) == 0) return 0;
+    hv_translate_discard_slots(m);
+    return -1;
 }
 
 static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
@@ -2040,13 +2330,16 @@ static __thread struct {
     HvMachine *m;
     uint64_t gen;
     uint32_t *hot, *cold;
+    uint32_t seg, epoch;  /* the ring segment it is in, and that segment's epoch then (taken back since: gone) */
 } chunk;
 
 static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_at, uint32_t **cold_at) {
     uint64_t gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST);
-    if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold) {
+    if (chunk.m != m || chunk.gen != gen || !chunk.hot || (size_t)(chunk.cold - chunk.hot) < (size_t)hot + cold ||
+        (m->jit.seg_words && m->jit.seg_epoch[chunk.seg] != chunk.epoch)) {
         size_t want = JIT_CHUNK_WORDS;
         if (want > m->jit.capacity) want = m->jit.capacity;
+        if (m->jit.seg_words && want > m->jit.seg_words) want = m->jit.seg_words;
         if (want < (size_t)hot + cold) want = (size_t)hot + cold;
         uint32_t *p = hv_jit_reserve(&m->jit, want);
         if (!p) {
@@ -2054,6 +2347,10 @@ static int chunk_take(HvMachine *m, uint32_t hot, uint32_t cold, uint32_t **hot_
             return -1;
         }
         chunk.m = m, chunk.gen = gen, chunk.hot = p, chunk.cold = p + ((want + 1) & ~(size_t)1);
+        if (m->jit.seg_words) {
+            chunk.seg = (uint32_t)((size_t)(p - m->jit.base) / m->jit.seg_words);
+            chunk.epoch = m->jit.seg_epoch[chunk.seg];
+        }
     }
     *hot_at = chunk.hot;
     chunk.hot += hot;
@@ -2067,6 +2364,7 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     uint32_t pad = hv_knob[HV_K_TEST1] & ~1u; /* HV_K1: words of nothing after each block's hot part, to see what density is worth */
     uint32_t *dst, *cold;
     if (chunk_take(m, e->nhot + pad, e->ncold, &dst, &cold) != 0) return -1;
+    e->place_seg = m->jit.seg_words ? chunk.seg : 0u;
     for (uint32_t k = 0; k < e->nrel; k++) {
         uint32_t at = e->rel[k].at, target = e->rel[k].target;
         if (e->rel[k].from_cold) patch_branch(&e->cold[at], (dst + target) - (cold + at));
@@ -2089,7 +2387,7 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
             if (tb && tb->maker == b->maker) code = tb->code;
         }
         if (!code) continue;
-        m->slots[slot] = (uint64_t)(uintptr_t)code;
+        *HV_SLOT(m, slot) = (uint64_t)(uintptr_t)code;
         uint32_t at = e->site[k].at;
         int64_t off = code - ((e->site[k].cold ? cold : dst) + at);
         if (off >= -(1 << 25) && off < (1 << 25)) (e->site[k].cold ? e->cold : e->hot)[at] = 0x14000000u | (uint32_t)(off & 0x3ffffff);
@@ -2107,10 +2405,52 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     hv_jit_finish2(&m->jit, dst, e->nhot, e->flat ? NULL : cold, e->flat ? 0 : e->ncold); /* one wait for both parts */
     b->code = dst;
     for (uint32_t k = 0; k < e->nsite; k++) {
-        m->slot_site[e->site[k].slot] = (e->site[k].cold ? cold : dst) + e->site[k].at;
-        m->slot_stub[e->site[k].slot] = (e->site[k].stub_cold ? cold : dst) + e->site[k].stub;
-        m->slot_cond[e->site[k].slot] = e->site[k].has_cond ? dst + e->site[k].cond_at : NULL;
+        m->slot_site[e->site[k].slot] = hv_slot_enc(m, (e->site[k].cold ? cold : dst) + e->site[k].at);
+        m->slot_stub[e->site[k].slot] = hv_slot_enc(m, (e->site[k].stub_cold ? cold : dst) + e->site[k].stub);
+        m->slot_cond[e->site[k].slot] = e->site[k].has_cond ? hv_slot_enc(m, dst + e->site[k].cond_at) : 0u;
     }
+    return 0;
+}
+
+uint32_t hv_translate_placed_seg(void) { return E.place_seg; }
+
+void hv_translate_discard_slots(HvMachine *m) {
+    Emit *e = &E;
+    for (uint32_t k = 0; k < e->nsite; k++) {
+        uint32_t idx = e->site[k].slot;
+        *HV_SLOT(m, idx) = 0;
+        m->slot_site[idx] = 0;
+        m->slot_stub[idx] = 0;
+        m->slot_cond[idx] = 0;
+        m->slot_xa[idx] = 0;
+        m->slot_xpa[idx] = 0;
+        m->slot_tseg[idx] = 0;
+        hv_slot_trash_push(m, idx);
+    }
+    e->nsite = 0;
+}
+
+int hv_translate_commit_slots(HvMachine *m) {
+    Emit *e = &E;
+    if (!e->nsite) return 0;
+    uint32_t seg = e->place_seg;
+    if (m->seg_slots_len[seg] + e->nsite > m->seg_slots_cap[seg]) {
+        uint32_t cap = m->seg_slots_cap[seg] ? m->seg_slots_cap[seg] * 2u : 4096u;
+        while (cap < m->seg_slots_len[seg] + e->nsite) cap *= 2u;
+        uint32_t *arr = realloc(m->seg_slots[seg], (size_t)cap * sizeof *arr);
+        if (!arr) return -1;
+        m->seg_slots[seg] = arr;
+        m->seg_slots_cap[seg] = cap;
+    }
+    for (uint32_t k = 0; k < e->nsite; k++) {
+        uint32_t idx = e->site[k].slot;
+        m->seg_slots[seg][m->seg_slots_len[seg]++] = idx;
+        if (*HV_SLOT(m, idx)) {
+            uint32_t tseg = hv_jit_seg_of(m, (const uint32_t *)(uintptr_t)*HV_SLOT(m, idx));
+            hv_slot_tlist_insert(m, tseg, idx);
+        }
+    }
+    e->nsite = 0;
     return 0;
 }
 

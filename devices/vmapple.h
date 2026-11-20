@@ -84,6 +84,8 @@ typedef struct HvVmapple {
    Guest RAM is reserved, not committed: pages are only used once touched. */
 int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpus, uint64_t ram_size, HvDisk *root, HvDisk *aux,
                       const HvCfgParams *cfg, const uint8_t mac[6]);
+/* Guest RAM for a board: sets b->ram, b->ram_size, b->ram_fd (-1 beforehand). 0, or -1. */
+int hv_vmapple_alloc_ram(HvVmapple *b, uint64_t ram_size);
 /* Copies a boot ROM image into the firmware region. */
 int hv_vmapple_load_rom(HvVmapple *b, const char *path);
 /* CPU reset: EL1, MMU off, interrupts masked, at the start of the ROM. */

@@ -1,0 +1,195 @@
+# .github/workflows/linux-machine.yml
+#
+# The Linux machine (docs/linux-machine.md), built and tried on a GitHub-hosted
+# arm64 Linux runner, where HengeVM's engine runs natively (no phone, no Mac):
+#
+# 1. builds tools/hengelinux, the engine with the Linux machine, for arm64 Linux;
+# 2. builds the machine's kernel (tools/linux/build-kernel.sh: 16 KB pages, what
+#    the engine runs fastest), cached between runs;
+# 3. makes an Ubuntu machine with tools/linux/make-ubuntu-disk.sh, with the Xfce
+#    desktop and with Ubuntu's GNOME desktop, one job each (the runner runs the
+#    image's arm64 apt itself);
+# 4. boots it on the engine, with virtio-gpu as its display (as the app), and henge.autotest on the kernel's command line:
+#    the image reports what came up on the serial console and powers off;
+# 5. uploads the machine folder (Image, disk.img.hvsparse, machine.json) for
+#    the app to import, and the boot log.
+#
+# Manual (Actions tab > Linux machine > Run workflow), and on pushes to main and pull requests that touch
+# the engine or the Linux machine (Ubuntu GNOME, Kali Xfce and Kali GNOME then). Free on a public repo: arm64 runners are standard
+# runners there.
+
+name: Linux machine
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop:
+        description: "Desktop: gnome (Ubuntu), kali (Kali Xfce), kali-gnome, both (Ubuntu Xfce and GNOME), xfce or none (a server). On push: gnome, kali and kali-gnome"
+        type: choice
+        options: [gnome, kali, kali-gnome, both, xfce, none]
+        default: gnome
+      size:
+        description: "Disk size"
+        type: string
+        default: "60G"
+      cpus:
+        description: "CPUs for the boot test"
+        type: string
+        default: "4"
+      kernel:
+        description: "Kernel: henge (16 KB pages, built here) or ubuntu (stock, 4 KB pages: slow on the engine)"
+        type: string
+        default: "henge"
+  push:
+    branches: ["main"]
+    paths:
+      - "core/**"
+      - "devices/linuxvirt.*"
+      - "devices/fdt.*"
+      - "devices/virtio_gpu.*"
+      - "devices/vgpu_virgl.*"
+      - "host/linux/**"
+      - "tools/hengelinux.c"
+      - "tools/linux/**"
+      - ".github/workflows/linux-machine.yml"
+  pull_request:
+    paths:
+      - "core/**"
+      - "devices/linuxvirt.*"
+      - "devices/fdt.*"
+      - "devices/virtio_gpu.*"
+      - "devices/vgpu_virgl.*"
+      - "host/linux/**"
+      - "tools/hengelinux.c"
+      - "tools/linux/**"
+      - ".github/workflows/linux-machine.yml"
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    # One machine per desktop: Xfce (LightDM) and GNOME (Ubuntu's desktop, GDM), side by side on pushes.
+    strategy:
+      fail-fast: false
+      matrix:
+        desktop: ${{ fromJSON((inputs.desktop == 'xfce' && '["xfce"]') || (inputs.desktop == 'gnome' && '["gnome"]') || (inputs.desktop == 'none' && '["none"]') || (inputs.desktop == 'kali' && '["kali"]') || (inputs.desktop == 'kali-gnome' && '["kali-gnome"]') || (inputs.desktop == 'both' && '["xfce", "gnome"]') || '["gnome", "kali", "kali-gnome"]') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debootstrap build-essential e2fsprogs kmod zstd xz-utils curl bc bison flex libssl-dev libelf-dev python3 \
+              libvirglrenderer-dev libepoxy-dev libegl-dev libgbm-dev libegl-mesa0 libgl1-mesa-dri libgles2 pkg-config
+
+      - name: Build the engine with the Linux machine (native arm64)
+        run: |
+          make linux-test LXCC=gcc
+          # And with 3D for virtio-gpu through virglrenderer (the runner's Mesa, surfaceless EGL).
+          make linux-test LXCC=gcc LX_VIRGL=1 LXB=build/linux-virgl
+
+      - name: Kernel cache
+        if: ${{ (inputs.kernel || 'henge') == 'henge' }}
+        uses: actions/cache@v4
+        with:
+          path: kernel
+          key: henge-kernel-6.12-${{ hashFiles('tools/linux/henge-kernel.config', 'tools/linux/build-kernel.sh') }}
+
+      - name: Build the kernel (16 KB pages)
+        if: ${{ (inputs.kernel || 'henge') == 'henge' }}
+        run: |
+          if [ -f kernel/Image ]; then echo "cached: Linux $(cat kernel/release)"; exit 0; fi
+          tools/linux/build-kernel.sh kernel
+          ls -la kernel
+
+      - name: Make the Ubuntu machine
+        run: |
+          set -euo pipefail
+          kernel=""
+          if [ -f kernel/Image ]; then kernel="--kernel-dir kernel"; fi
+          case "${{ matrix.desktop }}" in xfce) desktop=--desktop ;; gnome) desktop=--gnome ;; kali) desktop="--kali --desktop" ;; kali-gnome) desktop="--kali --gnome" ;; *) desktop="" ;; esac
+          sudo tools/linux/make-ubuntu-disk.sh machine --size "${{ inputs.size || '60G' }}" $desktop $kernel
+          sudo chown -R "$(id -u):$(id -g)" machine
+          ls -la machine
+          cat machine/machine.json
+
+      - name: Boot it on the engine
+        run: |
+          set -uo pipefail
+          # A copy, so the machine handed out has never been booted.
+          cp --sparse=always machine/disk.img boot-test.img
+          HV_FB_DUMP=screen.ppm timeout 3600 build/linux/hengelinux --kernel machine/Image --disk boot-test.img \
+              --cpus "${{ inputs.cpus || '4' }}" --ram 4096 --fb 1280x800 --gpu \
+              --append "console=ttyAMA0 root=/dev/vda rw rootwait henge.autotest" \
+              < /dev/null 2>&1 | tee boot.log
+          rm -f boot-test.img
+          sed -n '/henge-autotest: Ubuntu is up/,/henge-autotest: end/p' boot.log
+          # The screen as the machine left it, as a PNG (what the app would have shown).
+          [ -f screen.ppm ] && python3 tools/linux/ppm2png.py screen.ppm screen.png
+          grep -q "henge-autotest: Ubuntu is up" boot.log
+          # A desktop machine is handed out only if its desktop came up.
+          if [ "${{ matrix.desktop }}" != none ]; then grep -q "^desktop: .* up after" boot.log; fi
+
+      - name: Boot it again with 3D (virgl)
+        if: success()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cp --sparse=always machine/disk.img boot-test.img
+          HV_FB_DUMP=screen-virgl.ppm HV_VGPU_LOG=0 timeout 1800 build/linux-virgl/hengelinux --kernel machine/Image --disk boot-test.img \
+              --cpus "${{ inputs.cpus || '4' }}" --ram 4096 --fb 1280x800 --virgl \
+              --append "console=ttyAMA0 root=/dev/vda rw rootwait henge.autotest" \
+              < /dev/null 2>&1 | tee boot-virgl.log
+          rm -f boot-test.img
+          grep -E "^virgl:|^virtio-gpu:|glamor|^gl:|glxinfo said" boot-virgl.log | head -30
+          sed -n '/henge-autotest: Ubuntu is up/,/henge-autotest: end/p' boot-virgl.log
+          [ -f screen-virgl.ppm ] && python3 tools/linux/ppm2png.py screen-virgl.ppm screen-virgl.png
+          grep -q "gl: .*virgl" boot-virgl.log
+
+      - name: Boot it with 3D the iPhone's way (own EGL contexts, OpenGL ES)
+        if: success()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cp --sparse=always machine/disk.img boot-test.img
+          HV_FB_DUMP=screen-gles.ppm HV_VGPU_LOG=0 HV_VIRGL_OWN_EGL=1 HV_VIRGL_LOG=1 timeout 1800 build/linux-virgl/hengelinux --kernel machine/Image \
+              --disk boot-test.img --cpus "${{ inputs.cpus || '4' }}" --ram 4096 --fb 1280x800 --virgl \
+              --append "console=ttyAMA0 root=/dev/vda rw rootwait henge.autotest" \
+              < /dev/null 2>&1 | tee boot-gles.log
+          rm -f boot-test.img
+          grep -E "^virgl:|^virtio-gpu:|glamor|^gl:|glxinfo said" boot-gles.log | head -60
+          [ -f screen-gles.ppm ] && python3 tools/linux/ppm2png.py screen-gles.ppm screen-gles.png
+          grep -q "gl: .*virgl" boot-gles.log
+
+      - name: Pack the disk
+        if: always()
+        run: |
+          if [ -f machine/disk.img ]; then
+            cc -O2 -std=gnu11 -Ihost tools/hvsparse_main.c host/hvsparse.c -o hvsparse
+            ./hvsparse pack machine/disk.img machine/disk.img.hvsparse
+            rm machine/disk.img
+            du -sh machine/*
+          fi
+
+      - name: Upload the machine
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: henge-ubuntu-${{ matrix.desktop == 'none' && 'server' || matrix.desktop }}-${{ github.sha }}
+          path: machine/
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload the boot log and the screen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log-${{ matrix.desktop }}-${{ github.sha }}
+          path: |
+            boot.log
+            screen.png
+            boot-virgl.log
+            screen-virgl.png
+            boot-gles.log
+            screen-gles.png
+          if-no-files-found: ignore

@@ -64,7 +64,8 @@ struct BootDisplay: View {
                     }
                     if !gpuLive { image = Self.snapshot() ?? image }
                 }
-                try? await Task.sleep(nanoseconds: gpuLive ? 250_000_000 : 100_000_000)
+                /* The Linux machine's screen is this framebuffer for good, not a boot screen: refresh it at 60 Hz. */
+                try? await Task.sleep(nanoseconds: gpuLive ? 250_000_000 : henge_vm_is_linux() != 0 ? 16_666_667 : 100_000_000)
             }
         }
     }
@@ -73,9 +74,9 @@ struct BootDisplay: View {
         var px: UnsafePointer<UInt8>?
         var w: Int32 = 0, h: Int32 = 0, stride: Int32 = 0
         guard henge_vm_boot_display(&px, &w, &h, &stride) == 0, let px else { return nil }
-        defer { henge_vm_free_display(px) }
         let bytes = Int(stride) * Int(h)
-        let data = Data(bytes: px, count: bytes) // a copy: the guest keeps drawing
+        // The engine's copy (the guest keeps drawing), handed over: freed with free() once the image is done with it.
+        let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: px), count: bytes, deallocator: .free)
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }
         let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
         return CGImage(width: Int(w), height: Int(h), bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: Int(stride),

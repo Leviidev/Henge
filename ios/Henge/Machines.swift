@@ -28,7 +28,17 @@ struct VirtualMac: Identifiable, Codable, Hashable {
     var screen: (width: Int, height: Int) { isRetina ? Device.retinaScreen : (screenWidth ?? 1920, screenHeight ?? 1080) }
     var aspect: CGFloat { CGFloat(screen.width) / CGFloat(screen.height) }
 
+    /// "linux" for the Linux machine (docs/linux-machine.md): a kernel and a root disk instead of a boot ROM,
+    /// disk and auxiliary storage. nil: a Mac.
+    var kind: String?
+    /// The Linux kernel's command line; nil for the engine's (root file system on /dev/vda).
+    var cmdline: String?
+    var isLinux: Bool { kind == "linux" }
+
     var directory: URL { Machines.directory(for: id) }
+    /// The Linux machine's kernel (an uncompressed arm64 Image) and its initrd, if it has one.
+    var kernel: URL { directory.appendingPathComponent("Image") }
+    var initrd: URL { directory.appendingPathComponent("initrd.img") }
     var rom: URL { directory.appendingPathComponent("AVPBooter.vmapple2.bin") }
     var disk: URL { directory.appendingPathComponent("disk.img") }
     var aux: URL { directory.appendingPathComponent("auxiliary.bin") }
@@ -45,6 +55,7 @@ enum GuestMemory {
         let free = (try? mac.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? 0
         let room = free > 0 ? UInt64(max(free - (2 << 30), 0)) >> 20 : UInt64.max
+        henge_ios_release_high_room() // the blocks held for Mac apps would cap this Mac at 2 GB
         let reach = henge_largest_mapping_mb()
         let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
         HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
@@ -55,9 +66,12 @@ enum GuestMemory {
 /// machine.json in an exported folder (tools/export_ios.sh writes it).
 private struct MachineFile: Codable {
     var name: String?
-    var ecid: UInt64
+    var ecid: UInt64?
     var seed: UInt64?
     var ramMB: Int?
+    /// The Linux machine (tools/linux/make-ubuntu-disk.sh writes these): "linux", and its kernel's command line.
+    var kind: String?
+    var cmdline: String?
 }
 
 @MainActor
@@ -70,7 +84,16 @@ final class Machines: ObservableObject {
 
     /// The files an exported machine folder holds; its disk is disk.img, or disk.img.hvsparse (tools/export_ios.sh packs it).
     static let required = ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json"]
+    /// A Linux machine's folder: its kernel instead (tools/linux/make-ubuntu-disk.sh makes one).
+    static let requiredLinux = ["Image", "machine.json"]
     static let packedDisk = "disk.img.hvsparse"
+
+    /// What a folder must hold to be brought in, by what machine.json says it is.
+    nonisolated static func requiredFiles(_ folder: URL) -> [String] {
+        let data = try? Data(contentsOf: folder.appendingPathComponent("machine.json"))
+        let info = data.flatMap { try? JSONDecoder().decode(MachineFile.self, from: $0) }
+        return info?.kind == "linux" ? requiredLinux : required
+    }
 
     nonisolated static func hasDisk(_ folder: URL) -> Bool {
         let fm = FileManager.default
@@ -121,8 +144,9 @@ final class Machines: ObservableObject {
             if fm.fileExists(atPath: marker.path), let data = try? Data(contentsOf: item.appendingPathComponent("machine.json")),
                let info = try? JSONDecoder().decode(MachineFile.self, from: data),
                fm.fileExists(atPath: item.appendingPathComponent("disk.img").path) {
-                var mac = VirtualMac(id: id, name: info.name ?? "Mac", ecid: info.ecid, seed: info.seed ?? 0,
-                                     ramMB: info.ramMB ?? Device.suggestedRAMGB * 1024, diskBytes: 64 << 30)
+                let diskBytes = (try? fm.attributesOfItem(atPath: item.appendingPathComponent("disk.img").path)[.size] as? NSNumber)?.int64Value ?? 0
+                var mac = VirtualMac(id: id, name: info.name ?? "Mac", ecid: info.ecid ?? 0, seed: info.seed ?? 0,
+                                     ramMB: info.ramMB ?? Device.suggestedRAMGB * 1024, diskBytes: diskBytes)
                 let os = (try? String(contentsOf: marker, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 mac.osName = os.isEmpty ? nil : os
                 (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
@@ -153,7 +177,7 @@ final class Machines: ObservableObject {
 
     private func collect() async {
         guard importing == nil, let items = try? FileManager.default.contentsOfDirectory(at: Self.inbox, includingPropertiesForKeys: nil) else { return }
-        for folder in items where Self.hasDisk(folder) && Self.required.allSatisfy({ FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }) {
+        for folder in items where Self.hasDisk(folder) && Self.requiredFiles(folder).allSatisfy({ FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }) {
             await adopt(folder, move: true)
         }
     }
@@ -171,17 +195,26 @@ final class Machines: ObservableObject {
         do {
             let data = try Data(contentsOf: folder.appendingPathComponent("machine.json"))
             let info = try JSONDecoder().decode(MachineFile.self, from: data)
-            let missing = Self.required.filter { !FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }
+            let missing = Self.requiredFiles(folder).filter { !FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }
             guard missing.isEmpty, Self.hasDisk(folder) else { throw message("The folder is missing \((missing + (Self.hasDisk(folder) ? [] : ["disk.img"])).joined(separator: ", ")).") }
-            var mac = VirtualMac(name: info.name ?? folder.lastPathComponent, ecid: info.ecid, seed: info.seed ?? 0,
+            var mac = VirtualMac(name: info.name ?? folder.lastPathComponent, ecid: info.ecid ?? 0, seed: info.seed ?? 0,
                                  ramMB: info.ramMB ?? 2048, diskBytes: 0)
+            if info.kind == "linux" {
+                mac.kind = "linux"
+                mac.cmdline = info.cmdline
+                // The Linux machine's screen is a framebuffer the guest draws with the CPU: not the Mac's 1080p.
+                mac.screenWidth = 1280
+                mac.screenHeight = 800
+            } else if info.ecid == nil {
+                throw message("machine.json has no ECID: it is not a Mac exported by Henge.")
+            }
             importing = mac.name
             unpacked = 0
             let dest = mac.directory
             let fm = FileManager.default
             try fm.createDirectory(at: dest, withIntermediateDirectories: true)
             excludeFromBackup()
-            for name in ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json", "disk.img"] {
+            for name in ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json", "disk.img", "Image", "initrd.img"] {
                 let from = folder.appendingPathComponent(name)
                 guard fm.fileExists(atPath: from.path) else { continue }
                 if move { try fm.moveItem(at: from, to: dest.appendingPathComponent(name)) }
@@ -204,7 +237,7 @@ final class Machines: ObservableObject {
             mac.diskBytes = (try? fm.attributesOfItem(atPath: mac.disk.path)[.size] as? Int64) ?? 0
             all.append(mac)
             save()
-            HengeLog.log("machines", "imported \(mac.name) (ECID \(mac.ecid), \(mac.diskBytes >> 30) GB disk)")
+            HengeLog.log("machines", "imported \(mac.name) (\(mac.isLinux ? "Linux" : "ECID \(mac.ecid)"), \(mac.diskBytes >> 30) GB disk)")
         } catch {
             lastError = error.localizedDescription
             HengeLog.log("machines", "import of \(folder.lastPathComponent) failed: \(error.localizedDescription)")
@@ -251,9 +284,18 @@ final class Machines: ObservableObject {
         }
         try fm.createDirectory(at: partial, withIntermediateDirectories: true)
         do {
-            try fm.copyItem(at: mac.rom, to: partial.appendingPathComponent("AVPBooter.vmapple2.bin"))
-            try fm.copyItem(at: mac.aux, to: partial.appendingPathComponent("auxiliary.bin"))
-            let info: [String: Any] = ["name": mac.name, "ecid": mac.ecid, "seed": mac.seed, "ramMB": mac.ramMB]
+            var info: [String: Any] = ["name": mac.name, "ramMB": mac.ramMB]
+            if mac.isLinux {
+                try fm.copyItem(at: mac.kernel, to: partial.appendingPathComponent("Image"))
+                if fm.fileExists(atPath: mac.initrd.path) { try fm.copyItem(at: mac.initrd, to: partial.appendingPathComponent("initrd.img")) }
+                info["kind"] = "linux"
+                if let cmdline = mac.cmdline { info["cmdline"] = cmdline }
+            } else {
+                try fm.copyItem(at: mac.rom, to: partial.appendingPathComponent("AVPBooter.vmapple2.bin"))
+                try fm.copyItem(at: mac.aux, to: partial.appendingPathComponent("auxiliary.bin"))
+                info["ecid"] = mac.ecid
+                info["seed"] = mac.seed
+            }
             try JSONSerialization.data(withJSONObject: info).write(to: partial.appendingPathComponent("machine.json"))
             let source = mac.disk.path, target = partial.appendingPathComponent(Self.packedDisk).path
             let ok = await Task.detached { () -> Bool in

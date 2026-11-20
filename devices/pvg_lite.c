@@ -167,9 +167,25 @@ void hv_pvg_lite_set_size_mm(uint32_t width_mm, uint32_t height_mm) {
     display_mm_h = height_mm;
 }
 
+/* Where the host has the pointer, in the display mode's pixels (x | y << 16), drawn there instead of where the guest
+   says; 0xffffffff: the guest's own place. An iPhone mouse through AssistiveTouch: the pointer is drawn at once where
+   the mouse is (as Madeira draws its own), while the guest's pointer, moved there through the USB tablet, follows
+   behind; drawn where the slow guest has it, it trailed and jumped on fast moves. */
+uint32_t hv_pvg_cursor_at = 0xffffffff;
+
+void hv_pvg_lite_cursor_redraw(HvPvgLite *p) {
+    HvPvgMetal *metal = p ? atomic_load_explicit(&p->metal, memory_order_acquire) : NULL;
+    if (metal) hv_pvg_metal_cursor_moved(metal);
+}
+
 void hv_pvg_lite_set_mode(uint32_t width, uint32_t height) {
     display_w = width;
     display_h = height;
+}
+
+void hv_pvg_lite_mode(uint32_t *width, uint32_t *height) {
+    *width = display_w;
+    *height = display_h;
 }
 
 static void display_set_page(HvPvgLite *p, uint64_t pa) {
@@ -402,6 +418,10 @@ void hv_pvg_lite_set_layer(HvPvgLite *p, void *layer) {
 
 void hv_pvg_lite_barrier_stats(HvPvgLite *p, uint64_t out[4]) {
     out[0] = p->barriers, out[1] = p->barrier_drains, out[2] = p->barrier_retries, out[3] = p->barrier_timeouts;
+}
+
+uint64_t hv_pvg_lite_last_present_ns(HvPvgLite *p) {
+    return p && p->metal ? hv_pvg_metal_last_present_ns(p->metal) : 0;
 }
 
 uint64_t hv_pvg_lite_gpu_frames(HvPvgLite *p) {
@@ -720,14 +740,56 @@ static void vblank(HvPvgLite *p) {
         uint64_t r = hz && atoi(hz) > 0 ? (uint64_t)atoi(hz) : 60;
         period = 24000000ull / r; /* host counter ticks (24 MHz) */
     }
-    if (!on || !p->display_pa) return;
+    if (!p->display_pa) return;
     uint8_t *d = hv_phys_ptr(p->m, p->display_pa, 0x4000);
-    if (!d || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
+    if (!d) return;
     uint64_t now = mach_absolute_time();
     if (now < next) return;
     next = now + period;
+    /* The last refresh's time on the Mac's own clock, 64 bits at +68 of the display page: AppleParavirtDisplay's vblank
+       query reads it there (found in macOS 15.6.1's kernelcache, 2026-11-13: ldr x8, [page, #0x68]). Left 0, WindowServer
+       times its frames from 0 and logs "Timer delayed by <uptime>s" over and over. Written at every refresh, asked for or
+       not, before the event. HV_PVG_VSYNC_TS=0: not written (as before); another hex offset: there instead. */
+    static int ts_off = -1;
+    if (ts_off < 0) {
+        const char *e = getenv("HV_PVG_VSYNC_TS");
+        ts_off = e ? (int)strtol(e, NULL, 16) : 0x68;
+        if (ts_off < 0 || ts_off > 0xff8 || (ts_off & 7)) ts_off = 0;
+        fprintf(stderr, "hengevm: pvg: refresh time written at %s%x of the display page\n", ts_off ? "+" : "(off) ", ts_off);
+    }
+    if (ts_off) __atomic_store_n((uint64_t *)(d + ts_off), now - p->m->cntvoff, __ATOMIC_RELEASE);
+    /* The event itself only with HV_PVG_VBLANK=1 (off since 2026-11-17): upstream #165 reads event bit 3 as the driver's
+       disconnect (handleHostInterrupt calls destroyDisplayAttributes for it), so raising it at the refresh rate would tear
+       the display state down 60 times a second. The time above is what WindowServer's timer needed, and it is written
+       either way. */
+    if (!on || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
     __atomic_fetch_or((uint32_t *)(d + 0x100), 8, __ATOMIC_RELEASE);
     p->vblanks++;
+    /* In the log: the first one, then the count once a minute or so (it says whether the Mac is asking for them). */
+    {   /* What the Mac keeps in the display page, for finding the refresh event's timestamp: WindowServer's display
+           timer reports itself late by exactly the Mac's uptime, as if the time of the last refresh it reads were 0.
+           The words that changed since the last look, every 4096 events (about a minute), the first 8 times. */
+        static uint32_t seen[0x4000 / 4];
+        static int looks;
+        if ((p->vblanks == 1 || p->vblanks % 4096 == 0) && looks < 8) {
+            looks++;
+            int shown = 0;
+            for (uint32_t off = 0; off < 0x4000 && shown < 48; off += 4) {
+                uint32_t v = *(const uint32_t *)(d + off);
+                if (v != seen[off / 4] || looks == 1) {
+                    if (v || seen[off / 4]) {
+                        fprintf(stderr, "hengevm: pvg: display page +%03x %08x (was %08x)\n", off, v, seen[off / 4]);
+                        shown++;
+                    }
+                    seen[off / 4] = v;
+                }
+            }
+            fprintf(stderr, "hengevm: pvg: display page look %d at %llu events, guest counter %llu\n", looks,
+                    (unsigned long long)p->vblanks, (unsigned long long)(mach_absolute_time()));
+        }
+    }
+    if (p->vblanks == 1 || p->vblanks % 4096 == 0)
+        fprintf(stderr, "hengevm: pvg: display refresh events sent to the Mac: %llu\n", (unsigned long long)p->vblanks);
     hv_gicv3_pend(p->gic, p->gfx_irq);
 }
 

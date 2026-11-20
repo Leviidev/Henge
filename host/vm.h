@@ -20,6 +20,13 @@ typedef struct HvVmConfig {
     int log;                  /* m->log */
     int no_net, no_sound;
     int installer;            /* boot the ROM in DFU mode with the USB device port (installing macOS) */
+    /* The Linux machine (devices/linuxvirt.c, docs/linux-machine.md) instead of the virtual Mac when
+       linux_kernel is set: an uncompressed arm64 Image, an initrd (or NULL) and the kernel's command
+       line (NULL: the root file system on disk, /dev/vda). rom and aux are not used; the screen is a
+       display is virtio-gpu preferring fb_width x fb_height (0: 1280 x 800), or with HV_LINUX_FB set in the
+       environment a framebuffer that size; hv_vm_boot_display hands either out. */
+    const char *linux_kernel, *linux_initrd, *linux_cmdline;
+    uint32_t fb_width, fb_height;
     /* What the guest says it is (NULL: the vmapple defaults). serial, model and
        soc_name go through the config region; product_name and model_id are fixed
        up in the device tree while iBoot runs, which hardcodes them (dt_fixup.c).
@@ -28,7 +35,7 @@ typedef struct HvVmConfig {
     const char *product_name, *model_id;
     /* JIT memory the host already has (iOS: granted by a debugger), or NULL to map it here. */
     void *jit_rx, *jit_rw;
-    size_t jit_bytes;         /* 0: 768 MB */
+    size_t jit_bytes;         /* 0: 1536 MB */
 } HvVmConfig;
 
 /* Returns 0, or -1 with a reason in err. */
@@ -43,7 +50,12 @@ extern void (*hv_prof_register)(void); /* debugging: each thread that will run g
 /* Frames go to this CAMetalLayer, drawn by the GPU, instead of hv_vm_boot_display. */
 void hv_vm_set_display_layer(void *layer);
 uint64_t hv_vm_gpu_frames(void);
+/* The Linux machine's display: screen updates, 3D command buffers and their bytes so far (0s for a Mac).
+   Not hv_vm_gpu_frames, which says the Mac's GPU has taken over the display. */
+void hv_vm_linux_stats(uint64_t out[3]);
 int hv_vm_ncpus(void);
+/* The machine is the Linux one (HvVmConfig.linux_kernel): no saving it (instant resume) yet. */
+int hv_vm_is_linux(void);
 
 /* The boot framebuffer iBoot hands the kernel (XNU's boot_args video info):
    the Apple logo and progress bar while booting or installing, before a GPU
@@ -52,6 +64,7 @@ int hv_vm_ncpus(void);
 typedef struct HvBootDisplay {
     const uint8_t *pixels;
     uint32_t width, height, stride;
+    int owned; /* pixels is a copy made for the caller, to free() (the Linux machine's GPU screen) */
 } HvBootDisplay;
 int hv_vm_boot_display(HvBootDisplay *d);
 
@@ -106,6 +119,10 @@ void hv_vm_mouse_hwheel(int dx);
 void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
 void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void hv_vm_touch_button(int down); /* the pad's full press (a click) */
+/* The absolute pointer on the USB bus: put the guest's pointer at x, y, each 0..1 across its screen. */
+void hv_vm_pointer_at(double x, double y);
+/* Draw the pointer at x, y (0..1 across the screen) instead of where the guest has it; negative: the guest's place again. */
+void hv_vm_cursor_at(double x, double y);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

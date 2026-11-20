@@ -148,6 +148,10 @@ int henge_vm_pause(char *err, size_t errlen) {
 }
 
 int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen) {
+    if (hv_vm_is_linux()) { /* host/snapshot.c saves the virtual Mac's devices */
+        snprintf(err, errlen, "Saving a Linux machine is not supported yet.");
+        return -1;
+    }
     pthread_rwlock_rdlock(&api_lock);
     if (state != 4) {
         pthread_rwlock_unlock(&api_lock);
@@ -188,7 +192,7 @@ int henge_vm_continue(void) {
 
 static int boot_or_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
                           int cpus, const char *resume, const char *ident, char *err, size_t errlen) {
-    { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
+    { extern void hv_prof_ios_start(void), hv_fault_bench(void), hv_log_va_range(void); hv_log_va_range(); hv_fault_bench(); hv_prof_ios_start(); }
     if (begin_start(err, errlen)) return -1;
     HengeDualMapping *jit = henge_ios_jit_get_mapping();
     if (!jit || !jit->rw_addr) {
@@ -215,6 +219,27 @@ static int boot_or_resume(const char *rom, const char *disk, const char *aux, ui
     if (getenv("HV_STATS")) hv_vm_machine()->stats_interval = atoi(getenv("HV_STATS"));
     return started(err, errlen);
 }
+
+int henge_vm_boot_linux(const char *kernel, const char *initrd, const char *cmdline, const char *disk, uint64_t ram_mb,
+                        int cpus, uint32_t fb_width, uint32_t fb_height, char *err, size_t errlen) {
+    { extern void hv_prof_ios_start(void); hv_prof_ios_start(); }
+    if (begin_start(err, errlen)) return -1;
+    HengeDualMapping *jit = henge_ios_jit_get_mapping();
+    if (!jit || !jit->rw_addr) {
+        snprintf(err, errlen, "Henge has no JIT region. Turn on JIT first.");
+        return failed_start();
+    }
+    HvVmConfig c = {.disk = disk, .ram_mb = ram_mb, .ncpus = cpus, .log = 1, .linux_kernel = kernel,
+                    .linux_initrd = initrd && *initrd ? initrd : NULL, .linux_cmdline = cmdline, .fb_width = fb_width,
+                    .fb_height = fb_height, .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
+    fprintf(stderr, "henge: booting Linux with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
+            jit->size >> 20);
+    if (hv_vm_create(&c, err, errlen) != 0) return failed_start();
+    if (getenv("HV_STATS")) hv_vm_machine()->stats_interval = atoi(getenv("HV_STATS"));
+    return started(err, errlen);
+}
+
+int henge_vm_is_linux(void) { return hv_vm_is_linux(); }
 
 static volatile int install_step = -1;
 static volatile double install_progress;
@@ -438,10 +463,28 @@ void henge_vm_touch_button(int down) {
     hv_vm_touch_button(down);
     pthread_rwlock_unlock(&api_lock);
 }
+extern int hv_pvg_cursor_hidden;
+void henge_vm_hide_cursor(int hidden) {
+    __atomic_store_n(&hv_pvg_cursor_hidden, hidden ? 1 : 0, __ATOMIC_RELEASE);
+}
+void henge_vm_cursor_at(double x, double y) {
+    hv_vm_cursor_at(x, y); /* only a stored place and a redraw request: safe whether or not a Mac runs */
+}
+void henge_vm_pointer_at(double x, double y) {
+    if (!lock_running()) return;
+    hv_vm_pointer_at(x, y);
+    pthread_rwlock_unlock(&api_lock);
+}
 void henge_vm_set_display_layer(void *layer) {
     /* vm.c serializes this with unpublishing the old display before free.
        Main-thread layer detachment need not wait for disk/GPU teardown. */
     hv_vm_set_display_layer(layer);
+}
+void henge_vm_linux_stats(uint64_t *out) {
+    out[0] = out[1] = out[2] = 0;
+    if (!lock_running()) return;
+    hv_vm_linux_stats(out);
+    pthread_rwlock_unlock(&api_lock);
 }
 uint64_t henge_vm_gpu_frames(void) {
     if (!lock_running()) return 0;
@@ -455,9 +498,9 @@ int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *
     int result = -1;
     if (hv_vm_boot_display(&d) == 0) {
         size_t bytes = (size_t)d.stride * d.height;
-        uint8_t *copy = malloc(bytes);
+        uint8_t *copy = d.owned ? (uint8_t *)d.pixels : malloc(bytes); /* the GPU screen is already a copy */
         if (copy) {
-            memcpy(copy, d.pixels, bytes);
+            if (!d.owned) memcpy(copy, d.pixels, bytes);
             *pixels = copy;
             *width = (int)d.width;
             *height = (int)d.height;

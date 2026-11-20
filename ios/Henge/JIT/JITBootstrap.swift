@@ -69,7 +69,7 @@ enum JITBootstrap {
         : Entitlements.memoryLimitAtLaunch >= 3_500 << 20 ? 1024 : 512
     static let jitBytes: Int = {
         switch (UserDefaults.standard.object(forKey: codeCacheKey) as? Int) ?? defaultCodeCacheMB {
-        case 1536: return 1536 << 20
+        case 1536, 2048: return 1536 << 20 // 2 GB was offered briefly: no room for it below 0x7000000000, JIT failed
         case 512: return 512 << 20
         default: return 1024 << 20
         }
