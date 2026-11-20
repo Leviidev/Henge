@@ -14,6 +14,7 @@
 #define CFG_ID_DEVIDS 0x03
 #define CFG_PROP_BITS 0x10
 #define CFG_EV_BITS 0x11
+#define CFG_ABS_INFO 0x12
 
 static void set_bit(uint8_t *bits, unsigned n) {
     bits[n / 8] |= (uint8_t)(1u << (n % 8));
@@ -26,10 +27,10 @@ static void answer(HvVirtioInput *d) {
     uint8_t *data = c + 8;
     memset(c + 2, 0, 6 + 128);
     uint32_t size = 0;
-    int kbd = d->kind == HV_VINPUT_KEYBOARD;
+    int kbd = d->kind == HV_VINPUT_KEYBOARD, tablet = d->kind == HV_VINPUT_TABLET;
     switch (select) {
     case CFG_ID_NAME: {
-        const char *name = kbd ? "HengeVM Keyboard" : "HengeVM Mouse";
+        const char *name = kbd ? "HengeVM Keyboard" : tablet ? "HengeVM Tablet" : "HengeVM Mouse";
         size = (uint32_t)strlen(name);
         memcpy(data, name, size);
         break;
@@ -41,14 +42,14 @@ static void answer(HvVirtioInput *d) {
     case CFG_ID_DEVIDS: { /* bustype BUS_VIRTUAL, vendor, product, version */
         /* AppleVirtIOInputKeyboard always says vendor Apple (0x5ac) and takes the
            product from here; HV_KBD_PRODUCT tries others (experiment). */
-        uint16_t prod = (uint16_t)(kbd ? (getenv("HV_KBD_PRODUCT") ? atoi(getenv("HV_KBD_PRODUCT")) : 1) : 2);
+        uint16_t prod = (uint16_t)(kbd ? (getenv("HV_KBD_PRODUCT") ? atoi(getenv("HV_KBD_PRODUCT")) : 1) : tablet ? 3 : 2);
         uint16_t ids[4] = {0x06, 0x0627, prod, 1};
         memcpy(data, ids, sizeof ids);
         size = sizeof ids;
         break;
     }
     case CFG_PROP_BITS:
-        if (!kbd) {
+        if (!kbd && !tablet) { /* the tablet says none, as QEMU's: Linux takes it for an absolute mouse */
             data[0] = 1; /* INPUT_PROP_POINTER */
             size = 1;
         }
@@ -62,12 +63,23 @@ static void answer(HvVirtioInput *d) {
             set_bit(data, HV_BTN_RIGHT);
             set_bit(data, HV_BTN_MIDDLE);
             size = HV_BTN_MIDDLE / 8 + 1;
-        } else if (!kbd && subsel == HV_EV_REL) {
+        } else if (tablet && subsel == HV_EV_ABS) {
+            set_bit(data, HV_ABS_X);
+            set_bit(data, HV_ABS_Y);
+            size = 1;
+        } else if (!kbd && !tablet && subsel == HV_EV_REL) {
             set_bit(data, HV_REL_X);
             set_bit(data, HV_REL_Y);
             set_bit(data, HV_REL_HWHEEL);
             set_bit(data, HV_REL_WHEEL);
             size = 2;
+        }
+        break;
+    case CFG_ABS_INFO: /* min, max, fuzz, flat, res */
+        if (tablet && (subsel == HV_ABS_X || subsel == HV_ABS_Y)) {
+            uint32_t info[5] = {0, HV_TABLET_MAX, 0, 0, 0};
+            memcpy(data, info, sizeof info);
+            size = sizeof info;
         }
         break;
     default:

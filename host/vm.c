@@ -1,4 +1,7 @@
 #include "vm.h"
+#include "linuxvirt.h"
+#include "vgpu_metal.h"
+#include "vgpu_virgl.h"
 #include "pvg_lite.h"
 
 #include <TargetConditionals.h>
@@ -15,6 +18,7 @@
 #include <time.h>
 
 #include "usb_host.h"
+#include "window.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -29,6 +33,14 @@ static HvMachine m;
 static HvCpu cpus[HV_MAX_CPUS]; /* the board takes them as an array */
 static int ncpus = 1;
 static HvVmapple board = {.ram_fd = -1};
+/* The Linux machine (devices/linuxvirt.c), when that is what runs: its devices are in board. */
+static HvLinuxVirt linux_vm;
+static int linux_mode;
+static _Atomic(uint8_t *) linux_fb; /* published only when the machine is ready, like display_pvg */
+static _Atomic(HvVirtioGpu *) linux_gpu; /* the same, for its virtio-gpu */
+static HvVgpu3d linux_gl;           /* its 3D renderer (virgl on ANGLE), when the app was built with one */
+static HvVgpuVirgl *linux_virgl;
+static HvVgpuMetal *linux_metal; /* its screen on the display's layer (devices/vgpu_metal.m); display_lock */
 static _Atomic int input_stopping = 1;
 static void stop_pointer(void);
 /* UI display changes may arrive before or during the background machine creation. */
@@ -63,11 +75,28 @@ HvMachine *hv_vm_machine(void) { return &m; }
 HvVmapple *hv_vm_board(void) { return &board; }
 HvCpu *hv_vm_cpu(int index) { return index >= 0 && index < ncpus ? &cpus[index] : NULL; }
 int hv_vm_ncpus(void) { return ncpus; }
+int hv_vm_is_linux(void) { return machine_created && linux_mode; }
 
 /* arm64 boot_args: {u16 Revision, u16 Version, u64 virtBase, physBase, memSize,
    topOfKernelData, Video {baseAddr, display, rowBytes, width, height, depth}, ...}.
    Found by scanning page starts for one whose physBase is the RAM base. */
 int hv_vm_boot_display(HvBootDisplay *d) {
+    /* The Linux machine's screen is its simple-framebuffer: a8r8g8b8 is BGRA in memory, as here. */
+    d->owned = 0;
+    HvVirtioGpu *gpu = atomic_load_explicit(&linux_gpu, memory_order_acquire);
+    if (gpu) { /* what Linux's GPU driver scans out, with its pointer drawn in */
+        uint8_t *shot;
+        uint32_t w, h;
+        if (hv_virtio_gpu_snapshot(gpu, &shot, &w, &h) != 0) return -1;
+        d->pixels = shot, d->width = w, d->height = h, d->stride = w * 4, d->owned = 1;
+        return 0;
+    }
+    uint8_t *fb = atomic_load_explicit(&linux_fb, memory_order_acquire);
+    if (fb) {
+        d->pixels = fb;
+        d->width = linux_vm.fb_width, d->height = linux_vm.fb_height, d->stride = linux_vm.fb_width * 4;
+        return 0;
+    }
     /* What the guest's GPU has drawn, once it has drawn anything. */
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
     if (!pvg) return -1;
@@ -151,15 +180,16 @@ static int fail(char *err, size_t n, const char *msg) {
    there, for a crash report cannot. */
 static struct sigaction prior_ill, prior_bus, prior_segv;
 static void on_ill(int sig, siginfo_t *info, void *ctx) {
+    if (sig != SIGILL && hv_window_signal(&m, info, ctx)) return; /* a user page entering the window (window.c) */
     ucontext_t *uc = ctx;
     uint64_t pc = uc->uc_mcontext->__ss.__pc, rx = (uint64_t)(uintptr_t)m.jit.base, size = (uint64_t)m.jit.capacity * 4;
-    uint64_t used = (uint64_t)m.jit.used * 4;
+    uint64_t used = (uint64_t)hv_jit_extent(&m.jit) * 4;
     int in_rx = pc >= rx && pc < rx + size;
     int fetch = (uint64_t)(uintptr_t)info->si_addr == pc;
     if (sig == SIGILL || in_rx || fetch) {
-        fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, lr %llx, addr %p\n",
+        fprintf(stderr, "hengevm: signal %d in translated code: pc %llx (rx %llx size %llx used %llx, pc is rx%+lld), full flushes %llu, evictions %llu, lr %llx, addr %p\n",
                 sig, (unsigned long long)pc, (unsigned long long)rx, (unsigned long long)size, (unsigned long long)used, (long long)(pc - rx),
-                (unsigned long long)m.stats.block_flushes, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
+                (unsigned long long)m.stats.block_flushes, (unsigned long long)m.stats.evictions, (unsigned long long)uc->uc_mcontext->__ss.__lr, info->si_addr);
         for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%llx%c", i, (unsigned long long)uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? '\n' : ' ');
         fprintf(stderr, "\n");
         fprintf(stderr, "sp=%llx ram %llx size %llx\n", (unsigned long long)uc->uc_mcontext->__ss.__sp, (unsigned long long)(uintptr_t)board.ram, (unsigned long long)board.ram_size);
@@ -243,11 +273,22 @@ void hv_vm_set_display_layer(void *layer) {
     display_layer_set = 1;
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
     if (pvg) hv_pvg_lite_set_layer(pvg, layer);
+    if (linux_metal) hv_vgpu_metal_set_layer(linux_metal, layer);
     os_unfair_lock_unlock(&display_lock);
     if (previous) CFRelease(previous);
 }
 
+void hv_vm_linux_stats(uint64_t out[3]) {
+    hv_virtio_gpu_stats(atomic_load_explicit(&linux_gpu, memory_order_acquire), out);
+}
+
 uint64_t hv_vm_gpu_frames(void) {
+    /* A Linux machine's screen drawn on the layer: the display switches to the layer once there is a frame. */
+    os_unfair_lock_lock(&display_lock);
+    uint64_t linux_frames = linux_metal ? hv_vgpu_metal_frames(linux_metal) : 0;
+    int is_linux = linux_metal != NULL;
+    os_unfair_lock_unlock(&display_lock);
+    if (is_linux) return linux_frames;
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
     return pvg ? hv_pvg_lite_gpu_frames(pvg) : 0;
 }
@@ -258,7 +299,9 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         pthread_join(primary_thread, NULL);
         primary_started = 0;
     }
-    if (!c->rom || !c->disk || !c->aux) return fail(err, errlen, "The ROM, disk and auxiliary storage are all needed.");
+    linux_mode = c->linux_kernel != NULL;
+    if (linux_mode && !c->disk) return fail(err, errlen, "The Linux machine needs its disk.");
+    if (!linux_mode && (!c->rom || !c->disk || !c->aux)) return fail(err, errlen, "The ROM, disk and auxiliary storage are all needed.");
     machine_created = 1;
     struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
     ill.sa_sigaction = on_ill;
@@ -269,32 +312,67 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
         signals_installed = 1;
     }
     signal(SIGPIPE, SIG_IGN); /* a guest connection closing at the far end must not end the machine */
+    fprintf(stderr, "henge: opening the disks\n");
     if (hv_disk_open(&disk, c->disk, 0, 0) != 0) return fail(err, errlen, "Cannot open the disk image.");
-    if (hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
+    if (!linux_mode && hv_disk_open(&aux, c->aux, c->aux_offset ? c->aux_offset : 16384, 0) != 0)
         return fail(err, errlen, "Cannot open the auxiliary storage.");
-    size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)768 << 20;
+    size_t jit = c->jit_bytes ? c->jit_bytes : (size_t)1536 << 20; /* engine default code cache: 1536 MB; smaller defaults evict and retranslate through the boot translation storm */
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot set up the JIT region.");
     m.log = c->log;
     m.gen_checks = getenv("HV_JIT_POISON") != NULL;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1; /* debugging: every load and store through the helper */
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
+    fprintf(stderr, "henge: machine set up, %d CPUs\n", ncpus);
+    hv_window_reserve(&m, ncpus); /* HV_EL0_WINDOW: before any CPU resets (each takes its window then) */
     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK"); /* debugging: one CPU in guest code at a time */
     HvCfgParams cfg = {.nr_cpus = (uint32_t)ncpus, .ecid = c->ecid, .seed = c->seed, .mac_en0 = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01},
                        .serial = c->serial, .model = c->model, .soc_name = c->soc_name};
     if (c->installer) cfg.run_installer1 = cfg.run_installer2 = 1;
+    /* The chip About This Mac names (31 characters), when the host has a name for it. */
+    if (getenv("HV_SOC_NAME") && *getenv("HV_SOC_NAME")) cfg.soc_name = getenv("HV_SOC_NAME");
     if (getenv("HV_RUN_INSTALLER")) { /* experiment: "a,b" for the two installer words */
         unsigned a = 0, b2 = 0;
         sscanf(getenv("HV_RUN_INSTALLER"), "%u,%u", &a, &b2);
         cfg.run_installer1 = a, cfg.run_installer2 = b2;
     }
+    fprintf(stderr, "henge: building the board\n");
     static const uint8_t mac[6] = {0x02, 0x48, 0x56, 0x4d, 0x00, 0x01};
-    if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
-        return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
-    if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
-    hv_vmapple_reset_cpu(&board);
-    dt_fixup_on = !c->installer && hv_dt_fixup_start(board.ram, board.ram_size, VMAPPLE_MEM, c->product_name, c->model_id);
-    if (dt_fixup_on) hv_dt_fixup_run();
+    if (linux_mode) {
+        /* devices/linuxvirt.c: a real Linux kernel on the same engine and devices, the virtual Mac's
+           board holding them so input, disk, network and sound below serve it unchanged. */
+        uint64_t ram = (c->ram_mb ? c->ram_mb : 2048) << 20;
+        memset(&board, 0, sizeof board);
+        board.ram_fd = -1;
+        if (hv_vmapple_alloc_ram(&board, ram) != 0) return fail(err, errlen, "Not enough memory for the guest's RAM.");
+        /* .usb: the xHCI controller's transfer events confuse Linux's driver (docs/linux-machine.md): off for now. */
+        HvLinuxVirtConfig lc = {.ncpus = ncpus, .ram_size = ram, .disk = &disk, .mac = mac, .usb = 0, .sound = !c->no_sound,
+                                .gpu = !getenv("HV_LINUX_FB"),
+                                .fb_width = c->fb_width ? c->fb_width : 1280, .fb_height = c->fb_height ? c->fb_height : 800,
+                                .cmdline = c->linux_cmdline && *c->linux_cmdline ? c->linux_cmdline
+                                                                                 : "console=tty0 console=ttyAMA0 root=/dev/vda rw rootwait"};
+        /* 3D: virgl, on ANGLE (Metal) in the app; none without the GPU libraries (ios/scripts/build-gpu-deps.sh). */
+        if (lc.gpu && !getenv("HV_LINUX_NO_3D") && (linux_virgl = hv_vgpu_virgl_create(&linux_gl, 1))) lc.gl = &linux_gl;
+        if (hv_linuxvirt_create(&linux_vm, &board, &m, cpus, &lc) != 0)
+            return fail(err, errlen, "Cannot build the Linux machine (not enough memory for the guest's RAM?).");
+        hv_vgpu_virgl_bind(linux_virgl, linux_vm.gpu);
+        /* The screen drawn by the GPU on the display's layer, 3D scanouts as their own textures; HV_LINUX_NO_METAL:
+           copied into an image for BootDisplay instead, as before. */
+        HvVgpuMetal *metal = linux_vm.gpu && !getenv("HV_LINUX_NO_METAL") ? hv_vgpu_metal_create(linux_vm.gpu) : NULL;
+        os_unfair_lock_lock(&display_lock);
+        linux_metal = metal;
+        os_unfair_lock_unlock(&display_lock);
+        if (hv_linuxvirt_boot_files(&linux_vm, &lc, c->linux_kernel, c->linux_initrd, err, errlen) != 0) return -1;
+        fprintf(stderr, "hengevm: Linux machine, %d CPUs, %llu MB, %ux%u screen (%s), kernel %s\n", ncpus,
+                (unsigned long long)(ram >> 20), lc.fb_width, lc.fb_height, !lc.gpu ? "framebuffer" : lc.gl ? "virtio-gpu, virgl 3D" : "virtio-gpu, 2D", c->linux_kernel);
+    } else {
+        if (hv_vmapple_create(&board, &m, cpus, (c->ram_mb ? c->ram_mb : 2048) << 20, &disk, &aux, &cfg, mac) != 0)
+            return fail(err, errlen, "Cannot build the machine (not enough memory for the guest's RAM?).");
+        if (hv_vmapple_load_rom(&board, c->rom) != 0) return fail(err, errlen, "Cannot read the ROM (AVPBooter.vmapple2.bin).");
+        hv_vmapple_reset_cpu(&board);
+        dt_fixup_on = !c->installer && hv_dt_fixup_start(board.ram, board.ram_size, VMAPPLE_MEM, c->product_name, c->model_id);
+        if (dt_fixup_on) hv_dt_fixup_run();
+    }
     if (board.net && !c->no_net) {
         if (hv_net_attach(&m, board.net) != 0) fprintf(stderr, "hengevm: user-mode network unavailable\n");
         else net_on = 1;
@@ -308,7 +386,10 @@ int hv_vm_create(const HvVmConfig *c, char *err, size_t errlen) {
     // never overwrite a monitor change made while the board was being built.
     os_unfair_lock_lock(&display_lock);
     if (display_layer_set && board.pvg) hv_pvg_lite_set_layer(board.pvg, (void *)display_layer);
+    if (display_layer_set && linux_metal) hv_vgpu_metal_set_layer(linux_metal, (void *)display_layer);
     atomic_store_explicit(&display_pvg, board.pvg, memory_order_release);
+    atomic_store_explicit(&linux_fb, linux_mode ? linux_vm.fb : NULL, memory_order_release);
+    atomic_store_explicit(&linux_gpu, linux_mode ? linux_vm.gpu : NULL, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
     atomic_store(&input_stopping, 0);
     return 0;
@@ -324,12 +405,24 @@ void hv_vm_destroy(void) {
        queued GPU work; completion callbacks still need the GIC and RAM. */
     os_unfair_lock_lock(&display_lock);
     atomic_store_explicit(&display_pvg, NULL, memory_order_release);
+    atomic_store_explicit(&linux_fb, NULL, memory_order_release);
+    atomic_store_explicit(&linux_gpu, NULL, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
     stop_pointer();
     hv_net_detach();
     net_on = 0;
     hv_audio_detach();
-    hv_vmapple_destroy(&board);
+    hv_vmapple_destroy(&board); /* the Linux machine's devices too: they are in board, but for its GPU */
+    os_unfair_lock_lock(&display_lock);
+    HvVgpuMetal *metal = linux_metal;
+    linux_metal = NULL;
+    os_unfair_lock_unlock(&display_lock);
+    hv_vgpu_metal_destroy(metal); /* before the GPU it reads the pointer from */
+    hv_virtio_gpu_destroy(linux_vm.gpu);
+    hv_vgpu_virgl_destroy(linux_virgl); /* after the GPU, which hands its resources back to it */
+    linux_virgl = NULL;
+    memset(&linux_vm, 0, sizeof linux_vm);
+    linux_mode = 0;
     hv_disk_close(&disk);
     hv_disk_close(&aux);
     hv_machine_free(&m);
@@ -386,7 +479,7 @@ void hv_vm_cpu_qos(void) {
     /* HV_QOS=ui|init|default (testing): the class the guest's CPUs run at. */
     const char *q = getenv("HV_QOS");
 #if TARGET_OS_IPHONE
-    qos_class_t c = QOS_CLASS_USER_INITIATED;
+    qos_class_t c = QOS_CLASS_USER_INTERACTIVE;
 #else
     qos_class_t c = QOS_CLASS_DEFAULT;
 #endif
@@ -394,6 +487,13 @@ void hv_vm_cpu_qos(void) {
     else if (q && !strcmp(q, "init")) c = QOS_CLASS_USER_INITIATED;
     else if (q && !strcmp(q, "default")) c = QOS_CLASS_DEFAULT;
     if (c != QOS_CLASS_DEFAULT) pthread_set_qos_class_self_np(c, 0);
+    static int qos_logged;
+    if (!__atomic_load_n(&qos_logged, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&qos_logged, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "henge: vCPU thread QoS: %s (from %s)\n",
+                c == QOS_CLASS_USER_INTERACTIVE ? "USER_INTERACTIVE" : c == QOS_CLASS_USER_INITIATED ? "USER_INITIATED" : "DEFAULT",
+                q ? "HV_QOS" : "default");
+    }
 }
 
 /* CPUs 1 and up: run whenever PSCI CPU_ON starts them; the machine stops with CPU 0. */
@@ -667,18 +767,115 @@ static void rctrl_hold(int *owner, int down) {
     os_unfair_lock_unlock(&rctrl_lock);
 }
 
+/* ---- Input for the Linux machine ----
+   Its USB controller is left out for now (Linux's xHCI driver and the emulated controller disagree about
+   transfer events), so keys go to the virtio keyboard and the iPhone trackpad's fingers drive the virtio
+   mouse: one finger moves the pointer, two scroll (content follows the fingers, as on iOS), a quick tap
+   clicks and a two-finger tap right-clicks. The press (volume buttons) is the left button. */
+#define LX_FINGERS 10
+static pthread_mutex_t lx_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { int id, x, y, lx, ly; } lx_finger[LX_FINGERS];
+static int lx_down, lx_tap_fingers, lx_tap_moved, lx_tap_travel, lx_acc_x, lx_acc_y, lx_acc_wheel, lx_acc_hwheel;
+static uint64_t lx_tap_ns;
+enum { LX_PTR_NUM = 24, LX_PTR_DEN = 100 }; /* pad units to pixels: a swipe across the pad is ~1.5 screens wide */
+enum { LX_WHEEL_UNITS = 220, LX_TAP_MS = 220, LX_TAP_SLOP = 160 };
+
+static void lx_key(uint16_t code, int down) {
+    if (!board.keyboard || !code) return;
+    hv_virtio_input_send(board.keyboard, HV_EV_KEY, code, down);
+    hv_virtio_input_send(board.keyboard, HV_EV_SYN, 0, 0);
+}
+
+static void lx_button(uint16_t button, int down) {
+    hv_virtio_input_send(board.mouse, HV_EV_KEY, button, down);
+    hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+}
+
+static void lx_touch(int id, int phase, int x, int y) {
+    pthread_mutex_lock(&lx_mu);
+    int i = 0;
+    while (i < lx_down && lx_finger[i].id != id) i++;
+    if (phase == 0 && i == lx_down && lx_down < LX_FINGERS) {
+        if (!lx_down) {
+            lx_tap_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+            lx_tap_fingers = 0, lx_tap_moved = 0, lx_tap_travel = 0;
+            lx_acc_x = lx_acc_y = lx_acc_wheel = lx_acc_hwheel = 0;
+        }
+        lx_finger[lx_down].id = id;
+        lx_finger[lx_down].x = lx_finger[lx_down].lx = x;
+        lx_finger[lx_down].y = lx_finger[lx_down].ly = y;
+        lx_down++;
+        if (lx_down > lx_tap_fingers) lx_tap_fingers = lx_down;
+    } else if (phase == 1 && i < lx_down) {
+        lx_finger[i].x = x, lx_finger[i].y = y;
+    } else if (phase == 2 && i < lx_down) {
+        lx_finger[i] = lx_finger[--lx_down];
+        if (!lx_down && !lx_tap_moved && clock_gettime_nsec_np(CLOCK_MONOTONIC) - lx_tap_ns < LX_TAP_MS * 1000000ull) {
+            uint16_t b = lx_tap_fingers >= 2 ? HV_BTN_RIGHT : HV_BTN_LEFT;
+            lx_button(b, 1);
+            lx_button(b, 0);
+        }
+    }
+    pthread_mutex_unlock(&lx_mu);
+}
+
+static void lx_touch_frame(void) {
+    pthread_mutex_lock(&lx_mu);
+    int n = lx_down, dx = 0, dy = 0;
+    for (int i = 0; i < n; i++) {
+        dx += lx_finger[i].x - lx_finger[i].lx, dy += lx_finger[i].y - lx_finger[i].ly;
+        lx_finger[i].lx = lx_finger[i].x, lx_finger[i].ly = lx_finger[i].y;
+    }
+    if (n) dx /= n, dy /= n;
+    lx_tap_travel += abs(dx) + abs(dy); /* a touch that travelled is a move or a scroll, not a tap */
+    if (lx_tap_travel > LX_TAP_SLOP) lx_tap_moved = 1;
+    if (n == 1 && (dx || dy)) {
+        lx_acc_x += dx * LX_PTR_NUM, lx_acc_y += dy * LX_PTR_NUM;
+        int px = lx_acc_x / LX_PTR_DEN, py = lx_acc_y / LX_PTR_DEN;
+        lx_acc_x -= px * LX_PTR_DEN, lx_acc_y -= py * LX_PTR_DEN;
+        if (px) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, px);
+        if (py) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_Y, py);
+        if (px || py) hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+    } else if (n >= 2 && (dx || dy)) {
+        lx_acc_wheel += dy, lx_acc_hwheel -= dx;
+        int w = lx_acc_wheel / LX_WHEEL_UNITS, h = lx_acc_hwheel / LX_WHEEL_UNITS;
+        lx_acc_wheel -= w * LX_WHEEL_UNITS, lx_acc_hwheel -= h * LX_WHEEL_UNITS;
+        if (w) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_WHEEL, w);
+        if (h) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_HWHEEL, h);
+        if (w || h) hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+    }
+    pthread_mutex_unlock(&lx_mu);
+}
+
 void hv_vm_key(uint16_t code, int down) {
-    if (code == LINUX_KEY_RIGHTCTRL) rctrl_hold(&rctrl_user, down);
+    if (linux_mode) lx_key(code, down);
+    else if (code == LINUX_KEY_RIGHTCTRL) rctrl_hold(&rctrl_user, down);
     else hv_xhci_key_linux(board.usb, code, down);
 }
 
 void hv_vm_key_hid(uint8_t usage, int down) {
-    if (usage == HID_RIGHT_CONTROL) rctrl_hold(&rctrl_user, down);
+    if (linux_mode) lx_key(hv_xhci_hid_to_linux(usage), down);
+    else if (usage == HID_RIGHT_CONTROL) rctrl_hold(&rctrl_user, down);
     else hv_xhci_key(board.usb, usage, down);
+}
+
+/* macOS wakes a sleeping display for the USB keyboard but not for pointer input (the virtio mouse or the
+   USB trackpad). While the guest hasn't presented a frame for 3 s (its display is likely asleep), pointer
+   input also taps F20, a key macOS leaves unbound, at most once every two seconds. */
+static void wake_display_for_pointer(int held) {
+    static uint64_t wake_sent_ns;
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    uint64_t last = pvg ? hv_pvg_lite_last_present_ns(pvg) : 0, now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (!last || held || now - last < 3000000000ull || now - wake_sent_ns < 2000000000ull) return;
+    wake_sent_ns = now;
+    fprintf(stderr, "hengevm: display asleep; pointer input tapped F20 to wake it\n");
+    hv_xhci_key(board.usb, 0x6f, 1);
+    hv_xhci_key(board.usb, 0x6f, 0);
 }
 
 static void move_now(void *ctx) {
     if (atomic_load(&input_stopping)) return;
+    wake_display_for_pointer(left_sent);
     int64_t packed = (int64_t)(intptr_t)ctx;
     int32_t dx = (int32_t)(packed >> 32), dy = (int32_t)packed;
     if (dx) hv_virtio_input_send(board.mouse, HV_EV_REL, HV_REL_X, dx);
@@ -746,12 +943,56 @@ void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms) {
     if (x > HV_TP_SENSOR_X) x = HV_TP_SENSOR_X;
     if (y < 0) y = 0;
     if (y > HV_TP_SENSOR_Y) y = HV_TP_SENSOR_Y;
+    if (linux_mode) {
+        lx_touch(id, phase, x, y);
+        return;
+    }
+    wake_display_for_pointer(0);
     hv_xhci_touch(board.usb, id, phase, x, y, ts_ms);
 }
 
-void hv_vm_touch_frame(uint32_t ts_ms) { hv_xhci_touch_frame(board.usb, ts_ms); }
+void hv_vm_touch_frame(uint32_t ts_ms) {
+    if (linux_mode) lx_touch_frame();
+    else hv_xhci_touch_frame(board.usb, ts_ms);
+}
 
-void hv_vm_touch_button(int down) { hv_xhci_touch_button(board.usb, down); }
+void hv_vm_touch_button(int down) {
+    if (linux_mode) lx_button(HV_BTN_LEFT, down);
+    else hv_xhci_touch_button(board.usb, down);
+}
+
+void hv_vm_pointer_at(double x, double y) {
+    if (linux_mode) { /* the tablet: Linux's pointer goes there */
+        if (x < 0) x = 0;
+        if (x > 1) x = 1;
+        if (y < 0) y = 0;
+        if (y > 1) y = 1;
+        hv_virtio_input_send(linux_vm.tablet, HV_EV_ABS, HV_ABS_X, (int32_t)(x * HV_TABLET_MAX + 0.5));
+        hv_virtio_input_send(linux_vm.tablet, HV_EV_ABS, HV_ABS_Y, (int32_t)(y * HV_TABLET_MAX + 0.5));
+        hv_virtio_input_send(linux_vm.tablet, HV_EV_SYN, 0, 0);
+        return;
+    }
+    hv_xhci_pointer(board.usb, (int)(x * HV_PTR_MAX + 0.5), (int)(y * HV_PTR_MAX + 0.5));
+}
+
+void hv_vm_cursor_at(double x, double y) {
+    if (linux_mode) { /* drawn where the iPhone's pointer is, at once (Madeira's way) */
+        hv_virtio_gpu_pointer_at(linux_vm.gpu, x, y);
+        return;
+    }
+    uint32_t at = 0xffffffff;
+    uint32_t mw = 0, mh = 0;
+    hv_pvg_lite_mode(&mw, &mh);
+    if (x >= 0 && y >= 0 && mw && mh) {
+        if (x > 1) x = 1;
+        if (y > 1) y = 1;
+        uint32_t px = (uint32_t)(x * (mw - 1) + 0.5), py = (uint32_t)(y * (mh - 1) + 0.5);
+        at = (px & 0xffff) | (py & 0xffff) << 16;
+    }
+    __atomic_store_n(&hv_pvg_cursor_at, at, __ATOMIC_RELEASE);
+    HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);
+    if (pvg) hv_pvg_lite_cursor_redraw(pvg);
+}
 
 int hv_vm_pointer(int *x, int *y) {
     HvPvgLite *pvg = atomic_load_explicit(&display_pvg, memory_order_acquire);

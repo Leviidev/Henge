@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* SEEK_DATA, SEEK_HOLE (tools/linux/make-ubuntu-disk.sh builds hvsparse on Linux) */
+#endif
 #include "hvsparse.h"
 
 #include <fcntl.h>

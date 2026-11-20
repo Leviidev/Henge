@@ -126,6 +126,37 @@ static const uint8_t tp_config_desc[34] = {
 
 static const char *const tp_strings[] = {NULL, "Apple Inc.", "Magic Trackpad 2", "HengeVM"};
 
+/* Port 3: an absolute pointer, QEMU's usb-tablet report without the wheels: three
+   buttons, then X and Y, 0..32767 across the screen. macOS takes any HID pointer with
+   absolute X/Y as one, with no driver. */
+
+static const uint8_t ptr_report_desc[] = {
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01,       /* usage page (generic desktop), usage (mouse), collection (application) */
+    0x09, 0x01, 0xa1, 0x00,                   /* usage (pointer), collection (physical) */
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, /* buttons 1-3 */
+    0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31,       /* X, Y */
+    0x15, 0x00, 0x26, 0xff, 0x7f, 0x35, 0x00, 0x46, 0xff, 0x7f, /* 0..32767 */
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x02,       /* data, variable, absolute */
+    0xc0, 0xc0,
+};
+
+static const uint8_t ptr_device_desc[18] = {
+    18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
+    0x27, 0x06, 0x01, 0x00,         /* QEMU's vendor ID, product 1 */
+    0x00, 0x01, 1, 2, 3, 1,         /* bcdDevice 1.00, strings 1-3, one configuration */
+};
+
+static const uint8_t ptr_config_desc[34] = {
+    9, 2, 34, 0, 1, 1, 0, 0xa0, 50,           /* one interface, remote wakeup, 100 mA */
+    9, 4, 0, 0, 1, 3, 0, 0, 0,                /* interface 0: HID, no boot protocol */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof ptr_report_desc, 0, /* HID 1.11, one report descriptor */
+    7, 5, 0x81, 3, 8, 0, 4,                   /* EP1 IN, interrupt, 8 bytes, every 4 ms */
+};
+
+static const char *const ptr_strings[] = {NULL, "HengeVM", "HengeVM USB Pointer", "1"};
+
 struct HvXhciDev {
     const char *const *strings;
     const uint8_t *device_desc;
@@ -136,6 +167,7 @@ struct HvXhciDev {
 static const struct HvXhciDev devs[HV_XHCI_DEVICES] = {
     {kbd_strings, kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_report_desc},
     {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
+    {ptr_strings, ptr_device_desc, ptr_config_desc, ptr_report_desc, sizeof ptr_report_desc},
 };
 
 static int xlog(void) {
@@ -373,7 +405,12 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
         src = tmp, len = 1;
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT: wValue is (type << 8) | report ID */
         if (x->slots[slot].dev == 0) src = x->state, len = 8;
-        else {
+        else if (x->slots[slot].dev == 2) {
+            pthread_mutex_lock(&x->mu);
+            memcpy(tmp, x->ptr_report, sizeof x->ptr_report);
+            pthread_mutex_unlock(&x->mu);
+            src = tmp, len = (int)sizeof x->ptr_report;
+        } else {
             int rtype = value >> 8, rid = value & 0xff;
             if (rtype == 3) { /* feature: the sensor-configuration registers */
                 if (rid == 0x01) { /* the header for the register just selected */
@@ -505,6 +542,18 @@ static void run_ep_in(HvXhci *x, int slot) {
             wr(x, buf, x->reports[x->rhead % HV_XHCI_REPORTS], n);
             x->rhead++;
             x->delivered++;
+            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+        }
+    } else if (s->dev == 2) {
+        while (x->ptr_pending && ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t n = want < sizeof x->ptr_report ? want : (uint32_t)sizeof x->ptr_report;
+            wr(x, buf, x->ptr_report, n);
+            x->ptr_pending = 0;
             transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
         }
     } else {
@@ -701,10 +750,10 @@ static void run_commands(HvXhci *x) {
 /* ---- ports ---- */
 
 /* Port 1 is the full-speed keyboard; port 2 is the high-speed trackpad, as the real
-   Magic Trackpad 2 is. */
+   Magic Trackpad 2 is; port 3 is the full-speed pointer. */
 static void port_connect(HvXhci *x) {
     for (int p = 0; p < HV_XHCI_PORTS; p++) {
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p == 1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
         port_event(x, p);
     }
 }
@@ -760,10 +809,17 @@ static void reset(HvXhci *x) {
     x->tp_db = 0;
     x->tp_multi_logs = 0;
     x->tp_f1_len = 0;
+    memset(x->ptr_report, 0, sizeof x->ptr_report);
+    x->ptr_pending = 0;
     for (int p = 0; p < HV_XHCI_PORTS; p++)
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p == 1 ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
     update_irq(x);
 }
+
+/* hv_xhci_spec_ports: the port count as the xHCI specification has it (the Linux machine). Not in HvXhci,
+   whose size instant resume checks; reset by hv_xhci_create, and one controller exists at a time. */
+static int spec_port_count;
+void hv_xhci_spec_ports(HvXhci *x, int on) { (void)x; spec_port_count = on; }
 
 static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
     HvXhci *x = d->opaque;
@@ -789,7 +845,10 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         if (size == 8 && i + 1 < 8) v |= (uint64_t)cap[i + 1] << 32;
         v >>= 8 * (off & 3);
     } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on every port */
-        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | ((1u << HV_XHCI_PORTS) - 1u) << 8, 0};
+        /* Dword 2 is compatible port offset (1) and count. The virtual Mac's has always said 7, which macOS
+           takes; Linux drops a range past MaxPorts and then finds no ports at all, so its machine gets 3. */
+        uint32_t count = spec_port_count ? HV_XHCI_PORTS : (1u << HV_XHCI_PORTS) - 1u;
+        const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | count << 8, 0};
         uint32_t i = (uint32_t)(off - XECP) / 4;
         v = ext[i];
         if (size == 8 && i + 1 < 4) v |= (uint64_t)ext[i + 1] << 32;
@@ -981,6 +1040,19 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
     if (code < 256) hv_xhci_key(x, linux_to_hid[code], down);
 }
 
+uint16_t hv_xhci_hid_to_linux(uint8_t usage) {
+    static uint16_t table[256];
+    static int made;
+    if (!__atomic_load_n(&made, __ATOMIC_ACQUIRE)) {
+        uint16_t t[256] = {0};
+        for (int code = 255; code > 0; code--) /* the lowest Linux code where two share a usage */
+            if (linux_to_hid[code]) t[linux_to_hid[code]] = (uint16_t)code;
+        memcpy(table, t, sizeof table);
+        __atomic_store_n(&made, 1, __ATOMIC_RELEASE);
+    }
+    return table[usage];
+}
+
 /* ---- the Magic Trackpad 2's reports ---- */
 
 /* Build the current report into out: a 12-byte prefix (report ID 2, the press,
@@ -1112,6 +1184,19 @@ void hv_xhci_touch_button(HvXhci *x, int down) {
     hv_machine_wake(x->m);
 }
 
+void hv_xhci_pointer(HvXhci *x, int px, int py) {
+    if (!x) return;
+    px = px < 0 ? 0 : px > HV_PTR_MAX ? HV_PTR_MAX : px;
+    py = py < 0 ? 0 : py > HV_PTR_MAX ? HV_PTR_MAX : py;
+    pthread_mutex_lock(&x->mu);
+    x->ptr_report[0] = 0;
+    x->ptr_report[1] = (uint8_t)px, x->ptr_report[2] = (uint8_t)(px >> 8);
+    x->ptr_report[3] = (uint8_t)py, x->ptr_report[4] = (uint8_t)(py >> 8);
+    x->ptr_pending = 1;
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
 void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
     for (int slot = 1; slot <= HV_XHCI_SLOTS; slot++)
@@ -1119,6 +1204,7 @@ void hv_xhci_poll(HvXhci *x) {
 }
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus) {
+    spec_port_count = 0;
     HvXhci *x = calloc(1, sizeof *x);
     x->m = m;
     pthread_mutex_init(&x->mu, NULL);
