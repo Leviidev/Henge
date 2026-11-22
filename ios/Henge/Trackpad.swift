@@ -16,9 +16,17 @@ import UIKit
 struct Trackpad: UIViewRepresentable {
     /// Four fingers tapped together: the session shows its hidden controls.
     static let revealTap = Notification.Name("henge.trackpad.revealTap")
+    /// Pointing (Settings): the surface is no trackpad but the Mac's screen. The pointer goes where a touch is,
+    /// through the absolute pointer (a USB tablet) the Mac also has. On by default on Apple Vision Pro, where
+    /// a look and a pinch touch the place looked at.
+    static let pointingKey = "henge.trackpad.pointing"
+    static var pointing: Bool { UserDefaults.standard.object(forKey: pointingKey) as? Bool ?? Device.isVision }
+
+    /// Where the Mac's screen is, in the surface's own coordinates (for pointing).
+    var screen: CGRect = .zero
 
     func makeUIView(context: Context) -> Surface { Surface() }
-    func updateUIView(_ view: Surface, context: Context) {}
+    func updateUIView(_ view: Surface, context: Context) { view.macScreen = screen }
 
     final class Surface: UIView, UIPointerInteractionDelegate {
         /// The emulated pad's sensor, in the Magic Trackpad 2's own units.
@@ -42,6 +50,21 @@ struct Trackpad: UIViewRepresentable {
         private var holdTimer: Timer?
         private let buzz = UIImpactFeedbackGenerator(style: .medium)
         private var tapsClick: Bool { VolumeClicks.inputMode == .touchscreen }
+
+        /* Pointing: the Mac's screen, here, and the state of the touch that points at it. */
+        var macScreen: CGRect = .zero
+        private var pointing = false            /* this gesture points (the setting when it began) */
+        private var points: [UITouch] = []
+        private var pressed = false             /* the left button is down: a press or a drag */
+        private var pressTimer: Timer?
+        private var scrolling = false           /* two hands: the gesture scrolls, and never clicks */
+        private var scrollFrom = CGPoint.zero
+        private var scrollLeft = CGPoint.zero   /* movement not yet sent as whole wheel steps */
+        private var pointAt = (x: Int32(0), y: Int32(0))
+        /* A pinch waits this long before it presses, so a second hand starting a scroll does not click first. */
+        private static let pressDelay: TimeInterval = 0.12
+        /* Points of hand movement for one wheel step. */
+        private static let scrollStep: CGFloat = 6
 
         override init(frame: CGRect) {
             super.init(frame: frame)
@@ -79,6 +102,8 @@ struct Trackpad: UIViewRepresentable {
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
             let touches = touches.filter { $0.type != .indirectPointer }
             guard !touches.isEmpty else { return }
+            if points.isEmpty && fingers.isEmpty { pointing = Trackpad.pointing && macScreen.width > 0 }
+            if pointing { pointBegan(touches); return }
             if fingers.isEmpty {
                 started = Date()
                 travelled = 0
@@ -110,6 +135,7 @@ struct Trackpad: UIViewRepresentable {
         }
 
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            if pointing { pointMoved(); return }
             var moved = false
             let ts = Self.ms(event?.timestamp ?? touches.first?.timestamp ?? 0)
             for t in touches where t.type != .indirectPointer {
@@ -127,8 +153,105 @@ struct Trackpad: UIViewRepresentable {
             if moved { henge_vm_touch_frame(ts) }
         }
 
-        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { lift(touches) }
-        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { lift(touches) }
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            if pointing { pointEnded(touches, cancelled: false) } else { lift(touches) }
+        }
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            if pointing { pointEnded(touches, cancelled: true) } else { lift(touches) }
+        }
+
+        // MARK: Pointing
+
+        /// A place on the surface as the tablet's coordinates on the Mac's screen (0...32767 each way).
+        private func tablet(_ p: CGPoint) -> (x: Int32, y: Int32) {
+            let s = macScreen
+            let nx = min(max((p.x - s.minX) / max(s.width, 1), 0), 1)
+            let ny = min(max((p.y - s.minY) / max(s.height, 1), 0), 1)
+            return (Int32(nx * 32767), Int32(ny * 32767))
+        }
+
+        private func centroid() -> CGPoint {
+            let ps = points.map { $0.location(in: self) }
+            guard !ps.isEmpty else { return .zero }
+            return CGPoint(x: ps.map(\.x).reduce(0, +) / CGFloat(ps.count), y: ps.map(\.y).reduce(0, +) / CGFloat(ps.count))
+        }
+
+        /// One touch points, clicks and drags; a second one (the other hand) turns the gesture into scrolling.
+        private func pointBegan(_ touches: Set<UITouch>) {
+            if points.isEmpty {
+                started = Date()
+                travelled = 0
+                scrolling = false
+                scrollLeft = .zero
+            }
+            points.append(contentsOf: touches.filter { t in !points.contains(t) })
+            if points.count == 1, let t = points.first {
+                pointAt = tablet(t.location(in: self))
+                henge_vm_tablet(pointAt.x, pointAt.y, 0) /* the pointer jumps to where the touch is */
+                pressTimer?.invalidate()
+                let timer = Timer(timeInterval: Self.pressDelay, repeats: false) { [weak self] _ in
+                    guard let self, self.points.count == 1, !self.scrolling, !self.pressed else { return }
+                    self.pressed = true
+                    henge_vm_tablet(self.pointAt.x, self.pointAt.y, 1)
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                pressTimer = timer
+            } else if points.count >= 2 && !scrolling {
+                pressTimer?.invalidate()
+                if pressed { /* a drag had begun: let go where it is, then scroll */
+                    pressed = false
+                    henge_vm_tablet(pointAt.x, pointAt.y, 0)
+                }
+                scrolling = true
+                scrollFrom = centroid()
+            }
+        }
+
+        private func pointMoved() {
+            if scrolling {
+                let c = centroid()
+                travelled += abs(c.x - scrollFrom.x) + abs(c.y - scrollFrom.y)
+                /* The content follows the hands, as macOS's natural scrolling (its default) shows a wheel's steps:
+                   hands up is the wheel up. */
+                scrollLeft.x += c.x - scrollFrom.x
+                scrollLeft.y += scrollFrom.y - c.y
+                scrollFrom = c
+                let dx = Int32(scrollLeft.x / Self.scrollStep), dy = Int32(scrollLeft.y / Self.scrollStep)
+                if dx != 0 || dy != 0 {
+                    scrollLeft.x -= CGFloat(dx) * Self.scrollStep
+                    scrollLeft.y -= CGFloat(dy) * Self.scrollStep
+                    henge_vm_tablet_scroll(dx, dy)
+                }
+            } else if let t = points.first {
+                let now = t.location(in: self), before = t.previousLocation(in: self)
+                travelled += abs(now.x - before.x) + abs(now.y - before.y)
+                pointAt = tablet(now)
+                henge_vm_tablet(pointAt.x, pointAt.y, pressed ? 1 : 0)
+            }
+        }
+
+        private func pointEnded(_ touches: Set<UITouch>, cancelled: Bool) {
+            points.removeAll { touches.contains($0) }
+            guard points.isEmpty else { return } /* a hand still pinches: the gesture goes on */
+            pressTimer?.invalidate()
+            pressTimer = nil
+            let quick = Date().timeIntervalSince(started) < Self.tapTime
+            let still = travelled < Self.tapDistance
+            if pressed {
+                pressed = false
+                henge_vm_tablet(pointAt.x, pointAt.y, 0)
+            } else if scrolling {
+                if quick && still && !cancelled { /* both hands, briefly: a right click where the first one pointed */
+                    henge_vm_tablet(pointAt.x, pointAt.y, 2)
+                    henge_vm_tablet(pointAt.x, pointAt.y, 0)
+                }
+            } else if !cancelled { /* let go before the press: a click */
+                henge_vm_tablet(pointAt.x, pointAt.y, 1)
+                henge_vm_tablet(pointAt.x, pointAt.y, 0)
+            }
+            scrolling = false
+            StickyKeys.shared.releaseAll()
+        }
 
         private func lift(_ touches: Set<UITouch>) {
             var lifted: [Int32] = []
