@@ -23,11 +23,13 @@ Where the Vision Pro work stands, and what comes next. The tools and the measure
 Underway. With a Mac giving JIT at each launch:
 
 - [x] Install macOS (Sequoia 15.6.1)
-- [ ] First boot and Setup Assistant
+- [x] First boot, to Setup Assistant (8 GB of guest RAM, held outside Henge's footprint)
+- [ ] Through Setup Assistant
 - [ ] The desktop, Safari, and an app such as Discord
-- [ ] **Input in compatibility mode.** This is the main unknown. A look and pinch reaches an iPad app as a
-      single touch, so the trackpad surface's two-finger scrolling and the Mac's gestures may not
-      happen. Check a Bluetooth keyboard and Magic Trackpad too.
+- [x] **Input in compatibility mode.** A look and pinch reaches an iPad app as one touch a hand, so the
+      trackpad surface's gestures, and the four-finger tap that shows hidden controls, can't happen.
+      Pointing (step 3) and an eye button for the hidden controls make it usable, though still awkward.
+- [ ] A Bluetooth keyboard and Magic Trackpad
 - [ ] Performance, heat and battery over a longer session
 - [ ] What compatibility mode lacks: no volume buttons (`VolumeClicks.swift` has nothing to read), no
       haptics, no external display. Note the Mac's screen size and how the window resizes.
@@ -62,12 +64,16 @@ If this works, a Vision Pro user needs no Mac after the first pairing.
 
 Useful in compatibility mode already, so probably before step 4.
 
-- [ ] An **absolute pointer** for the guest: a USB HID tablet on the xHCI bus (`devices/xhci.c`), the idea
-      behind QEMU's `usb-tablet`, which macOS supports out of the box. Then a look and pinch clicks where
-      you look, and pinch and drag drags. The guest has only a relative mouse (`devices/virtio_input.c`)
-      and the Magic Trackpad 2 today. This is an engine change, and the iPad's touch mode could use it too.
-- [ ] Scrolling, and the Mac's gestures (Mission Control, Spaces) from visionOS's own gestures, or from
-      controls beside the window.
+- [x] An **absolute pointer** for the guest: a USB HID tablet on port 3 of the xHCI bus (`devices/xhci.c`,
+      `tests/test_xhci.c`), as QEMU's `usb-tablet` is. macOS drives it with its own HID driver.
+- [x] **Pointing** (Settings › Touch, on by default on the headset, `Trackpad.swift`). A look and a pinch
+      clicks where you look, pinch and move drags, both hands moving together scroll, and a brief pinch
+      with both right-clicks.
+- [ ] Make it comfortable. It works but is still awkward: tune the press delay, the drag threshold and the
+      scroll speed, and try visionOS's hover feedback in the native version, where the app can tell
+      where you are looking before you pinch.
+- [ ] The Mac's gestures (Mission Control, Spaces), which pointing gives up, from controls beside the
+      window or visionOS's own gestures.
 - [ ] A keyboard row (Esc, Tab, Control, Option, Command) that works without the iPhone's
       `inputAccessoryView`.
 
@@ -104,6 +110,48 @@ limiting.
 - [ ] The keyboard row as an ornament, and the `#available(iOS 26, *)` checks that decide JIT behaviour
       (`JITBootstrap.swift`, `JITBuiltIn.swift`, `JITPairing.swift`) checked on visionOS
 - [ ] Later: a large immersive screen through CompositorServices
+
+## 5. Mac windows as visionOS windows
+
+The goal: each macOS window floats in its own visionOS window, so Mac apps sit in the room almost like
+native ones. This is what Parallels' Coherence, VMware's Unity and VirtualBox's Seamless mode do: a helper in
+the guest says where each window is, and the host shows each one by itself. It needs the native version
+(step 4), where each window can be its own SwiftUI `WindowGroup` scene with its own size and ornaments.
+
+**The virtual Mac:**
+- [ ] **The window list.** `tools/henge-agent.m` already runs in macOS and long-polls `host/share.c` at
+      `10.0.2.4` for the clipboard. A `/.henge/windows` endpoint would carry each window's ID, owner app,
+      position, size and stacking order (`CGWindowListCopyWindowInfo`; titles need the Screen Recording
+      permission).
+- [ ] **One window, cut out.** Henge already renders the Mac's whole screen with Metal (`devices/pvg_metal.m`),
+      so showing a window means copying its rectangle into its own visionOS window: a GPU copy each frame,
+      and only window positions cross the network.
+- [ ] **No overlaps.** A copied rectangle shows whatever is on top there, so the agent manages the windows:
+      the Mac gets a large screen (5K, say), and the agent keeps its windows side by side, each the size of
+      its visionOS window, through the Accessibility API (`AXUIElement`, a one-time permission). Resizing a
+      visionOS window resizes its Mac window.
+- [ ] **Input and focus.** A pinch in a visionOS window becomes a tablet position inside that window's
+      rectangle (step 3's absolute pointer is what makes this simple). Focusing a visionOS window has the
+      agent raise and activate its Mac window, so the keyboard goes there.
+- [ ] **Menus.** A Mac app's menus are in the global menu bar. Read them through Accessibility and show them
+      as an ornament on the app's windows, or keep one floating menu bar window.
+- [ ] **Pop-ups.** Context menus, sheets, pop-overs and tooltips are windows of their own. Recognise them by
+      level and owner, and attach them to their parent's visionOS window.
+- [ ] **System UI.** Hide the Dock automatically, and keep a "whole desktop" window for notifications,
+      Spotlight and anything left over.
+
+Order: the window list and endpoint first, tried on an iPhone with the windows drawn as labelled
+rectangles; then one visionOS window for one Mac window, with input; then the window manager and resizing;
+then menus and pop-ups.
+
+A deeper alternative: Henge's GPU replay sees WindowServer composite each window's own surface into the
+screen, so in principle each window could be taken from that stream, overlaps and all. It would mean
+reverse-engineering WindowServer's private compositing, so it would be fragile.
+
+**Mac apps run directly (`tl/`):** more direct still. The translation layer's own AppKit already hands over
+each window as a layer (`henge_tl_app_window_count`, `henge_tl_app_window_layer`, `henge_tl_app_window_frame`,
+laid out by `MacScreen.swift`). Each layer could go into its own visionOS window, with no capture, tiling or
+agent. The limit is which apps `tl/` runs.
 
 ## Not pursued
 
