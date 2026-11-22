@@ -17,6 +17,9 @@ settings:
     # helper by its bundle identifier. visionOS has no AR viewer point and ignores the helper, so the Vision Pro
     # build (tools/visionos/build_henge.sh) uses com.apple.share-services, which both systems have.
     HENGE_JIT_HELPER_EXTENSION_POINT: com.apple.ar.viewer
+    # Filled in by project.tunnel.yml's Vision Pro additions (tunnel.yml); empty here.
+    HENGE_EXTRA_LDFLAGS: ""
+    HENGE_EXTRA_SWIFT_CONDITIONS: ""
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: YES
     ENABLE_BITCODE: NO
@@ -48,6 +51,8 @@ targets:
       - path: HengeJITHelper/HengeJITMessages.swift
       # Tells this device's pairing service from other devices' (both look the port up).
       - path: HengeJITHelper/OwnAddresses.swift
+      # Finds this device's Bonjour services by port (also for pairing on an Apple Vision Pro).
+      - path: HengeJITHelper/RSDPortResolver.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(HENGE_BUNDLE_IDENTIFIER)
@@ -57,6 +62,7 @@ targets:
         INFOPLIST_FILE: Henge/Info.plist
         CODE_SIGN_ENTITLEMENTS: $(HENGE_ENTITLEMENTS)
         SWIFT_OBJC_BRIDGING_HEADER: Henge/HengeBridge.h
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) $(HENGE_EXTRA_SWIFT_CONDITIONS)"
         TARGETED_DEVICE_FAMILY: "1,2"
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
@@ -89,6 +95,8 @@ targets:
           - "-lbz2"
           # On-device pairing for Built-in StikJIT (from Husk's src/rppairing-ios).
           - "-lhusk_rppairing"
+          # More libraries in some builds (project.tunnel.yml); empty otherwise.
+          - "$(HENGE_EXTRA_LDFLAGS)"
           - "-framework"
           - "Metal"
           - "-framework"

@@ -15,8 +15,8 @@ Where the Vision Pro work stands, and what comes next. The tools and the measure
   fix was needed first: the shared region fills the low address space there, so a virtual Mac now gets
   the high address blocks Henge holds for Mac apps when its RAM fits nowhere else
   (`GuestMemory.prepare`, `henge_ios_release_high_room`).
-- **JIT on the headset, without a Mac.** Henge's built-in StikJIT helper runs there (step 2), with
-  LocalDevVPN built from source, a pairing file made by `pair/` and the helper on another extension point.
+- **JIT on the headset, without a Mac.** Henge's built-in StikJIT helper runs there (step 2), with Henge's own
+  VPN, pairing on the headset and the helper on another extension point.
 - **Build fixes along the way:** the `tl/` sample Mac programs are built with the macOS SDK (Xcode 27.1's
   iOS SDK broke them), and Husk can live in `deps/Husk` inside the repository.
 
@@ -56,9 +56,11 @@ LLDB, since the page writes no longer cross Wi-Fi. Details in [README.md](README
 - [ ] **Developer disk image after a restart.** StikJIT downloads iOS images (`DeveloperDiskImageService.swift`).
       Check whether it mounts one after the headset restarts with no Mac, or whether it needs the xrOS one that
       Xcode keeps in `/Library/Developer/DeveloperDiskImages/xrOS_DDI`.
-- [ ] **Pairing on the headset.** Port `pair/` into Henge: while Remote Devices is open beside Henge, Henge
-      finds the headset's own `_remotepairing-manual-pairing._tcp` and the user types the code into Henge. Then
-      a Vision Pro needs no Mac at all, except to install Henge.
+- [x] **Pairing on the headset** (JIT setup › Pair on this Apple Vision Pro, `JITVisionPairing.swift`). Henge
+      connects its VPN, finds the headset's own `_remotepairing-manual-pairing._tcp` once Settings › General ›
+      Remote Devices is open beside it, connects at 10.7.0.1 and sends the code the user types. The client is
+      `ios/rppairing-client` (`libhenge_rpclient.a`, idevice's `RemotePairingClient`), linked beside Husk's
+      pairing library only in `project.tunnel.yml` builds. A Vision Pro now needs a Mac only to install Henge.
 - [x] **A loopback VPN inside Henge**, so LocalDevVPN isn't needed: `ios/HengeTunnel`, a packet-tunnel extension
       based on LocalDevVPN's (credited in `third_party/LocalDevVPN`). Network extensions need a paid team, so it is
       added only by `xcodegen generate --spec project.tunnel.yml`, which `build_henge.sh` uses. Henge connects it

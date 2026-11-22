@@ -1,0 +1,23 @@
+[package]
+name = "henge_rpclient"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+# Pairing as the computer, for devices that pair that way round (Apple Vision Pro, Apple TV): the device
+# advertises _remotepairing-manual-pairing._tcp while its pairing screen is open, and shows the code.
+# The C interface is ../Henge/Native/HengeRPClient.h; built by ../scripts/build_rpclient.sh.
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# The same idevice as Husk's rppairing, so the pairing file is the same format.
+idevice = { version = "=0.1.68", default-features = false, features = ["remote_pairing", "ring"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

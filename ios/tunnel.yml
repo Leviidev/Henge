@@ -1,6 +1,13 @@
 # The optional loopback VPN (HengeTunnel.appex), so Built-in StikJIT needs no LocalDevVPN. Network extensions
 # need a paid developer team, so it is included only by `xcodegen generate --spec project.tunnel.yml`
 # (tools/visionos/build_henge.sh does). The app's entitlements must then also carry packet-tunnel-provider.
+#
+# It also brings pairing as the computer (ios/rppairing-client, libhenge_rpclient.a from
+# scripts/build_rpclient.sh), which an Apple Vision Pro needs and which reaches the device through this VPN.
+settings:
+  base:
+    HENGE_EXTRA_LDFLAGS: -lhenge_rpclient
+    HENGE_EXTRA_SWIFT_CONDITIONS: HENGE_VISION_PAIRING
 targets:
   Henge:
     dependencies:

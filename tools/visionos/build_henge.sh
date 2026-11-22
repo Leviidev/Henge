@@ -2,7 +2,7 @@
 # Builds Henge's iPad app signed for development with your team, to install directly on an Apple Vision Pro
 # (where it runs as a "Designed for iPad" app) or any iPhone or iPad registered to the team.
 #   TEAM=XXXXXXXXXX BUNDLE_ID=com.example.henge tools/visionos/build_henge.sh
-# Needs a built Husk at deps/Husk (or HUSK=...): see README.md, Building. Writes build/visionos/Henge.app.
+# Needs a built Husk at deps/Husk (or HUSK=...): see README.md, Building. And rustup with aarch64-apple-ios. Writes build/visionos/Henge.app.
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TEAM=${TEAM:?your Apple developer team id is required (TEAM=...)}
@@ -10,6 +10,8 @@ BUNDLE_ID=${BUNDLE_ID:?a bundle identifier of your own is required (BUNDLE_ID=..
 cd "$ROOT"
 [ -f ios/deps/lib/libslirp.a ] || zsh ios/scripts/fetch_deps.sh
 [ -f build/ios/libhengerestore.a ] || zsh tools/build_ios_restore.sh
+# Pairing as the computer, for pairing on the headset (ios/rppairing-client).
+[ -f ios/deps/lib/libhenge_rpclient.a ] || zsh ios/scripts/build_rpclient.sh
 cd ios
 # With Henge's own VPN (ios/tunnel.yml), so the built-in JIT needs no LocalDevVPN.
 xcodegen generate --spec project.tunnel.yml >/dev/null

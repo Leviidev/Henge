@@ -48,11 +48,11 @@ needed three things:
   in the headset's App Store, but its source
   ([jkcoxson/LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN)) builds unchanged for iOS with a paid team
   (a `CodeSigning.xcconfig` with your team and prefix) and connects in compatibility mode.
-- **A pairing file.** On iOS 27 Henge advertises itself as a computer and the device pairs into it. visionOS
-  pairs the other way round: Settings › General › Remote Devices advertises
-  `_remotepairing-manual-pairing._tcp`, and a computer connects and enters the code the headset shows. That
-  screen lists only computers already paired, so Henge's on-device pairing can't be used there. `pair/pair.sh`
-  plays the computer, with idevice's `RemotePairingClient` (the same idevice as Husk's pairing).
+- **Pairing.** On iOS 27 Henge advertises itself as a computer and the device pairs into it. visionOS pairs the
+  other way round: Settings › General › Remote Devices advertises `_remotepairing-manual-pairing._tcp`, and a
+  computer connects and enters the code the headset shows. So on the headset Henge plays the computer (JIT
+  setup › Pair on this Apple Vision Pro, `ios/rppairing-client`), through its VPN. `pair/pair.sh` does the
+  same from a Mac and writes a pairing file, for builds without the VPN.
 - **Another extension point for the helper.** visionOS has no `com.apple.ar.viewer` point, so it ignored the
   helper ("could not be found"). `build_henge.sh` registers it under `com.apple.share-services`
   (`HENGE_JIT_HELPER_EXTENSION_POINT`). Its `FALSEPREDICATE` activation rule keeps it out of share sheets.

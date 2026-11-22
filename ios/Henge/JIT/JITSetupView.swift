@@ -9,15 +9,23 @@ import UniformTypeIdentifiers
 /// LocalDevVPN and enabling. StikDebug has its own short page. Presented from
 /// onboarding, Settings › JIT, and whenever Start finds JIT not set up.
 struct JITSetupFlow: View {
-    enum Step: Hashable { case pairOnDevice, importFile, connect, enable, stikDebug, trollStore, jailbreak }
+    enum Step: Hashable { case pairOnDevice, pairVision, importFile, connect, enable, stikDebug, trollStore, jailbreak }
 
     @ObservedObject private var jit = JITCoordinator.shared
     @ObservedObject private var pairing = OnDevicePairing.shared
+    @ObservedObject private var visionPairing = VisionPairing.shared
+    @State private var visionCode = ""
     @State private var path: [Step] = []
     @State private var importing = false
     @Environment(\.dismiss) private var dismiss
 
     private var device: String { OnDevicePairing.deviceKind }
+
+    /// This device's own way to pair: the Vision Pro's (Henge connects to the headset) or iOS 27's (the device
+    /// connects to Henge). nil when there is none and only a pairing file will do.
+    private var pairOnThisDevice: Step? {
+        VisionPairing.isSupported ? .pairVision : OnDevicePairing.isSupported ? .pairOnDevice : nil
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -25,6 +33,7 @@ struct JITSetupFlow: View {
                 .hengeDestination(for: Step.self) { step in
                     switch step {
                     case .pairOnDevice: pairOnDevice
+                    case .pairVision: pairVision
                     case .importFile: importFile
                     case .connect: connect
                     case .enable: enable
@@ -45,6 +54,7 @@ struct JITSetupFlow: View {
         .onAppear {
             jit.refreshPairingStatus()
             pairing.reset()
+            visionPairing.reset()
             // A failed enable from the Library lands on the step that can fix it.
             if jit.error != nil, jit.hasPairing, jit.resolvedMethod == .builtIn {
                 path = [.enable]
@@ -69,12 +79,20 @@ struct JITSetupFlow: View {
                      + "debugger can grant. Choose how your \(device) gets one.") {
             VStack(spacing: 10) {
                 let builtIn = HengeBuiltInJIT.unavailableReason
-                way("Pair on this \(device)", symbol: "iphone.radiowaves.left.and.right",
-                    detail: builtIn ?? (!OnDevicePairing.isSupported ? "Needs iOS 27 or later."
-                        : jit.pairingSource == .onDevice ? "Paired on this \(device)."
-                        : "No computer needed. Pairs from Settings in a minute."),
-                    done: jit.pairingSource == .onDevice,
-                    enabled: builtIn == nil && OnDevicePairing.isSupported) { path.append(.pairOnDevice) }
+                if VisionPairing.isSupported {
+                    way("Pair on this \(device)", symbol: "visionpro",
+                        detail: builtIn ?? (jit.pairingSource == .onDevice ? "Paired on this \(device)."
+                            : "No computer needed. Pairs from Remote Devices in Settings."),
+                        done: jit.pairingSource == .onDevice,
+                        enabled: builtIn == nil) { path.append(.pairVision) }
+                } else {
+                    way("Pair on this \(device)", symbol: "iphone.radiowaves.left.and.right",
+                        detail: builtIn ?? (!OnDevicePairing.isSupported ? "Needs iOS 27 or later."
+                            : jit.pairingSource == .onDevice ? "Paired on this \(device)."
+                            : "No computer needed. Pairs from Settings in a minute."),
+                        done: jit.pairingSource == .onDevice,
+                        enabled: builtIn == nil && OnDevicePairing.isSupported) { path.append(.pairOnDevice) }
+                }
                 way("Use a pairing file", symbol: "doc.badge.plus",
                     detail: builtIn ?? (jit.pairingSource == .imported ? "Pairing file imported."
                         : "Import a pairing file made on a computer."),
@@ -221,6 +239,97 @@ struct JITSetupFlow: View {
         }
     }
 
+    // MARK: Pair on an Apple Vision Pro
+
+    private var visionPhase: VisionPairing.Phase { visionPairing.phase }
+
+    private var pairVision: some View {
+        page(symbol: "visionpro", title: "Pair on this \(device)",
+             subtitle: "Henge pairs with your \(device) the way a Mac does: your \(device) shows a code, "
+                     + "and you type it into Henge.") {
+            VStack(alignment: .leading, spacing: 14) {
+                point(1, "Tap **Start pairing** and allow Local Network access"
+                       + (HengeTunnel.isEmbedded ? " and Henge's VPN." : ". Keep LocalDevVPN connected."),
+                      done: visionPhase != .idle)
+                point(2, "Open **Settings › General › Remote Devices** and keep it open beside Henge.",
+                      done: [.connecting, .code, .pairing, .paired].contains(visionPhase))
+                point(3, "Type the code Settings shows into Henge.",
+                      done: [.pairing, .paired].contains(visionPhase))
+            }
+            .padding(16).hengeCard()
+            visionPairingStatus
+        } actions: {
+            switch visionPhase {
+            case .idle, .failed:
+                Button { visionCode = ""; visionPairing.start() } label: {
+                    Label("Start pairing", systemImage: "dot.radiowaves.left.and.right")
+                }
+                .buttonStyle(PrimaryButtonStyle())
+            case .code:
+                Button("Pair") { visionPairing.submit(code: visionCode) }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(visionCode.filter(\.isNumber).count != 6)
+                Button("Cancel pairing", role: .cancel) { visionPairing.cancel() }
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Theme.textDim)
+            case .connectingVPN, .searching, .connecting, .pairing:
+                Button("Cancel pairing", role: .cancel) { visionPairing.cancel() }
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Theme.textDim)
+            case .paired:
+                Button("Continue") { path.append(.connect) }
+                    .buttonStyle(PrimaryButtonStyle())
+            }
+        }
+    }
+
+    @ViewBuilder private var visionPairingStatus: some View {
+        switch visionPhase {
+        case .idle:
+            EmptyView()
+        case .connectingVPN, .searching, .connecting, .pairing:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    ProgressView().tint(Theme.accent)
+                    Text(visionPhase == .connectingVPN ? "Connecting Henge's VPN…"
+                         : visionPhase == .searching ? "Waiting for Remote Devices…"
+                         : visionPhase == .connecting ? "Asking your \(device) for a code…"
+                         : "Pairing…")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Theme.text)
+                }
+                if visionPhase == .searching {
+                    Button("Open Settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                    }
+                    .font(.system(size: 14, weight: .semibold))
+                    Text("Settings opens on Henge's page. Go back to General › Remote Devices.")
+                        .font(.system(size: 13)).foregroundStyle(Theme.textDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16).hengeCard()
+        case .code:
+            VStack(spacing: 10) {
+                Text("Type the code Settings shows").font(.system(size: 14))
+                    .foregroundStyle(Theme.textDim)
+                TextField("000000", text: $visionCode)
+                    .keyboardType(.numberPad)
+                    .textContentType(.oneTimeCode)
+                    .font(.system(size: 36, weight: .bold, design: .monospaced))
+                    .multilineTextAlignment(.center)
+                    .onSubmit { visionPairing.submit(code: visionCode) }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(18).hengeCard(high: true)
+        case .paired:
+            outcome("Paired with this \(device)", ok: true)
+        case .failed(let message):
+            outcome(message, ok: false)
+        }
+    }
+
     // MARK: Import a pairing file
 
     private var importFile: some View {
@@ -323,8 +432,8 @@ struct JITSetupFlow: View {
                 VStack(alignment: .leading, spacing: 10) {
                     outcome(error, ok: false)
                     if jit.advice?.actions.contains(.pairAgain) == true {
-                        Button(OnDevicePairing.isSupported ? "Pair again" : "Import a new pairing file") {
-                            path = [OnDevicePairing.isSupported ? .pairOnDevice : .importFile]
+                        Button(pairOnThisDevice == nil ? "Import a new pairing file" : "Pair again") {
+                            path = [pairOnThisDevice ?? .importFile]
                         }
                         .font(.system(size: 14, weight: .semibold))
                     }

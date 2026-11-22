@@ -17,10 +17,12 @@ enum RSDPortResolver {
         var detail: String
     }
 
-    private static let serviceType = "_remotepairing._tcp"
+    static let rsdServiceType = "_remotepairing._tcp"
+    /// What an Apple Vision Pro advertises while Settings › General › Remote Devices is open (Henge's app uses it).
+    static let manualPairingServiceType = "_remotepairing-manual-pairing._tcp"
 
-    /// Blocks for at most `timeout`. Call it off the main thread.
-    static func resolve(timeout: TimeInterval = 4) -> Result {
+    /// This device's port for `serviceType`. Blocks for at most `timeout`. Call it off the main thread.
+    static func resolve(serviceType: String = rsdServiceType, timeout: TimeInterval = 4) -> Result {
         let state = State()
         let queue = DispatchQueue(label: "com.henge.app.jit-helper.rsd-port")
         let context = Unmanaged.passRetained(state)
