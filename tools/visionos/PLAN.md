@@ -166,6 +166,27 @@ each window as a layer (`henge_tl_app_window_count`, `henge_tl_app_window_layer`
 laid out by `MacScreen.swift`). Each layer could go into its own visionOS window, with no capture, tiling or
 agent. The limit is which apps `tl/` runs.
 
+## 6. Later: Xcode in the virtual Mac, deploying to the headset
+
+The goal: Xcode running inside Henge's Mac installs and debugs apps on the Vision Pro it runs on. The virtual Mac
+pairs as a computer of its own (Remote Devices, a code, as any Mac does), not with Henge's pairing: Xcode keeps
+its pairings in macOS's private store. Henge carries its traffic to the headset the way the JIT helper's goes.
+
+- [ ] **A route to the headset.** The guest's connections are made by Henge's network stack (Husk's libslirp),
+      so a guest address can be mapped to 10.7.0.1 through Henge's VPN, where the headset takes it for a computer
+      on the network.
+- [ ] **Discovery.** Xcode finds network devices by Bonjour, which doesn't cross the guest's NAT. Henge answers
+      the guest's mDNS queries itself: the headset's `_remotepairing._tcp`, and
+      `_remotepairing-manual-pairing._tcp` while Remote Devices is open, pointing at the mapped address. Henge
+      already finds both (`RSDPortResolver`).
+- [ ] **CoreDevice's tunnel.** Pairing, then CoreDevice's encrypted tunnel, which carries installing, the disk
+      image and debugging. Henge only forwards it (TCP, and UDP if CoreDevice uses it there).
+- [ ] Unknowns: whether CoreDevice checks the advertised addresses against where it connects (then Henge rewrites
+      them, IPv6 too); whether Xcode is usable in the virtual Mac (disk, RAM, speed; device builds don't need the
+      Simulator); whether visionOS suspends Henge while the app being debugged is in front.
+
+First test: the route and discovery, then whether the guest's Xcode lists the headset under Devices.
+
 ## Not pursued
 
 **Running without JIT.** Henge's translator copies most guest instructions unchanged and needs
