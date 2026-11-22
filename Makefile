@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown $(B)/test_xhci
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -109,6 +109,9 @@ $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 # Block-level tests: test_X.c plus X_programs.S, run natively and through the JIT.
 $(B)/test_devices: tests/test_devices.c tests/devices_programs.S tests/harness.S tests/harness.h $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) -Itests tests/test_devices.c tests/devices_programs.S tests/harness.S $(ENGINE) $(DEV) $(METAL_LIBS) -o $@
+# The xHCI controller's tablet and ports, driven directly (it includes devices/xhci.c).
+$(B)/test_xhci: tests/test_xhci.c devices/xhci.c devices/*.h $(ENGINE) $(filter-out $(B)/xhci.o,$(DEV))
+	$(CC) $(CFLAGS) tests/test_xhci.c $(ENGINE) $(filter-out $(B)/xhci.o,$(DEV)) $(METAL_LIBS) -o $@
 # The device-tree identity rewrite, on crafted blobs (no machine needed).
 $(B)/test_dt_fixup: tests/test_dt_fixup.c host/dt_fixup.c host/dt_fixup.h | $(B)
 	$(CC) $(CFLAGS) tests/test_dt_fixup.c host/dt_fixup.c -o $@

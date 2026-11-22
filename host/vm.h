@@ -106,6 +106,11 @@ void hv_vm_mouse_hwheel(int dx);
 void hv_vm_touch(int id, int phase, int x, int y, uint32_t ts_ms);
 void hv_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void hv_vm_touch_button(int down); /* the pad's full press (a click) */
+/* The tablet on the Mac's USB bus: the pointer at x, y (0..HV_TABLET_MAX across the screen,
+   from the top left) with these buttons held (bit 0 left, 1 right, 2 middle); and scrolling
+   there by wheel steps (dy > 0 up, dx > 0 right). */
+void hv_vm_tablet(int x, int y, int buttons);
+void hv_vm_tablet_scroll(int dx, int dy);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int hv_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

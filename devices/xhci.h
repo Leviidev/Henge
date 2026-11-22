@@ -6,15 +6,17 @@
 #include "pcie.h"
 
 /* An xHCI USB host controller (xHCI 1.0, one interrupter, 32-byte contexts,
-   INTx) with two USB HID devices: a boot keyboard on port 1 and a Magic
-   Trackpad 2 on port 2: what Virtualization.framework gives a macOS guest as
-   its "Virtual USB Keyboard", plus Apple's multitouch pad, so the guest's
-   own gesture engine sees a real trackpad. Changes come from the host UI on
-   any thread (hv_xhci_key, hv_xhci_touch); the CPU thread delivers them
-   (hv_xhci_poll). */
+   INTx) with three USB HID devices: a boot keyboard on port 1, a Magic
+   Trackpad 2 on port 2 and an absolute pointer (a tablet) on port 3. The
+   first is what Virtualization.framework gives a macOS guest as its "Virtual
+   USB Keyboard"; the pad lets the guest's own gesture engine see a real
+   trackpad; the tablet puts the pointer where the host says, for input that
+   points at the screen itself (look and pinch on Apple Vision Pro). Changes
+   come from the host UI on any thread (hv_xhci_key, hv_xhci_touch,
+   hv_xhci_tablet); the CPU thread delivers them (hv_xhci_poll). */
 #define HV_XHCI_SLOTS 8
-#define HV_XHCI_PORTS 2
-#define HV_XHCI_DEVICES 2
+#define HV_XHCI_PORTS 3
+#define HV_XHCI_DEVICES 3
 #define HV_XHCI_INTRS 4
 #define HV_XHCI_EPS 32 /* device context index 1..31 */
 #define HV_XHCI_REPORTS 256
@@ -26,6 +28,11 @@
 #define HV_TP_FINGERS 10
 #define HV_TP_REPORTS 64
 #define HV_TP_REPORT_LEN (12 + 9 * HV_TP_FINGERS) /* report ID 2: 12-byte prefix, N x 9-byte fingers */
+
+/* The tablet's coordinates: 0..HV_TABLET_MAX across the Mac's screen, in both directions. */
+#define HV_TABLET_MAX 32767
+#define HV_TAB_REPORTS 64
+#define HV_TAB_REPORT_LEN 7 /* buttons, x (16 bits), y (16 bits), wheel, pan */
 
 typedef struct HvXhciRing {
     uint64_t dequeue; /* guest PA of the next TRB */
@@ -83,6 +90,13 @@ typedef struct HvXhci {
     uint32_t tp_multi_logs; /* multi-finger deliveries logged, capped */
     uint8_t tp_f1[8];   /* feature report 1: the header for the selected sensor register */
     int tp_f1_len;
+    /* The tablet: its current state and the reports waiting for an IN transfer
+       (buttons, x and y little-endian in 0..HV_TABLET_MAX, wheel and pan steps). */
+    uint8_t tab_state[HV_TAB_REPORT_LEN];
+    uint8_t tab_reports[HV_TAB_REPORTS][HV_TAB_REPORT_LEN];
+    uint32_t tab_rhead, tab_rtail;
+    int tab_tail_move;  /* the newest waiting report is a plain move: the next move may replace it */
+    uint64_t tab_delivered;
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);
@@ -102,6 +116,13 @@ void hv_xhci_touch(HvXhci *x, int id, int phase, int px, int py, uint32_t ts_ms)
 void hv_xhci_touch_frame(HvXhci *x, uint32_t ts_ms);
 /* Any thread: the pad's full press (a click), down or up. */
 void hv_xhci_touch_button(HvXhci *x, int down);
+/* Any thread: the tablet's pointer at px, py (0..HV_TABLET_MAX across the Mac's screen,
+   from the top left) with these buttons held (bit 0 left, 1 right, 2 middle). Moves with
+   the same buttons are merged while the guest has not taken them; a button change never is. */
+void hv_xhci_tablet(HvXhci *x, int px, int py, int buttons);
+/* Any thread: scroll by dy wheel steps (positive: up) and dx pan steps (positive: right),
+   at the tablet's current position. */
+void hv_xhci_tablet_scroll(HvXhci *x, int dx, int dy);
 /* CPU thread: hand waiting reports to the guest. */
 void hv_xhci_poll(HvXhci *x);
 
