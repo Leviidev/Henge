@@ -13,6 +13,7 @@ built for visionOS yet, so these tools let a Mac be the debugger instead, over t
   traps. The debugger allocates the region with `_M<size>,rx` and writes into every page.
 - `build_henge.sh` and `Henge.development.entitlements`: build Henge's iPad app signed by Xcode with your
   own (paid) team, to install directly. On a Vision Pro it runs as a "Designed for iPad" app.
+- `PLAN.md`: where the work stands and the next steps.
 
 ## Result so far
 
@@ -23,6 +24,8 @@ detaches.
 Henge's iPad build, unchanged, runs there in compatibility mode. It sees itself as an `iPad13,4` on iPadOS
 27.0 with 15.7 GB of RAM, and gets both memory entitlements (a 6139 MB limit). With `run_jit.sh --launch`
 and a 512 MB code cache, it claimed its region, passed its own self-test, and let the debugger go.
+It then installed macOS Sequoia 15.6.1. The restore took about 7½ minutes once a Vision Pro address-space
+fix was in (`GuestMemory.prepare`). What comes next is in [PLAN.md](PLAN.md).
 
 Preparing the region is limited by Wi-Fi. One write a page manages about 42 pages a second (a 24 ms round
 trip each). Bulk writes, the default, manage about 1.6 MB/s. A 512 MB code cache therefore takes about
