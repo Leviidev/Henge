@@ -17,6 +17,7 @@ mkdir -p "$DD"
 xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
     -derivedDataPath "$DD" -allowProvisioningUpdates \
     DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic HENGE_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+    HENGE_JIT_HELPER_EXTENSION_POINT=com.apple.share-services \
     HENGE_ENTITLEMENTS="$ROOT/tools/visionos/Henge.development.entitlements" build > "$DD.buildlog" 2>&1 || {
     grep -E "error:|BUILD" "$DD.buildlog" | sort -u
     echo "==> the build failed (full log: $DD.buildlog)" >&2

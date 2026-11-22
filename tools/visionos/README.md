@@ -1,9 +1,9 @@
 # Apple Vision Pro tools
 
 Experiments toward a Vision Pro version of Henge. On a TXM device only an attached debugger can give an app
-executable memory. On iPhone that debugger is StikDebug or the built-in StikJIT helper. Neither has been
-built for visionOS yet, so these tools let a Mac be the debugger instead, over the same trap protocol as
-`ios/Henge/Resources/henge-jit.js`.
+executable memory. On iPhone that debugger is StikDebug or the built-in StikJIT helper. Henge's iPad build
+now runs its built-in helper on the headset too (below). These tools also let a Mac be the debugger, over the
+same trap protocol as `ios/Henge/Resources/henge-jit.js`.
 
 - `jitprobe/`: a minimal native visionOS app that asks for a JIT region the way Henge does
   (`brk #0x69`, then `brk #0xf00d` with `x16 = 1`). It then writes code through a `vm_remap` alias, runs it
@@ -13,6 +13,8 @@ built for visionOS yet, so these tools let a Mac be the debugger instead, over t
   traps. The debugger allocates the region with `_M<size>,rx` and writes into every page.
 - `build_henge.sh` and `Henge.development.entitlements`: build Henge's iPad app signed by Xcode with your
   own (paid) team, to install directly. On a Vision Pro it runs as a "Designed for iPad" app.
+- `pair/`: pairs this Mac with the headset the way Xcode does and writes the RPPairing file Henge's built-in JIT
+  uses. visionOS can't pair the way Henge does on iOS 27 (below).
 - `PLAN.md`: where the work stands and the next steps.
 
 ## Result so far
@@ -36,6 +38,26 @@ Keep the headset awake throughout: a 1.5 GB run lost its connection about 4 minu
 After attaching to an app launched suspended, LLDB's own register writes fail, so registers are set with
 the raw `P` packets that `henge-jit.js` sends.
 
+### JIT on the headset, without a Mac
+
+Henge's built-in StikJIT helper works on the Vision Pro, and boots macOS in seconds rather than minutes. It
+needed three things:
+
+- **LocalDevVPN.** It isn't offered in the headset's App Store, but its source
+  ([jkcoxson/LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN)) builds unchanged for iOS with a paid team
+  (a `CodeSigning.xcconfig` with your team and prefix) and connects in compatibility mode.
+- **A pairing file.** On iOS 27 Henge advertises itself as a computer and the device pairs into it. visionOS
+  pairs the other way round: Settings › General › Remote Devices advertises
+  `_remotepairing-manual-pairing._tcp`, and a computer connects and enters the code the headset shows. That
+  screen lists only computers already paired, so Henge's on-device pairing can't be used there. `pair/pair.sh`
+  plays the computer, with idevice's `RemotePairingClient` (the same idevice as Husk's pairing).
+- **Another extension point for the helper.** visionOS has no `com.apple.ar.viewer` point, so it ignored the
+  helper ("could not be found"). `build_henge.sh` registers it under `com.apple.share-services`
+  (`HENGE_JIT_HELPER_EXTENSION_POINT`). Its `FALSEPREDICATE` activation rule keeps it out of share sheets.
+
+The developer disk image was already mounted by the Mac in that test. Whether the helper mounts one by itself
+after a restart is still to check.
+
 ## Use
 
 ```bash
@@ -50,6 +72,12 @@ tools/visionos/run_jit.sh --launch <your.bundle.id>
 TEAM=<team> BUNDLE_ID=<your.bundle.id> tools/visionos/build_henge.sh
 xcrun devicectl device install app --device <udid> build/visionos/Henge.app
 tools/visionos/run_jit.sh --launch <your.bundle.id> -- -henge.perf.codeCacheMB '<integer>512</integer>'
+
+# Or JIT on the headset: build and connect LocalDevVPN, open Settings › General › Remote Devices, then
+tools/visionos/pair/pair.sh pairingFile.plist     # type the code the headset shows
+xcrun devicectl device copy to --device <udid> --domain-type appDataContainer --domain-identifier <your.bundle.id> \
+    --source pairingFile.plist --destination Documents/StikJIT/pairingFile.plist
+# then in Henge: Turn on JIT › Check setup › Enable JIT
 ```
 
 `run_jit.sh` uses Xcode's LLDB through a standalone Python `SBDebugger` in synchronous mode. A loop inside the

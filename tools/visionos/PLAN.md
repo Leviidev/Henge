@@ -15,6 +15,8 @@ Where the Vision Pro work stands, and what comes next. The tools and the measure
   fix was needed first: the shared region fills the low address space there, so a virtual Mac now gets
   the high address blocks Henge holds for Mac apps when its RAM fits nowhere else
   (`GuestMemory.prepare`, `henge_ios_release_high_room`).
+- **JIT on the headset, without a Mac.** Henge's built-in StikJIT helper runs there (step 2), with
+  LocalDevVPN built from source, a pairing file made by `pair/` and the helper on another extension point.
 - **Build fixes along the way:** the `tl/` sample Mac programs are built with the macOS SDK (Xcode 27.1's
   iOS SDK broke them), and Husk can live in `deps/Husk` inside the repository.
 
@@ -34,31 +36,33 @@ Underway. With a Mac giving JIT at each launch:
 - [ ] What compatibility mode lacks: no volume buttons (`VolumeClicks.swift` has nothing to read), no
       haptics, no external display. Note the Mac's screen size and how the window resizes.
 
-Region preparation over Wi-Fi is slow (about 1.6 MB/s, so 6 minutes for a 512 MB code cache and 16 for
-Henge's 1.5 GB default there), and the headset must stay awake for it. That's fine for testing. Step 2
-removes the wait. If it doesn't work out, the Mac side could batch its writes the way StikJIT does (128
-packets per round trip), which needs its own debugserver connection, since LLDB can't send batches.
+Region preparation from the Mac over Wi-Fi is slow (about 1.6 MB/s, so 6 minutes for a 512 MB code cache and
+16 for Henge's 1.5 GB default there), and the headset must stay awake for it. Step 2's JIT on the headset
+removes the wait.
 
 ## 2. JIT on the headset, without a Mac (iPad version)
 
-No new build is needed. The app is an iOS binary in compatibility mode, so the iOS StikJIT, the pairing
-library and `HengeJITHelper.appex` already in it work as they are. The helper extension installs on
-visionOS.
+Works. Henge's built-in StikJIT helper attached on the headset and macOS booted, far faster than with the Mac's
+LLDB, since the page writes no longer cross Wi-Fi. Details in [README.md](README.md).
 
-- [ ] Is **LocalDevVPN** in the App Store on the Vision Pro? iPad apps are listed there unless their
-      developer opted out. If it isn't, write a small loopback VPN that does the same thing (traffic for
-      `10.7.0.1` returned to the device, so its developer services take it for a computer on the network).
-- [ ] **Pairing:** Henge's on-device pairing (`JITPairing.swift`, advertising
-      `_remotepairing-pairable-host._tcp`), or a pairing file made on the Mac and imported.
-- [ ] **Developer disk image:** StikJIT downloads iOS images (`DeveloperDiskImageService.swift`). Check
-      whether the headset needs the xrOS one, which Xcode keeps in
-      `/Library/Developer/DeveloperDiskImages/xrOS_DDI`.
-- [ ] Does the helper extension (`com.apple.ar.viewer`) launch on visionOS? If not, a companion app could
-      run StikJIT instead.
-- [ ] **Turn On JIT** end to end. On the device the page writes have almost no round-trip time, so the
-      wait should all but go away.
-
-If this works, a Vision Pro user needs no Mac after the first pairing.
+- [x] **LocalDevVPN** isn't in the headset's App Store, but its source builds unchanged with a paid team and
+      connects in compatibility mode.
+- [x] **Pairing:** visionOS pairs the other way round from iOS 27 (the headset advertises
+      `_remotepairing-manual-pairing._tcp` and a computer connects), so Henge's on-device pairing has nothing to
+      pair with. `pair/pair.sh` makes the file on a Mac.
+- [x] **The helper extension:** visionOS has no `com.apple.ar.viewer` point, so the helper is registered under
+      `com.apple.share-services` in the Vision Pro build (`HENGE_JIT_HELPER_EXTENSION_POINT`).
+- [x] **Turn On JIT** end to end, with the developer disk image already mounted by the Mac.
+- [ ] **Developer disk image after a restart.** StikJIT downloads iOS images (`DeveloperDiskImageService.swift`).
+      Check whether it mounts one after the headset restarts with no Mac, or whether it needs the xrOS one that
+      Xcode keeps in `/Library/Developer/DeveloperDiskImages/xrOS_DDI`.
+- [ ] **Pairing on the headset.** Port `pair/` into Henge: while Remote Devices is open beside Henge, Henge
+      finds the headset's own `_remotepairing-manual-pairing._tcp` and the user types the code into Henge. Then
+      a Vision Pro needs no Mac at all, except to install Henge.
+- [ ] **A loopback VPN inside Henge**, so LocalDevVPN isn't needed: a packet-tunnel extension (paid teams only).
+- [ ] Try `com.apple.share-services` on an iPhone. If the helper works there too, one point serves both, and an
+      upstream IPA works on the headset as it is.
+- [ ] "RemotePairing port not found; using StikJIT's default" appears in the log but didn't stop it. Find out why.
 
 ## 3. Input
 

@@ -12,6 +12,10 @@ settings:
     # The app's entitlements file. Override on the xcodebuild command line (the JIT helper doesn't use it, so a
     # personal team can sign the app with fewer entitlements without touching the helper).
     HENGE_ENTITLEMENTS: Henge/Henge.entitlements
+    # The extension point the JIT helper is registered under. Nothing ever offers it there; Henge starts the
+    # helper by its bundle identifier. visionOS has no AR viewer point and ignores the helper, so the Vision Pro
+    # build (tools/visionos/build_henge.sh) uses com.apple.share-services, which both systems have.
+    HENGE_JIT_HELPER_EXTENSION_POINT: com.apple.ar.viewer
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: YES
     ENABLE_BITCODE: NO

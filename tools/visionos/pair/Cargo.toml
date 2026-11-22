@@ -1,0 +1,11 @@
+[package]
+name = "henge-vision-pair"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The same idevice as Husk's rppairing, so the file is the format Henge reads.
+idevice = { version = "=0.1.68", default-features = false, features = ["remote_pairing", "ring"] }
+tokio = { version = "1", features = ["rt", "net", "io-std", "io-util", "macros", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

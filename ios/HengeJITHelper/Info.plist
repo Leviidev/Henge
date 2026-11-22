@@ -36,7 +36,7 @@
 		<key>NSExtensionContextHostClass</key>
 		<string>NSExtensionContext</string>
 		<key>NSExtensionPointIdentifier</key>
-		<string>com.apple.ar.viewer</string>
+		<string>$(HENGE_JIT_HELPER_EXTENSION_POINT)</string>
 		<key>NSExtensionPrincipalClass</key>
 		<string>HengeJITHelperHandler</string>
 	</dict>
