@@ -253,7 +253,28 @@ struct JITSetupFlow: View {
 
     // MARK: LocalDevVPN
 
-    private var connect: some View {
+    @ViewBuilder private var connect: some View {
+        if HengeTunnel.isEmbedded { ownVPN } else { localDevVPN }
+    }
+
+    /// This Henge carries its own loopback VPN (HengeTunnel), so there is nothing to install.
+    private var ownVPN: some View {
+        page(symbol: "network.badge.shield.half.filled", title: "Henge's VPN",
+             subtitle: "Henge's helper reaches this \(device)'s debugging service through a local VPN. "
+                     + "Nothing leaves your \(device).") {
+            VStack(alignment: .leading, spacing: 14) {
+                point(1, "Henge connects its own VPN when it turns JIT on, and disconnects it afterwards.")
+                point(2, "The first time, \(Device.isVision ? "visionOS" : "iOS") asks to add Henge's "
+                       + "VPN configuration. Allow it.")
+            }
+            .padding(16).hengeCard()
+        } actions: {
+            Button("Continue") { path.append(.enable) }
+                .buttonStyle(PrimaryButtonStyle())
+        }
+    }
+
+    private var localDevVPN: some View {
         page(symbol: "network.badge.shield.half.filled", title: "Connect LocalDevVPN",
              subtitle: "Henge's helper reaches this \(device)'s debugging service through a local VPN. "
                      + "Nothing leaves your \(device).") {
@@ -281,7 +302,9 @@ struct JITSetupFlow: View {
              subtitle: "The first check downloads and mounts Apple's Developer Disk Image, "
                      + "which can take a minute.") {
             VStack(alignment: .leading, spacing: 14) {
-                point(1, "Tap **Check setup**. Henge checks LocalDevVPN and prepares the Developer Disk Image.",
+                point(1, HengeTunnel.isEmbedded
+                         ? "Tap **Check setup**. Henge connects its VPN and prepares the Developer Disk Image."
+                         : "Tap **Check setup**. Henge checks LocalDevVPN and prepares the Developer Disk Image.",
                       done: jit.prepared || attached)
                 point(2, "Tap **Enable JIT**. Henge's helper attaches and a Mac can start.", done: attached)
             }
@@ -305,7 +328,7 @@ struct JITSetupFlow: View {
                         }
                         .font(.system(size: 14, weight: .semibold))
                     }
-                    if jit.advice?.actions.contains(.connectLocalDevVPN) == true {
+                    if jit.advice?.actions.contains(.connectLocalDevVPN) == true, !HengeTunnel.isEmbedded {
                         Button(LocalDevVPN.actionTitle) { LocalDevVPN.open() }
                             .font(.system(size: 14, weight: .semibold))
                     }

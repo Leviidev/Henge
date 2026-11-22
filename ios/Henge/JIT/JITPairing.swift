@@ -184,7 +184,9 @@ import UserNotifications
         endBackground(success: false)
     }
 
-    static var deviceKind: String { UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone" }
+    static var deviceKind: String {
+        Device.isVision ? "Apple Vision Pro" : UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+    }
 
     nonisolated private static func take(_ string: UnsafeMutablePointer<CChar>?) -> String? {
         guard let string else { return nil }

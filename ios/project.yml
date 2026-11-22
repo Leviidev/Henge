@@ -1,4 +1,5 @@
 name: Henge
+# With the optional loopback VPN, for paid teams: xcodegen generate --spec project.tunnel.yml (see tunnel.yml).
 options:
   bundleIdPrefix: com.henge
   deploymentTarget:
@@ -45,6 +46,8 @@ targets:
         buildPhase: resources
       # The messages the app and its JIT helper exchange.
       - path: HengeJITHelper/HengeJITMessages.swift
+      # Tells this device's pairing service from other devices' (both look the port up).
+      - path: HengeJITHelper/OwnAddresses.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(HENGE_BUNDLE_IDENTIFIER)

@@ -3,7 +3,8 @@
 <plist version="1.0">
 <!-- For a development build signed by Xcode with a paid team and installed directly (tools/visionos/build_henge.sh).
      Henge.entitlements without dynamic-codesigning, which no development profile can carry: JIT comes from a
-     debugger here (tools/visionos/run_jit.sh). The other keys' reasons are in ios/Henge/Henge.entitlements. -->
+     debugger here (the built-in helper, or tools/visionos/run_jit.sh). packet-tunnel-provider lets Henge set up
+     its own VPN (ios/tunnel.yml). The other keys' reasons are in ios/Henge/Henge.entitlements. -->
 <dict>
 	<key>get-task-allow</key>
 	<true/>
@@ -11,5 +12,9 @@
 	<true/>
 	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
 	<true/>
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>packet-tunnel-provider</string>
+	</array>
 </dict>
 </plist>

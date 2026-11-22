@@ -59,10 +59,17 @@ LLDB, since the page writes no longer cross Wi-Fi. Details in [README.md](README
 - [ ] **Pairing on the headset.** Port `pair/` into Henge: while Remote Devices is open beside Henge, Henge
       finds the headset's own `_remotepairing-manual-pairing._tcp` and the user types the code into Henge. Then
       a Vision Pro needs no Mac at all, except to install Henge.
-- [ ] **A loopback VPN inside Henge**, so LocalDevVPN isn't needed: a packet-tunnel extension (paid teams only).
+- [x] **A loopback VPN inside Henge**, so LocalDevVPN isn't needed: `ios/HengeTunnel`, a packet-tunnel extension
+      based on LocalDevVPN's (credited in `third_party/LocalDevVPN`). Network extensions need a paid team, so it is
+      added only by `xcodegen generate --spec project.tunnel.yml`, which `build_henge.sh` uses. Henge connects it
+      before the helper needs it and disconnects it once JIT is on (`JITTunnel.swift`).
+- [x] **The pairing service's port on a busy network.** Henge and its helper took the first
+      `_remotepairing._tcp` that answered, which was once a nearby iPhone's, and timed out. Both now accept only a
+      service on this device (`OwnAddresses.swift`). This affects iPhones too.
 - [ ] Try `com.apple.share-services` on an iPhone. If the helper works there too, one point serves both, and an
       upstream IPA works on the headset as it is.
-- [ ] "RemotePairing port not found; using StikJIT's default" appears in the log but didn't stop it. Find out why.
+- [ ] Henge's own port lookup (`RemotePairingPortDiscovery`) finds nothing on the headset; the helper's
+      (`RSDPortResolver`) does. Find out why.
 
 ## 3. Input
 

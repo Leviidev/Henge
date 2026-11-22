@@ -187,7 +187,8 @@ final class JITCoordinator: ObservableObject {
         }
         // The helper reaches this device through LocalDevVPN. When it is not connected, connect it first: LocalDevVPN
         // connects and comes back (henge://), and the return to the foreground goes on above.
-        if LocalDevVPN.isInstalled, !LocalDevVPN.isConnected {
+        // With Henge's own VPN there is nothing to open: the helper's request connects it.
+        if !HengeTunnel.isEmbedded, LocalDevVPN.isInstalled, !LocalDevVPN.isConnected {
             log("JIT at launch: LocalDevVPN is not connected; opening it to connect")
             awaitingVPN = true
             LocalDevVPN.open()
@@ -326,8 +327,16 @@ final class JITCoordinator: ObservableObject {
         error = nil
         connectionProblem = nil
         advice = nil
-        if attempt == 1 { status = "Checking LocalDevVPN and the Developer Disk Image…" }
-        RemotePairingPortDiscovery.resolve { port in
+        if attempt == 1 {
+            status = HengeTunnel.isEmbedded ? "Checking the Developer Disk Image…"
+                                            : "Checking LocalDevVPN and the Developer Disk Image…"
+        }
+        withTunnel(failed: { [weak self] failure in
+            self?.busy = false
+            self?.prepared = false
+            self?.status = nil
+            self?.error = failure
+        }) { RemotePairingPortDiscovery.resolve { port in
             HengeBuiltInJIT.send(.prepare(pairingData: pairing, rsdPort: port)) { [weak self] result in
                 guard let self else { return }
                 switch result {
@@ -349,7 +358,7 @@ final class JITCoordinator: ObservableObject {
                     error = failure.localizedDescription
                 }
             }
-        }
+        } }
     }
 
     func enableBuiltIn(attempt: Int = 1) {
@@ -386,14 +395,15 @@ final class JITCoordinator: ObservableObject {
             }
         }
 
-        RemotePairingPortDiscovery.resolve { port in
+        withTunnel(failed: finish) { RemotePairingPortDiscovery.resolve { port in
             HengeBuiltInJIT.send(
                 .enable(targetPID: getpid(), pairingData: pairing, scriptBase64: script, rsdPort: port),
                 started: { [weak self] in
                     if attempt == 1 { self?.status = "Waiting for the helper to attach…" }
                     readiness = Self.waitForDebugger { attached in
                         finish(attached ? nil : "The helper did not attach within 90 seconds. "
-                                              + "Check that LocalDevVPN is connected, then try again.")
+                                              + (HengeTunnel.isEmbedded ? "Try again."
+                                                 : "Check that LocalDevVPN is connected, then try again."))
                     }
                 },
                 completion: { [weak self] result in
@@ -402,7 +412,10 @@ final class JITCoordinator: ObservableObject {
                     case .success(let response):
                         self?.txmPresent = response.txmPresent
                         HengeLog.log("jit", "helper: \(response.message)")
-                        if !response.success {
+                        if response.success {
+                            // Henge has detached: the helper is done with the device, and so is the VPN.
+                            HengeTunnel.disconnectIfOurs()
+                        } else {
                             guard let self else { return }
                             // Not finish(): a retry keeps the screen busy and the next attempt starts its own watch.
                             if !finished,
@@ -412,12 +425,27 @@ final class JITCoordinator: ObservableObject {
                                 readiness?.invalidate()
                                 return
                             }
+                            HengeTunnel.disconnectIfOurs()
                             finish(helperFailure(response.message))
                         }
                     case .failure(let failure):
+                        HengeTunnel.disconnectIfOurs()
                         finish(failure.localizedDescription)
                     }
                 })
+        } }
+    }
+
+    /// With Henge's own VPN embedded and no tunnel up, connects it first: the helper reaches this device at
+    /// 10.7.0.1 through it. Otherwise (LocalDevVPN, or a build without the VPN) goes straight on.
+    private func withTunnel(failed: @escaping (String) -> Void, then: @escaping () -> Void) {
+        guard HengeTunnel.isEmbedded, !LocalDevVPN.isConnected else {
+            then()
+            return
+        }
+        status = "Connecting Henge's VPN…"
+        HengeTunnel.connect { failure in
+            if let failure { failed(failure) } else { then() }
         }
     }
 
@@ -580,7 +608,17 @@ enum RemotePairingPortDiscovery {
         let resultLock = NSLock()
         var finished = false
         var resolvedPort: UInt16?
-        var pendingConnection: NWConnection?
+        var tried = Set<NWEndpoint>()
+        var pendingConnections: [NWConnection] = []
+
+        func isThisDevice(_ host: NWEndpoint.Host) -> Bool {
+            switch host {
+            case .ipv4(let address): return OwnAddresses.isOwn(address.rawValue)
+            case .ipv6(let address): return OwnAddresses.isOwn(address.rawValue)
+            case .name(let name, _): return OwnAddresses.isThisDevice(host: name)
+            @unknown default: return false
+            }
+        }
 
         func finish(_ port: UInt16?) {
             resultLock.lock()
@@ -598,40 +636,38 @@ enum RemotePairingPortDiscovery {
             return finished
         }
 
+        // Every Apple device on the network advertises the service; only one that turns out to be this device
+        // counts (OwnAddresses). Taking the first answer once handed the helper a nearby iPhone's port.
         browser.browseResultsChangedHandler = { results, _ in
             guard !hasFinished() else { return }
+            let ordered = results.filter { $0.interfaces.contains { $0.name == "lo0" } }
+                + results.filter { !$0.interfaces.contains { $0.name == "lo0" } }
+            for result in ordered {
+                guard case .service = result.endpoint else { continue }
+                resultLock.lock()
+                let fresh = tried.insert(result.endpoint).inserted
+                let connection = fresh ? NWConnection(to: result.endpoint, using: parameters) : nil
+                if let connection { pendingConnections.append(connection) }
+                resultLock.unlock()
+                guard let connection else { continue }
 
-            let preferred = results.first { result in
-                result.interfaces.contains { $0.name == "lo0" }
-            } ?? results.first
-            guard let result = preferred, case .service = result.endpoint else { return }
-
-            resultLock.lock()
-            let alreadyConnecting = pendingConnection != nil
-            if !alreadyConnecting {
-                pendingConnection = NWConnection(to: result.endpoint, using: parameters)
-            }
-            let connection = pendingConnection
-            resultLock.unlock()
-
-            guard !alreadyConnecting, let connection else { return }
-
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
-                       case .hostPort(_, let port) = remoteEndpoint {
-                        finish(port.rawValue)
-                    } else {
-                        finish(nil)
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        if case .hostPort(let host, let port) = connection.currentPath?.remoteEndpoint,
+                           isThisDevice(host) {
+                            finish(port.rawValue)
+                        } else {
+                            connection.cancel()
+                        }
+                    case .failed:
+                        connection.cancel()
+                    default:
+                        break
                     }
-                case .failed, .cancelled:
-                    finish(nil)
-                default:
-                    break
                 }
+                connection.start(queue: queue)
             }
-            connection.start(queue: queue)
         }
 
         browser.stateUpdateHandler = { state in
@@ -648,9 +684,9 @@ enum RemotePairingPortDiscovery {
         browser.cancel()
 
         resultLock.lock()
-        let connectionToCancel = pendingConnection
+        let connectionsToCancel = pendingConnections
         resultLock.unlock()
-        connectionToCancel?.cancel()
+        connectionsToCancel.forEach { $0.cancel() }
 
         resultLock.lock()
         defer { resultLock.unlock() }

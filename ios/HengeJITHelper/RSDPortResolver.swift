@@ -8,7 +8,8 @@ import dnssd
 /// 49152 StikJIT falls back to is closed then, so every attempt times out at 10.7.0.1:49152. Henge's own lookup
 /// (RemotePairingPortDiscovery) connects to the service to learn its port, and on some devices that never
 /// becomes ready. This reads the port from the service's SRV record with DNSServiceResolve instead, which
-/// needs no connection.
+/// needs no connection. Every Apple device on the network advertises the service, so only one whose host is this
+/// device counts (OwnAddresses); taking the first answer once picked a nearby iPhone's port.
 enum RSDPortResolver {
     struct Result {
         var port: UInt16?
@@ -45,6 +46,7 @@ enum RSDPortResolver {
                 return Result(port: port, detail: "resolved \(serviceType) to port \(port) on \(state.host ?? "?")")
             }
             var detail = "no port within \(Int(timeout))s: \(state.seen) service(s) seen"
+            if !state.others.isEmpty { detail += ", other devices' skipped (\(state.others.joined(separator: ", ")))" }
             if let error = state.lastError { detail += ", last error \(describe(error))" }
             return Result(port: nil, detail: detail)
         }
@@ -60,6 +62,8 @@ enum RSDPortResolver {
         var host: String?
         var lastError: DNSServiceErrorType?
         var finished = false
+        /// Services found on other devices, as host:port, for the log.
+        var others: [String] = []
 
         func finish(port: UInt16, host: String) {
             guard self.port == nil, !finished else { return }
@@ -98,8 +102,19 @@ enum RSDPortResolver {
         }
         // The port arrives in network byte order.
         let value = UInt16(bigEndian: port)
-        guard value != 0 else { return }
-        state.finish(port: value, host: host.map { String(cString: $0) } ?? "?")
+        guard value != 0, let host, let queue = state.queue else { return }
+        let name = String(cString: host)
+        // Resolving the host name blocks, so not on the queue the other callbacks wait on.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let mine = OwnAddresses.isThisDevice(host: name)
+            queue.async {
+                if mine {
+                    state.finish(port: value, host: name)
+                } else if !state.finished {
+                    state.others.append("\(name):\(value)")
+                }
+            }
+        }
     }
 
     private static func describe(_ error: DNSServiceErrorType) -> String {

@@ -11,7 +11,8 @@ cd "$ROOT"
 [ -f ios/deps/lib/libslirp.a ] || zsh ios/scripts/fetch_deps.sh
 [ -f build/ios/libhengerestore.a ] || zsh tools/build_ios_restore.sh
 cd ios
-xcodegen generate >/dev/null
+# With Henge's own VPN (ios/tunnel.yml), so the built-in JIT needs no LocalDevVPN.
+xcodegen generate --spec project.tunnel.yml >/dev/null
 DD="$ROOT/build/visionos/DerivedData"
 mkdir -p "$DD"
 xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \

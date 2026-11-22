@@ -43,7 +43,9 @@ the raw `P` packets that `henge-jit.js` sends.
 Henge's built-in StikJIT helper works on the Vision Pro, and boots macOS in seconds rather than minutes. It
 needed three things:
 
-- **LocalDevVPN.** It isn't offered in the headset's App Store, but its source
+- **A loopback VPN.** `build_henge.sh` builds Henge with its own (`ios/HengeTunnel`, from
+  `project.tunnel.yml`), which Henge connects while it turns JIT on. Without it, LocalDevVPN: it isn't offered
+  in the headset's App Store, but its source
   ([jkcoxson/LocalDevVPN](https://github.com/jkcoxson/LocalDevVPN)) builds unchanged for iOS with a paid team
   (a `CodeSigning.xcconfig` with your team and prefix) and connects in compatibility mode.
 - **A pairing file.** On iOS 27 Henge advertises itself as a computer and the device pairs into it. visionOS
