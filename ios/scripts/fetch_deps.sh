@@ -4,8 +4,12 @@
 #   libhusk_rppairing.a   on-device pairing (Husk's src/rppairing-ios, scripts/build_rppairing_ios.sh)
 #   libslirp, glib, intl, pcre2 (arm64 iOS static libraries, Husk's scripts/build_ios.sh)
 set -e
-HUSK=${HUSK:-$HOME/Documents/Coding/Husk}
-DEPS="$(cd "$(dirname "$0")/.." && pwd)/deps"
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# A checkout inside this repository (deps/Husk, ignored by git) first, then the usual place.
+if [ -z "$HUSK" ]; then
+    if [ -d "$REPO/deps/Husk" ]; then HUSK="$REPO/deps/Husk"; else HUSK="$HOME/Documents/Coding/Husk"; fi
+fi
+DEPS="$REPO/ios/deps"
 mkdir -p "$DEPS/lib"
 rm -rf "$DEPS/StikJIT.xcframework"
 ditto "$HUSK/src/app/Frameworks/StikJIT.xcframework" "$DEPS/StikJIT.xcframework"
