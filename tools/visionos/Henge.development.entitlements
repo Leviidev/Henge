@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- For a development build signed by Xcode with a paid team and installed directly (tools/visionos/build_henge.sh).
+     Henge.entitlements without dynamic-codesigning, which no development profile can carry: JIT comes from a
+     debugger here (tools/visionos/run_jit.sh). The other keys' reasons are in ios/Henge/Henge.entitlements. -->
+<dict>
+	<key>get-task-allow</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>
