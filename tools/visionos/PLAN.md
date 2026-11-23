@@ -53,9 +53,21 @@ LLDB, since the page writes no longer cross Wi-Fi. Details in [README.md](README
 - [x] **The helper extension:** visionOS has no `com.apple.ar.viewer` point, so the helper is registered under
       `com.apple.share-services` in the Vision Pro build (`HENGE_JIT_HELPER_EXTENSION_POINT`).
 - [x] **Turn On JIT** end to end, with the developer disk image already mounted by the Mac.
-- [ ] **Developer disk image after a restart.** StikJIT downloads iOS images (`DeveloperDiskImageService.swift`).
-      Check whether it mounts one after the headset restarts with no Mac, or whether it needs the xrOS one that
-      Xcode keeps in `/Library/Developer/DeveloperDiskImages/xrOS_DDI`.
+- [x] **Developer disk image after a restart.** StikJIT downloads iOS images (from doronz88's
+      DeveloperDiskImage repository, which has no visionOS ones), and the iOS image can't be signed for the
+      headset: its board, `0x42`, is only in Xcode's `xrOS_DDI`. With that image in the helper's cache, Check setup
+      installed it after a restart with no Mac, and JIT turned on.
+- [ ] **Importing the visionOS image** (`VisionDDI.swift`; JIT setup › Turn on JIT › Import visionOS disk
+      image): the user zips `/Library/Developer/DeveloperDiskImages/xrOS_DDI` on a Mac with Xcode, AirDrops it,
+      expands it in Files and picks the folder; the helper keeps it in its cache. On the headset the helper no
+      longer lets StikJIT download the iOS image: with nothing mounted and nothing imported, it asks for the
+      import. Henge doesn't host or download the image: Apple's license doesn't allow redistributing it.
+- [ ] Later, to make the import easier: an extraction script, in Python so it runs on Windows and Linux too, for
+      people without a Mac. On a Mac with Xcode it zips the installed folder; otherwise it takes Xcode's `.xip`
+      (downloaded with the user's Apple ID) and unpacks only `XcodeSystemResources.pkg` ›
+      `Library/Developer/CoreDevice/CandidateDDIs/xrOS_DDI.dmg` › `Restore`, all formats with open tools (xar,
+      pbzx, cpio, a disk image 7-Zip reads). Further off: a download address the user gives, or Henge
+      downloading and unpacking the `.xip` itself after an Apple ID login.
 - [x] **Pairing on the headset** (JIT setup › Pair on this Apple Vision Pro, `JITVisionPairing.swift`). Henge
       connects its VPN, finds the headset's own `_remotepairing-manual-pairing._tcp` once Settings › General ›
       Remote Devices is open beside it, connects at 10.7.0.1 and sends the code the user types. The client is

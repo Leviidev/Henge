@@ -94,6 +94,11 @@ final class JITCoordinator: ObservableObject {
     /// The setup check passed for the current pairing file.
     @Published private(set) var prepared = false
     @Published private(set) var pairingSource = JITPairingFileStore.source
+    /// On an Apple Vision Pro: the helper has no disk image it can use, so the user must import visionOS's.
+    @Published private(set) var needsVisionDDI = false
+    /// The build of the visionOS disk image last imported (VisionDDI), or nil.
+    @Published private(set) var visionDDIBuild = UserDefaults.standard.string(forKey: visionDDIBuildKey)
+    private static let visionDDIBuildKey = "henge.jit.visionDDIBuild"
     /// Bumped each time the built-in helper attaches. Henge stays in the
     /// foreground for that, so nothing else tells ContentView to claim the region.
     @Published private(set) var attachGeneration = 0
@@ -348,6 +353,7 @@ final class JITCoordinator: ObservableObject {
                     }
                     busy = false
                     txmPresent = response.txmPresent
+                    needsVisionDDI = response.needsDDI == true
                     prepared = response.success
                     status = response.success ? response.message : nil
                     error = response.success ? nil : helperFailure(response.message)
@@ -417,6 +423,7 @@ final class JITCoordinator: ObservableObject {
                             HengeTunnel.disconnectIfOurs()
                         } else {
                             guard let self else { return }
+                            needsVisionDDI = response.needsDDI == true
                             // Not finish(): a retry keeps the screen busy and the next attempt starts its own watch.
                             if !finished,
                                retryIfAdvised(helperMessage: response.message, attempt: attempt,
@@ -449,6 +456,48 @@ final class JITCoordinator: ObservableObject {
         }
     }
 
+    /// Hands visionOS's disk image, from the folder the user picked, to the helper to keep in its cache.
+    func importVisionDDI(_ folder: URL) {
+        guard HengeBuiltInJIT.unavailableReason == nil else {
+            error = HengeBuiltInJIT.unavailableReason
+            return
+        }
+        busy = true
+        error = nil
+        status = "Importing visionOS's disk image…"
+        let scoped = folder.startAccessingSecurityScopedResource()
+        let image: (build: String, files: [String: Data])
+        do {
+            defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
+            image = try VisionDDI.files(in: folder)
+        } catch {
+            busy = false
+            status = nil
+            self.error = error.localizedDescription
+            log("visionOS disk image import failed: \(error.localizedDescription)")
+            return
+        }
+        HengeBuiltInJIT.send(.installDDI(files: image.files)) { [weak self] result in
+            guard let self else { return }
+            busy = false
+            switch result {
+            case .success(let response) where response.success:
+                needsVisionDDI = false
+                prepared = false
+                visionDDIBuild = image.build
+                UserDefaults.standard.set(image.build, forKey: Self.visionDDIBuildKey)
+                status = "visionOS's disk image (\(image.build)) is imported. Tap Check setup."
+                log("visionOS disk image \(image.build) imported")
+            case .success(let response):
+                status = nil
+                error = response.message
+            case .failure(let failure):
+                status = nil
+                error = failure.localizedDescription
+            }
+        }
+    }
+
     func resetDDI() {
         busy = true
         error = nil
@@ -459,6 +508,10 @@ final class JITCoordinator: ObservableObject {
             prepared = false
             switch result {
             case .success(let response):
+                if response.success, VisionDDI.isVision {
+                    visionDDIBuild = nil
+                    UserDefaults.standard.removeObject(forKey: Self.visionDDIBuildKey)
+                }
                 status = response.success ? response.message : nil
                 error = response.success ? nil : response.message
             case .failure(let failure):

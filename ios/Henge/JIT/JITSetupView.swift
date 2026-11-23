@@ -17,6 +17,8 @@ struct JITSetupFlow: View {
     @State private var visionCode = ""
     @State private var path: [Step] = []
     @State private var importing = false
+    /// The file importer picks visionOS's disk image folder rather than a pairing file.
+    @State private var importingDDI = false
     @Environment(\.dismiss) private var dismiss
 
     private var device: String { OnDevicePairing.deviceKind }
@@ -44,11 +46,14 @@ struct JITSetupFlow: View {
                 }
         }
         .tint(Theme.accent)
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.propertyList, .data]) { result in
+        .fileImporter(isPresented: $importing,
+                      allowedContentTypes: importingDDI ? [.folder] : [.propertyList, .data]) { result in
+            let ddi = importingDDI
+            importingDDI = false
             switch result {
-            case .success(let url): jit.importPairingFile(url)
+            case .success(let url): ddi ? jit.importVisionDDI(url) : jit.importPairingFile(url)
             case .failure(let failure):
-                HengeLog.log("jit", "pairing import failed: \(failure.localizedDescription)")
+                HengeLog.log("jit", "\(ddi ? "disk image" : "pairing") import failed: \(failure.localizedDescription)")
             }
         }
         .onAppear {
@@ -404,6 +409,29 @@ struct JITSetupFlow: View {
 
     // MARK: Enable
 
+    /// visionOS's Developer Disk Image, which Henge can't download (VisionDDI): imported once from a Mac's Xcode.
+    private var visionDDICard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("visionOS's disk image").font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
+            Text(jit.visionDDIBuild.map { "Imported (\($0)). Henge keeps it until you remove it." }
+                 ?? "Henge can't download this one, so import it once. On a Mac with Xcode, zip the folder "
+                  + "/Library/Developer/DeveloperDiskImages/xrOS_DDI and AirDrop it here. Open the zip in Files "
+                  + "to expand it, then choose the xrOS_DDI folder. Not needed while a Mac has mounted it since "
+                  + "your \(device) last restarted.")
+                .font(.system(size: 13))
+                .foregroundStyle(jit.needsVisionDDI ? .orange : Theme.textDim)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(jit.visionDDIBuild == nil ? "Import visionOS disk image" : "Import it again") {
+                importingDDI = true
+                importing = true
+            }
+            .font(.system(size: 14, weight: .semibold))
+            .disabled(jit.busy)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16).hengeCard()
+    }
+
     private var attached: Bool { jit.attachGeneration > 0 || JITBootstrap.debuggedFlag }
 
     private var enable: some View {
@@ -446,8 +474,13 @@ struct JITSetupFlow: View {
                 outcome(status, ok: true)
             }
 
+            if VisionDDI.isVision && !attached {
+                visionDDICard
+            }
+
             if !attached {
-                Button("Reset Developer Disk Image", role: .destructive) { jit.resetDDI() }
+                Button(VisionDDI.isVision ? "Remove the disk image" : "Reset Developer Disk Image",
+                       role: .destructive) { jit.resetDDI() }
                     .font(.system(size: 13, weight: .medium))
                     .disabled(jit.busy)
                     .padding(.top, 4)

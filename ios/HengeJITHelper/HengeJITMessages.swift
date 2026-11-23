@@ -13,6 +13,8 @@ struct HengeJITRequest: Codable, Sendable {
         /// Attach to `targetPID` and run the JIT script until it detaches.
         case enable
         case resetDDI
+        /// Store visionOS's Developer Disk Image, imported by the user, in StikJIT's cache (VisionDDI).
+        case installDDI
     }
 
     let operation: Operation
@@ -22,6 +24,8 @@ struct HengeJITRequest: Codable, Sendable {
     /// The port the device is currently advertising for RemotePairing. iOS picks
     /// a new one when it boots; nil means StikJIT's default.
     let rsdPort: UInt16?
+    /// For installDDI: the image's files by path relative to its Restore folder.
+    var ddiFiles: [String: Data]? = nil
 
     static func prepare(pairingData: Data, rsdPort: UInt16? = nil) -> HengeJITRequest {
         HengeJITRequest(operation: .prepare, targetPID: nil,
@@ -39,10 +43,17 @@ struct HengeJITRequest: Codable, Sendable {
                        pairingData: nil, scriptBase64: nil, rsdPort: nil)
     }
 
+    static func installDDI(files: [String: Data]) -> HengeJITRequest {
+        HengeJITRequest(operation: .installDDI, targetPID: nil,
+                       pairingData: nil, scriptBase64: nil, rsdPort: nil, ddiFiles: files)
+    }
+
     struct Response: Codable, Sendable {
         static let itemKey = "henge-jit-response"
         let success: Bool
         let message: String
         let txmPresent: Bool?
+        /// On an Apple Vision Pro: no disk image is mounted and none was imported, so the user must import one.
+        var needsDDI: Bool? = nil
     }
 }

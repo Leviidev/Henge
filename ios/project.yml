@@ -53,6 +53,8 @@ targets:
       - path: HengeJITHelper/OwnAddresses.swift
       # Finds this device's Bonjour services by port (also for pairing on an Apple Vision Pro).
       - path: HengeJITHelper/RSDPortResolver.swift
+      # visionOS's Developer Disk Image, imported by the user (the helper stores it).
+      - path: HengeJITHelper/VisionDDI.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(HENGE_BUNDLE_IDENTIFIER)
