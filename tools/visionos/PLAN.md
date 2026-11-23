@@ -104,9 +104,11 @@ Useful in compatibility mode already, so probably before step 4.
 
 ## 4. The native visionOS version
 
-What it adds is the Vision Pro experience: windows, ornaments and gaze-driven input. Compatibility mode
-already runs the engine, graphics and installer unchanged, so this can wait until the iPad version feels
-limiting.
+What it adds is the Vision Pro experience: windows, ornaments, immersive spaces, and ARKit's hand and table
+tracking, none of which an iPad app in compatibility mode gets. The first native build keeps today's input:
+pointing (a look and a pinch clicks there) and the system keyboard. The table trackpad comes after the window.
+
+### 4.1 A native build that boots, with JIT from the Mac
 
 **C libraries (mostly mechanical):**
 - [ ] The engine: a visionOS variant of the `Makefile`'s `IOS_CC` and `IOS_SDK` (`xcrun --sdk xros`,
@@ -116,25 +118,56 @@ limiting.
 - [ ] Husk's libffi, glib (with pcre2 and intl) and libslirp: meson cross files for `xros` in
       `scripts/build_ios.sh`
 
-**Rust (the risky part, and only for JIT on the headset):**
-- [ ] StikJIT's `idevice` (`libidevice_ffi.a` ships iOS-only) and Husk's `husk_rppairing` for
-      `aarch64-apple-visionos`, a tier 3 Rust target (a nightly compiler and `-Zbuild-std`)
-- [ ] StikJIT's Swift built for `xros`. The frameworks it uses (JavaScriptCore, Network, Security,
-      IOKit) are in the visionOS SDK. Its embed script's `CFBundleSupportedPlatforms` says `iPhoneOS`.
-- [ ] Until then, a native build can take JIT from a Mac (`run_jit.sh`) the way the iPad build does
-
 **The app:**
 - [ ] A visionOS target in `ios/project.yml` (this xcodegen needs `SDKROOT: xros` and
-      `TARGETED_DEVICE_FAMILY: 7` on an iOS target, as `jitprobe/project.yml` does)
+      `TARGETED_DEVICE_FAMILY: 7` on an iOS target, as `jitprobe/project.yml` does). `Device.isVision` and
+      `VisionDDI.isVision` become `#if os(visionOS)`.
+- [ ] JIT from the Mac (`run_jit.sh`) while 4.2 isn't done, as the iPad build had it
+- [ ] **Check first: the memory entitlements.** In compatibility mode Henge gets increased-memory-limit and
+      extended-virtual-addressing (a 6139 MB limit). jitprobe ran natively but never asked for them. If a native
+      app doesn't get them, the guest's RAM has to shrink.
+
+### 4.2 JIT on the headset, natively
+
+The risky part. Everything else from step 2 carries over (Henge's VPN, pairing on the headset, the disk image
+import, the port lookup).
+- [ ] StikJIT's `idevice` (`libidevice_ffi.a` ships iOS-only), Husk's `husk_rppairing` and Henge's
+      `rppairing-client` for `aarch64-apple-visionos`, a tier 3 Rust target (a nightly compiler and `-Zbuild-std`)
+- [ ] StikJIT's Swift built for `xros`. The frameworks it uses (JavaScriptCore, Network, Security,
+      IOKit) are in the visionOS SDK. Its embed script's `CFBundleSupportedPlatforms` says `iPhoneOS`.
+- [ ] The helper and the VPN extension as visionOS extensions, and the `#available(iOS 26, *)` checks that
+      decide JIT behaviour (`JITBootstrap.swift`, `JITBuiltIn.swift`, `JITPairing.swift`) checked on visionOS
+
+### 4.3 The window
+
+Input stays as in compatibility mode: pointing and the system keyboard.
+- [ ] A fixed Mac resolution (2560×1440, say) in a window that keeps its aspect as it's resized, instead of
+      the iPad's screen-shaped Mac
 - [ ] Sizes from the window scene instead of `UIScreen.main` (`Hardware.swift`, `MacScreen.swift`,
       `Input.swift`, `BootDisplay.swift`). Haptics behind a check.
 - [ ] No `VolumeClicks.swift` and no external display on visionOS (`DisplayRouter`,
       `ExternalDisplaySceneDelegate`, `LegacyExternalDisplay`, `ExternalScreenPlan`)
-- [ ] A fixed Mac resolution (2560×1440, say) in a window that keeps its aspect as it's resized, instead of
-      the iPad's screen-shaped Mac
-- [ ] The keyboard row as an ornament, and the `#available(iOS 26, *)` checks that decide JIT behaviour
-      (`JITBootstrap.swift`, `JITBuiltIn.swift`, `JITPairing.swift`) checked on visionOS
-- [ ] Later: a large immersive screen through CompositorServices
+- [ ] Ornaments: a row of Mac keys (Esc, Tab, Control, Option, Command) and the session's controls
+
+### 4.4 A trackpad on the table
+
+- [ ] **A prototype first**, a small native app (jitprobe builds natively and is a start): ARKit's plane
+      detection finds a table (horizontal, classified `.table`), RealityKit draws a trackpad on it, and hand
+      tracking counts a fingertip within about a centimetre of it as a touch. Does detection feel reliable and
+      precise enough?
+- [ ] In Henge: movement becomes relative mouse motion, so the cursor moves continuously (hover effects and
+      tooltips work, which pinching can't give: visionOS never tells apps where the user looks). Two fingers
+      scroll, a tap clicks, and the Mac's gestures from `Trackpad.swift` carry over.
+- [ ] The limit: hand and table tracking only work in an immersive space, which hides other apps' windows.
+      That suits a Henge session, but it decides the layout (4.5).
+
+### 4.5 The immersive session
+
+- [ ] Henge's own space: the Mac's screen in a large or curved panel (RealityKit, or CompositorServices), the
+      table trackpad, and the Mac's gestures (Mission Control, Spaces)
+- [ ] An experiment: a keyboard on the table. Typing on a flat surface with no feel, through tracking accurate to
+      about a centimetre, may be too error-prone; a Bluetooth keyboard (shown in passthrough) and the system
+      keyboard stay the main ways to type.
 
 ## 5. Mac windows as visionOS windows
 
