@@ -1,1 +1,3 @@
 build/
+# Local checkouts of Husk and StikJIT (deps/Husk, deps/StikJIT): see README.md, Building.
+/deps/

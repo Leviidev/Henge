@@ -126,6 +126,42 @@ static const uint8_t tp_config_desc[34] = {
 
 static const char *const tp_strings[] = {NULL, "Apple Inc.", "Magic Trackpad 2", "HengeVM"};
 
+/* Port 3: an absolute pointer, as a USB HID mouse whose X and Y are absolute (0..32767
+   across the screen), with three buttons, a wheel and horizontal pan: what QEMU calls a
+   USB tablet, which macOS drives with its own HID pointing driver. The host puts the
+   pointer where the user points at the screen; nothing has to be accumulated. */
+
+static const uint8_t tab_report_desc[] = {
+    0x05, 0x01, 0x09, 0x02, 0xa1, 0x01,       /* usage page (generic desktop), usage (mouse), collection (application) */
+    0x09, 0x01, 0xa1, 0x00,                  /* usage (pointer), collection (physical) */
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, /* buttons 1-3 */
+    0x95, 0x03, 0x75, 0x01, 0x81, 0x02,       /* three bits: data, variable, absolute */
+    0x95, 0x01, 0x75, 0x05, 0x81, 0x01,       /* five bits of padding */
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31,       /* X, Y */
+    0x15, 0x00, 0x26, 0xff, 0x7f, 0x35, 0x00, 0x46, 0xff, 0x7f, /* 0..32767, physically the same */
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x02,       /* two 16-bit fields: data, variable, absolute */
+    0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x35, 0x00, 0x45, 0x00, /* wheel, -127..127 */
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x06,       /* one byte: data, variable, relative */
+    0x05, 0x0c, 0x0a, 0x38, 0x02,             /* usage page (consumer), usage (AC Pan): horizontal scrolling */
+    0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+    0xc0, 0xc0,
+};
+
+static const uint8_t tab_device_desc[18] = {
+    18, 1, 0x00, 0x02, 0, 0, 0, 64, /* USB 2.0, class per interface, EP0 64 bytes */
+    0x09, 0x12, 0x01, 0x00,         /* vendor 0x1209 (pid.codes, open source), product 0x0001 */
+    0x00, 0x01, 1, 2, 3, 1,         /* bcdDevice 1.00, strings 1-3, one configuration */
+};
+
+static const uint8_t tab_config_desc[34] = {
+    9, 2, 34, 0, 1, 1, 0, 0xa0, 50,           /* one interface, remote wakeup, 100 mA */
+    9, 4, 0, 0, 1, 3, 0, 0, 0,                /* interface 0: HID, no boot protocol (it is absolute) */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof tab_report_desc, 0, /* HID 1.11, one report descriptor */
+    7, 5, 0x81, 3, 8, 0, 4,                   /* EP1 IN, interrupt, 8 bytes, every 4 ms */
+};
+
+static const char *const tab_strings[] = {NULL, "HengeVM", "HengeVM USB Tablet", "1"};
+
 struct HvXhciDev {
     const char *const *strings;
     const uint8_t *device_desc;
@@ -136,6 +172,7 @@ struct HvXhciDev {
 static const struct HvXhciDev devs[HV_XHCI_DEVICES] = {
     {kbd_strings, kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_report_desc},
     {tp_strings, tp_device_desc, tp_config_desc, tp_report_desc, sizeof tp_report_desc},
+    {tab_strings, tab_device_desc, tab_config_desc, tab_report_desc, sizeof tab_report_desc},
 };
 
 static int xlog(void) {
@@ -373,7 +410,12 @@ static int control(HvXhci *x, int slot, const uint8_t setup[8], uint8_t *out, in
         src = tmp, len = 1;
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT: wValue is (type << 8) | report ID */
         if (x->slots[slot].dev == 0) src = x->state, len = 8;
-        else {
+        else if (x->slots[slot].dev == 2) { /* the tablet: where it points now */
+            pthread_mutex_lock(&x->mu);
+            memcpy(tmp, x->tab_state, HV_TAB_REPORT_LEN);
+            pthread_mutex_unlock(&x->mu);
+            src = tmp, len = HV_TAB_REPORT_LEN;
+        } else {
             int rtype = value >> 8, rid = value & 0xff;
             if (rtype == 3) { /* feature: the sensor-configuration registers */
                 if (rid == 0x01) { /* the header for the register just selected */
@@ -505,6 +547,20 @@ static void run_ep_in(HvXhci *x, int slot) {
             wr(x, buf, x->reports[x->rhead % HV_XHCI_REPORTS], n);
             x->rhead++;
             x->delivered++;
+            transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
+        }
+    } else if (s->dev == 2) {
+        while (x->tab_rhead != x->tab_rtail && ring_peek(x, r, trb, &at)) {
+            int type = (trb[3] >> 10) & 0x3f;
+            ring_advance(r);
+            if (type != TRB_NORMAL) continue;
+            uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
+            uint32_t want = trb[2] & 0x1ffff;
+            uint32_t n = want < HV_TAB_REPORT_LEN ? want : HV_TAB_REPORT_LEN;
+            wr(x, buf, x->tab_reports[x->tab_rhead % HV_TAB_REPORTS], n);
+            x->tab_rhead++;
+            x->tab_delivered++;
+            if (x->tab_delivered <= 4) fprintf(stderr, "hengevm: xhci: tablet: %u bytes to the guest (delivered %llu)\n", n, (unsigned long long)x->tab_delivered);
             transfer_event(x, at, n < want ? CC_SHORT_PACKET : CC_SUCCESS, want - n, slot, dci);
         }
     } else {
@@ -701,10 +757,12 @@ static void run_commands(HvXhci *x) {
 /* ---- ports ---- */
 
 /* Port 1 is the full-speed keyboard; port 2 is the high-speed trackpad, as the real
-   Magic Trackpad 2 is. */
+   Magic Trackpad 2 is; port 3 is the full-speed tablet. */
+static uint32_t port_speed(int p) { return p == 1 ? SPEED_HIGH : SPEED_FULL; }
+
 static void port_connect(HvXhci *x) {
     for (int p = 0; p < HV_XHCI_PORTS; p++) {
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | port_speed(p) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
         port_event(x, p);
     }
 }
@@ -760,8 +818,12 @@ static void reset(HvXhci *x) {
     x->tp_db = 0;
     x->tp_multi_logs = 0;
     x->tp_f1_len = 0;
+    memset(x->tab_state, 0, sizeof x->tab_state);
+    x->tab_rhead = x->tab_rtail = 0;
+    x->tab_tail_move = 0;
+    x->tab_delivered = 0;
     for (int p = 0; p < HV_XHCI_PORTS; p++)
-        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | (uint32_t)(p ? SPEED_HIGH : SPEED_FULL) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
+        x->portsc[p] = PORT_PP | PORT_CCS | PORT_CSC | port_speed(p) << PORT_SPEED_SHIFT | 7u << PORT_PLS_SHIFT;
     update_irq(x);
 }
 
@@ -789,7 +851,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
         if (size == 8 && i + 1 < 8) v |= (uint64_t)cap[i + 1] << 32;
         v >>= 8 * (off & 3);
     } else if (off >= XECP && off < XECP + 16) { /* Supported Protocol: USB 2.0 on every port */
-        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | ((1u << HV_XHCI_PORTS) - 1u) << 8, 0};
+        static const uint32_t ext[4] = {2u | 0x0200u << 16, 0x20425355, 1u | (uint32_t)HV_XHCI_PORTS << 8, 0}; /* ports 1..N */
         uint32_t i = (uint32_t)(off - XECP) / 4;
         v = ext[i];
         if (size == 8 && i + 1 < 4) v |= (uint64_t)ext[i + 1] << 32;
@@ -1107,6 +1169,54 @@ void hv_xhci_touch_button(HvXhci *x, int down) {
     if (x->tp_button != (down & 1)) {
         x->tp_button = down & 1;
         tp_queue(x, 0);
+    }
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+/* ---- the tablet's reports ---- */
+
+/* Queue one report (the caller holds the lock). A plain move replaces a plain move still
+   waiting, so a fast pointer does not fill the queue with places the guest never needs;
+   a press, a release or a scroll always gets its own report, at its own position. */
+static void tab_queue(HvXhci *x, const uint8_t *r, int move) {
+    if (move && x->tab_tail_move && x->tab_rtail != x->tab_rhead) {
+        memcpy(x->tab_reports[(x->tab_rtail - 1) % HV_TAB_REPORTS], r, HV_TAB_REPORT_LEN);
+        return;
+    }
+    if (x->tab_rtail - x->tab_rhead >= HV_TAB_REPORTS) return; /* the guest is not reading: drop it */
+    memcpy(x->tab_reports[x->tab_rtail++ % HV_TAB_REPORTS], r, HV_TAB_REPORT_LEN);
+    x->tab_tail_move = move;
+}
+
+void hv_xhci_tablet(HvXhci *x, int px, int py, int buttons) {
+    if (!x) return;
+    px = px < 0 ? 0 : px > HV_TABLET_MAX ? HV_TABLET_MAX : px;
+    py = py < 0 ? 0 : py > HV_TABLET_MAX ? HV_TABLET_MAX : py;
+    uint8_t r[HV_TAB_REPORT_LEN] = {(uint8_t)(buttons & 7), (uint8_t)px, (uint8_t)(px >> 8), (uint8_t)py, (uint8_t)(py >> 8), 0, 0};
+    pthread_mutex_lock(&x->mu);
+    int move = r[0] == x->tab_state[0];
+    if (!move || memcmp(r, x->tab_state, HV_TAB_REPORT_LEN)) {
+        memcpy(x->tab_state, r, HV_TAB_REPORT_LEN);
+        tab_queue(x, r, move);
+    }
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+void hv_xhci_tablet_scroll(HvXhci *x, int dx, int dy) {
+    if (!x) return;
+    pthread_mutex_lock(&x->mu);
+    while (dx || dy) { /* a byte a step: larger amounts go out as several reports */
+        int sy = dy < -127 ? -127 : dy > 127 ? 127 : dy;
+        int sx = dx < -127 ? -127 : dx > 127 ? 127 : dx;
+        uint8_t r[HV_TAB_REPORT_LEN];
+        memcpy(r, x->tab_state, HV_TAB_REPORT_LEN);
+        r[5] = (uint8_t)(int8_t)sy;
+        r[6] = (uint8_t)(int8_t)sx;
+        tab_queue(x, r, 0);
+        dy -= sy;
+        dx -= sx;
     }
     pthread_mutex_unlock(&x->mu);
     hv_machine_wake(x->m);

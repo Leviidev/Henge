@@ -556,6 +556,17 @@ static void henge_ios_release_high_hold(void)
         }
 }
 
+/* The held blocks given back for a virtual Mac's RAM, when nothing else is large enough for it. On Apple Vision Pro
+   (Henge as an iPad app) the shared region fills the low address space up to 0xfc0000000, so beside these blocks only a
+   4 GB gap at 0x7A00000000 is left, and the machine's own allocations take part of that before its RAM is mapped.
+   Nothing happens once the translation layer has taken the blocks. */
+HENGE_EXPORT void henge_ios_release_high_room(void)
+{
+    if (g_high_hold_given || !(g_high_hold[0] || g_high_hold[1] || g_high_hold[2])) return;
+    henge_ios_release_high_hold();
+    HENGE_LOG("high hold released: the guest's RAM fits nowhere else");
+}
+
 /* The held blocks, once, for the translation layer to place large reservations in (they stay held: those are mapped
    over them). Returns how many (0 if none). */
 HENGE_EXPORT int henge_ios_take_high_room(void **base, size_t *bytes)

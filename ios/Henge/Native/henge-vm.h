@@ -97,6 +97,11 @@ void henge_vm_mouse_scroll(int dx, int dy);
 void henge_vm_touch(int finger, int phase, int x, int y, uint32_t ts_ms);
 void henge_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
 void henge_vm_touch_button(int down); /* the pad's full press (a click) */
+/* The tablet the Mac sees on its USB bus: an absolute pointer. x, y are 0..32767 across the Mac's
+   screen from the top left; buttons bit 0 left, 1 right, 2 middle. Scrolling is in wheel steps at
+   the pointer's place (dy > 0 up, dx > 0 right). */
+void henge_vm_tablet(int x, int y, int buttons);
+void henge_vm_tablet_scroll(int dx, int dy);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */

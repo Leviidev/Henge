@@ -45,7 +45,13 @@ enum GuestMemory {
         let free = (try? mac.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? 0
         let room = free > 0 ? UInt64(max(free - (2 << 30), 0)) >> 20 : UInt64.max
-        let reach = henge_largest_mapping_mb()
+        var reach = henge_largest_mapping_mb()
+        if reach < UInt64(mac.ramMB) + 512 {
+            // On Apple Vision Pro the shared region fills the low address space, and the high blocks held for a Mac
+            // app's allocators leave only a 4 GB gap, which the machine's own setup then shares: the RAM gets those.
+            henge_ios_release_high_room()
+            reach = henge_largest_mapping_mb()
+        }
         let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
         HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
         return ram

@@ -22,7 +22,7 @@ private enum HengeJITWork {
         var needsScan = false
         if let rsdPort = request.rsdPort {
             configuration.rsdPort = rsdPort
-        } else if request.operation != .resetDDI {
+        } else if request.operation != .resetDDI, request.operation != .installDDI {
             // Henge found no advertised port. StikJIT's 49152 is closed when the device picked another at boot.
             let lookup = RSDPortResolver.resolve()
             NSLog("[HengeJIT] RemotePairing port: %@", lookup.detail)
@@ -32,10 +32,26 @@ private enum HengeJITWork {
 
         do {
             try manager.createDirectory(at: root, withIntermediateDirectories: true)
+            let ddiDirectory = URL(fileURLWithPath: paths.manifestPath).deletingLastPathComponent()
             if request.operation == .resetDDI {
+                if VisionDDI.isVision {
+                    // The imported image too: StikJIT's reset leaves the Restore folder's own files.
+                    try? manager.removeItem(at: ddiDirectory)
+                    return .init(success: true, message: "visionOS's disk image was removed. Import it again "
+                                    + "before turning on JIT, unless a Mac has mounted it since the last restart.",
+                                 txmPresent: StikJIT.isTXMPresent)
+                }
                 try StikJIT.resetCachedDDI(at: paths)
                 return .init(success: true, message: "Developer Disk Image cache reset.",
                              txmPresent: StikJIT.isTXMPresent)
+            }
+            if request.operation == .installDDI {
+                guard let files = request.ddiFiles else {
+                    throw NSError(domain: "HengeJITHelper", code: 3,
+                                  userInfo: [NSLocalizedDescriptionKey: "The disk image was not provided."])
+                }
+                try VisionDDI.install(files, into: ddiDirectory)
+                return .init(success: true, message: "visionOS's disk image is ready.", txmPresent: StikJIT.isTXMPresent)
             }
 
             guard let pairingData = request.pairingData, !pairingData.isEmpty else {
@@ -52,6 +68,17 @@ private enum HengeJITWork {
                 } else {
                     portNote += " [port scan: no RemotePairing port found]"
                 }
+            }
+
+            // On an Apple Vision Pro StikJIT would download the iOS image, which Apple won't sign for the headset.
+            // Unless a Mac mounted one since the last restart, the user must import visionOS's. When the device can't
+            // be asked, StikJIT's own reachability check reports that before it would download anything.
+            if VisionDDI.isVision, !VisionDDI.isInstalled(in: ddiDirectory),
+               (try? StikJIT.isDDIMounted(pairingFile: pairingURL, configuration: configuration)) == false {
+                return .init(success: false,
+                             message: "This Apple Vision Pro needs visionOS's Developer Disk Image, which Henge can't "
+                                    + "download. Import it once (Turn on JIT › Import visionOS disk image)." + portNote,
+                             txmPresent: StikJIT.isTXMPresent, needsDDI: true)
             }
 
             switch request.operation {
@@ -88,7 +115,7 @@ private enum HengeJITWork {
                     progress: { NSLog("[HengeJIT] %@", $0) })
                 return .init(success: true, message: "Henge detached cleanly from its built-in JIT helper." + portNote,
                              txmPresent: StikJIT.isTXMPresent)
-            case .resetDDI:
+            case .resetDDI, .installDDI:
                 preconditionFailure("Handled above")
             }
         } catch {

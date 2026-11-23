@@ -6,6 +6,11 @@ import GameController
 enum Device {
     static let isPad = UIDevice.current.userInterfaceIdiom == .pad
     static let name = isPad ? "iPad" : "iPhone"
+    /// Running as an iPad app on Apple Vision Pro: touches come from looking and pinching, one a hand.
+    static let isVision: Bool = {
+        if #available(iOS 26.1, *) { return ProcessInfo.processInfo.isiOSAppOnVision }
+        return false
+    }()
 
     /// A Mac's screen that fills this device on its side: 1920 wide, as tall as the shape asks. iPads and
     /// squarer phones (iPhone Duo, about 1.46:1) would get bars above and below at 16:9. Phones wider

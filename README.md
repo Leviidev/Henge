@@ -79,7 +79,7 @@ Then a Henge folder in the Mac's home folder is the same folder as Files › Hen
 
 To use Henge, install the [latest release](https://github.com/Leviidev/Henge/releases). Every change lands on `main` as it's made, so `main` can be unfinished between releases.
 
-On a Mac with Xcode 27 or later and `xcodegen`. Henge takes StikJIT, on-device pairing, libslirp and glib from a built [Husk](https://github.com/Leviidev/Husk) checkout at `~/Documents/Coding/Husk` (set `HUSK` to use another path):
+On a Mac with Xcode 27 or later and `xcodegen`. Henge takes StikJIT, on-device pairing, libslirp and glib from a built [Husk](https://github.com/Leviidev/Husk) checkout at `deps/Husk` in this repository (ignored by git) or else `~/Documents/Coding/Husk` (set `HUSK` to use another path):
 
 ```bash
 ios/scripts/fetch_deps.sh

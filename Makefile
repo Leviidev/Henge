@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown $(B)/test_xhci
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -109,6 +109,9 @@ $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 # Block-level tests: test_X.c plus X_programs.S, run natively and through the JIT.
 $(B)/test_devices: tests/test_devices.c tests/devices_programs.S tests/harness.S tests/harness.h $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) -Itests tests/test_devices.c tests/devices_programs.S tests/harness.S $(ENGINE) $(DEV) $(METAL_LIBS) -o $@
+# The xHCI controller's tablet and ports, driven directly (it includes devices/xhci.c).
+$(B)/test_xhci: tests/test_xhci.c devices/xhci.c devices/*.h $(ENGINE) $(filter-out $(B)/xhci.o,$(DEV))
+	$(CC) $(CFLAGS) tests/test_xhci.c $(ENGINE) $(filter-out $(B)/xhci.o,$(DEV)) $(METAL_LIBS) -o $@
 # The device-tree identity rewrite, on crafted blobs (no machine needed).
 $(B)/test_dt_fixup: tests/test_dt_fixup.c host/dt_fixup.c host/dt_fixup.h | $(B)
 	$(CC) $(CFLAGS) tests/test_dt_fixup.c host/dt_fixup.c -o $@
@@ -131,8 +134,9 @@ clean:
 # of libslirp and glib from Husk's sysroot (scripts there make them); see ios/README.md.
 IOS_SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
 IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot $(IOS_SDK)
-# ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there).
-IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
+# ios/deps/include/slirp first when it holds libslirp's headers (they are all the engine takes from there),
+# then a Husk checkout inside this repository (deps/Husk), then the usual place.
+IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(if $(wildcard deps/Husk/build/ios-arm64/sysroot),$(CURDIR)/deps/Husk/build/ios-arm64/sysroot,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot))
 IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
 IB = build/ios
 IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/dt_fixup.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
@@ -188,8 +192,9 @@ $(B)/test_tl_app: tests/test_tl_app.m ios/Henge/Native/henge-tl-app.m ios/Henge/
 	  -framework CoreText -framework ImageIO -framework IOSurface -framework CoreVideo -framework UniformTypeIdentifiers \
 	  -lz -lbz2 -lcompression -o $@
 # Sample Mac programs for the app's Mac apps screen, as a disk image (read by the same import path as anyone's).
+# Built for the Mac, not with the iOS SDK that Xcode's build phase leaves in SDKROOT (as for henge-agent).
 $(B)/tl-samples.dmg: tests/tl/exit3.c tl/tests/hello.c tl/tests/fnd.m tl/tests/swifty.swift tl/tests/cxx.cpp tl/tests/fw.m tl/tests/fwapp.m | $(B)
-	make -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
+	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET make -C tl build/hello build/fnd build/swifty build/cxx build/FW.app/Contents/MacOS/fwapp
 	rm -rf $(B)/tl-samples $@ && mkdir -p $(B)/tl-samples
 	cp tl/build/hello "$(B)/tl-samples/Hello (C)"
 	cp tl/build/fnd "$(B)/tl-samples/Foundation sample"

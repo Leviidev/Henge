@@ -85,7 +85,7 @@ struct SessionView: View {
                     }
                     .position(x: layout.screen.midX, y: layout.screen.midY)
                 if state != 2 {
-                    Trackpad()
+                    Trackpad(screen: layout.screen.offsetBy(dx: -layout.touch.minX, dy: -layout.touch.minY))
                         .frame(width: layout.touch.width, height: layout.touch.height)
                         .position(x: layout.touch.midX, y: layout.touch.midY)
                     if inputMode == .volumeButtons && volumeMode == .intercept {
@@ -110,8 +110,21 @@ struct SessionView: View {
                             .transition(.opacity)
                             .allowsHitTesting(false)
                     }
+                    if controlsHidden && Device.isVision {
+                        // Look and pinch makes at most two touches, one a hand, so the four-finger tap cannot
+                        // happen on Apple Vision Pro: a small button brings the controls back instead.
+                        tool("eye", "Show controls", tint: .white) {
+                            controlsHidden = false
+                            showRevealHint = false
+                        }
+                        .deskGlass(in: Circle())
+                        .opacity(0.55)
+                        .position(x: full.width - insets.trailing - 34, y: full.height - insets.bottom - 34)
+                        .transition(.opacity)
+                    }
                     if showRevealHint {
-                        Label("Tap with four fingers to show the controls", systemImage: "hand.tap")
+                        Label(Device.isVision ? "Use the eye button to show the controls" : "Tap with four fingers to show the controls",
+                              systemImage: Device.isVision ? "eye" : "hand.tap")
                             .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 18).padding(.vertical, 12)

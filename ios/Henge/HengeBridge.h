@@ -2,4 +2,5 @@
 #include "Native/henge-vm.h"
 #include "Native/henge-tl.h"
 #include "Native/HuskRPPairing.h"
+#include "Native/HengeRPClient.h"
 #include "hvsparse.h"

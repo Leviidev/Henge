@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
     @AppStorage(InstantResume.key) private var instantResume = false
     @AppStorage(MacAppsFeature.key) private var macApps = false
+    @AppStorage(Trackpad.pointingKey) private var pointing = Device.isVision
 
     /// The second footer paragraph: how you click, given the selected input mode.
     private var inputDescription: String {
@@ -60,6 +61,14 @@ struct SettingsView: View {
                     Text(Entitlements.increasedMemory
                          ? "A Mac's memory is kept out of this limit once JIT is on. If iOS refuses that, it uses free storage instead."
                          : "This install isn't signed with the increased memory limit entitlement. Reinstall Henge with a certificate that has it. Export your Mac first if the reinstall replaces the app's data.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section("Touch") {
+                    Toggle("Point at the Mac's screen", isOn: $pointing)
+                    Text(Device.isVision
+                         ? "Look and pinch to click where you look; pinch and move to drag. Pinch with both hands and move them to scroll, or pinch both briefly to right-click. Off: the window is a trackpad."
+                         : "The pointer goes where you touch, and a tap clicks there; touch and move to drag. Two fingers move together to scroll, or tap together to right-click. Off: the screen is a trackpad.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
