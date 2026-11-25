@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/event.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -381,9 +382,24 @@ void henge_tl_tool_setup(const char *const *folders, int copies) {
     host.tool_folders = tool_folders, host.tool_copies = copies;
 }
 
+/* The address space held at launch for a Mac app's allocators (60 of iOS's 64 GB): a tool's file and its threads' stacks
+   find no room beside it. Given back at the first tool, when the terminal's program has long made its reservations. */
+static void give_room(void) {
+    void *try = mmap(NULL, (size_t)512 << 20, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    int before = try != MAP_FAILED;
+    if (before) munmap(try, (size_t)512 << 20);
+    henge_ios_release_high_room();
+    try = mmap(NULL, (size_t)512 << 20, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    int after = try != MAP_FAILED;
+    if (after) munmap(try, (size_t)512 << 20);
+    fprintf(stderr, "henge: term: room for 512 MB: %s before the holds were released, %s after\n", before ? "yes" : "no", after ? "yes" : "no");
+}
+static pthread_once_t room_once = PTHREAD_ONCE_INIT;
+
 int henge_tl_tool_run(const char *path, int argc, const char *const *argv, const char *const *env, const char *cwd,
                       HengeTlToolOutput output, void *context) {
     if (!image) return -1;
+    pthread_once(&room_once, give_room);
     return tl_tool_command(path, argc, (const char **)argv, (const char **)env, cwd, output, context);
 }
 
@@ -393,6 +409,7 @@ static pthread_mutex_t program_lock = PTHREAD_MUTEX_INITIALIZER;
 int henge_tl_program_run(const char *path, const char *argv0, const char *entry, const char *const *env, HengeTlToolOutput output, void *context) {
     if (!image) return -1;
     char err[512] = "";
+    pthread_once(&room_once, give_room);
     pthread_mutex_lock(&program_lock);
     TlImage *im = tl_load_replaceable(path, program, err, sizeof err);
     if (im) program = im;

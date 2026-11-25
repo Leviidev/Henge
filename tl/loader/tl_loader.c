@@ -1526,7 +1526,7 @@ static TlImage *load_one(const char *path, char *err, size_t errlen) {
     if (im->fd < 0 || fstat(im->fd, &st)) { set_err(err, errlen, "cannot open %s: %s", path, strerror(errno)); return NULL; }
     im->maplen = (size_t)st.st_size;
     im->map = mmap(NULL, im->maplen, PROT_READ, MAP_PRIVATE, im->fd, 0);
-    if (im->map == MAP_FAILED) { set_err(err, errlen, "cannot read %s", path); return NULL; }
+    if (im->map == MAP_FAILED) { set_err(err, errlen, "cannot read %s (%zu bytes): %s", path, im->maplen, strerror(errno)); return NULL; }
     if (parse(im, err, errlen) || map_segments(im, err, errlen)) return NULL;
     if (im->fmh->filetype == MH_EXECUTE && !main_of(im->ns)) {
         if (im->ns < TL_MAX_NS) g_ns_main[im->ns] = im;

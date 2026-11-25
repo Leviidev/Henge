@@ -1,4 +1,5 @@
 /* The JIT region tests/test_project.swift runs in. */
+void henge_ios_release_high_room(void) {}
 #include <stdatomic.h>
 #include <stdlib.h>
 

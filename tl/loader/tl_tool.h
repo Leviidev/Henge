@@ -1137,6 +1137,12 @@ static int tool_run_it(TlToolRun *r) {
     while (!rc && !r->ended) pthread_cond_wait(&g_tool_cond, &g_tool_lock);
     pthread_mutex_unlock(&g_tool_lock);
     pthread_attr_destroy(&a);
+    if (rc) {
+        char why[160];
+        snprintf(why, sizeof why, "no thread for the tool: %s\n", strerror(rc));
+        tl_log("%s", why);
+        tool_text_to(r, 2, why, strlen(why));
+    }
     int code = rc ? 127 : r->code & 0xFF;
     r->stop = 1;
     for (int i = 0; i < 300 && r->live > 0; i++) usleep(10000);
