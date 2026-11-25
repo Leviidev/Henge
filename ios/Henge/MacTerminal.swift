@@ -193,7 +193,7 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
     private var cell = CGSize(width: 7, height: 15)
     private var offset = 0 // rows scrolled back
     private var panStart = 0
-    private var ctrl = false { didSet { ctrlButton?.configuration?.baseForegroundColor = ctrl ? .systemOrange : .white } }
+    private var ctrl = false { didSet { ctrlButton?.configuration?.baseForegroundColor = ctrl ? TerminalLook.accent : .white } }
     private weak var ctrlButton: UIButton?
 
     var autocorrectionType: UITextAutocorrectionType = .no
@@ -206,7 +206,7 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        backgroundColor = UIColor(red: 0.06, green: 0.06, blue: 0.07, alpha: 1)
+        backgroundColor = .black
         contentMode = .redraw
         session.view = self
         setFont(size: CGFloat(UserDefaults.standard.object(forKey: "terminal.fontSize") as? Double ?? 11))
@@ -227,7 +227,7 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
         font = .monospacedSystemFont(ofSize: size, weight: .regular)
         boldFont = .monospacedSystemFont(ofSize: size, weight: .bold)
         let w = ("M" as NSString).size(withAttributes: [.font: font]).width
-        cell = CGSize(width: w, height: ceil(font.lineHeight * 1.05))
+        cell = CGSize(width: w, height: ceil(font.lineHeight * 1.12))
         fit()
     }
     private func fit() {
@@ -345,11 +345,13 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
             return (Array(all), 0, 0, false)
         }
         let chosen = selection, firstShown = session.read { firstRow($0) }
-        let base = UIColor(white: 0.9, alpha: 1), page = backgroundColor ?? .black
+        let base = UIColor(white: 0.96, alpha: 1), page = backgroundColor ?? .black
         func color(_ c: UInt32) -> UIColor? {
             guard let v = TerminalScreen.rgb(c) else { return nil }
             return UIColor(red: CGFloat(v >> 16 & 255) / 255, green: CGFloat(v >> 8 & 255) / 255, blue: CGFloat(v & 255) / 255, alpha: 1)
         }
+        /// Text on the black page: never too dark to read.
+        func ink(_ c: UInt32) -> UIColor? { TerminalScreen.rgb(c).map { TerminalLook.readable($0) } }
         for (y, row) in rows.enumerated() {
             let top = CGFloat(y) * cell.height
             var x = 0
@@ -363,11 +365,15 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
                     while end < row.count, row[end].style == row[x].style, row[end].ch.isASCII, !row[end].wide, !row[end].tail,
                           !(showCursor && y == cy && (end == cx || x == cx)) { end += 1 }
                 } else if row[x].wide, end < row.count { end += 1 }
-                var fg = color(st.fg) ?? base, bg = color(st.bg)
-                if st.inverse { (fg, bg) = (bg ?? page, fg) }
-                if st.dim { fg = fg.withAlphaComponent(0.6) }
+                var fg = (color(st.bg) == nil && !st.inverse ? ink(st.fg) : color(st.fg)) ?? base, bg = color(st.bg)
+                let caret = showCursor && y == cy && x == cx
+                if st.inverse { (fg, bg) = (bg ?? page, caret ? TerminalLook.accent : fg) }
+                if st.dim { fg = fg.withAlphaComponent(0.72) }
                 let box = CGRect(x: 4 + CGFloat(x) * cell.width, y: top, width: CGFloat(end - x) * cell.width, height: cell.height)
-                if let bg { ctx.setFillColor(bg.cgColor); ctx.fill(box) }
+                if let bg {
+                    ctx.setFillColor(bg.cgColor)
+                    if caret { ctx.addPath(UIBezierPath(roundedRect: box, cornerRadius: 2).cgPath); ctx.fillPath() } else { ctx.fill(box) }
+                }
                 let text = simple ? String(row[x..<end].map(\.ch)) : String(row[x].ch)
                 if text.contains(where: { $0 != " " }) {
                     var a: [NSAttributedString.Key: Any] = [.font: st.bold ? boldFont : font, .foregroundColor: fg]
@@ -381,7 +387,7 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
                 let i = firstShown + y
                 guard i >= c.from.row, i <= c.to.row else { continue }
                 let a = i == c.from.row ? c.from.col : 0, b = i == c.to.row ? c.to.col : row.count
-                ctx.setFillColor(UIColor.systemBlue.withAlphaComponent(0.45).cgColor)
+                ctx.setFillColor(TerminalLook.accent.withAlphaComponent(0.4).cgColor)
                 if b > a { ctx.fill(CGRect(x: 4 + CGFloat(a) * cell.width, y: top, width: CGFloat(b - a) * cell.width, height: cell.height)) }
             }
         }
@@ -431,14 +437,19 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
 
     /// The keys above the keyboard, in a row that scrolls.
     private lazy var keys: UIView = {
-        let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 46), inputViewStyle: .keyboard)
+        let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 50), inputViewStyle: .default)
+        bar.backgroundColor = .black
         let scroll = KeyScroll(), row = UIStackView()
         scroll.showsHorizontalScrollIndicator = false
         row.spacing = 6
         func key(_ title: String, _ act: @escaping () -> Void) -> UIButton {
-            var c = UIButton.Configuration.gray()
-            c.title = title
+            var c = UIButton.Configuration.plain()
+            c.attributedTitle = title.isEmpty ? nil : AttributedString(title, attributes: AttributeContainer([.font: UIFont.systemFont(ofSize: 16, weight: .medium)]))
             c.baseForegroundColor = .white
+            c.background.backgroundColor = UIColor(white: 0.07, alpha: 1)
+            c.background.strokeColor = UIColor(white: 1, alpha: 0.28)
+            c.background.strokeWidth = 1
+            c.background.cornerRadius = 10
             c.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 9, bottom: 6, trailing: 9)
             return UIButton(configuration: c, primaryAction: UIAction { _ in act() })
         }
@@ -447,8 +458,8 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
         let look = UIPasteControl.Configuration()
         look.displayMode = .labelOnly
         look.cornerStyle = .medium
-        look.baseBackgroundColor = .systemBlue
-        look.baseForegroundColor = .white
+        look.baseBackgroundColor = TerminalLook.accent
+        look.baseForegroundColor = .black
         let pasteKey = UIPasteControl(configuration: look)
         pasteKey.target = self
         for k in [pasteKey, key("esc") { [weak self] in self?.session.send("\u{1b}") }, key("tab") { [weak self] in self?.session.send("\t") },
@@ -483,6 +494,19 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
     override var inputAccessoryView: UIView? { keys }
 }
 
+/// The terminal's own look: true black for an OLED screen, and text that stands out on it.
+enum TerminalLook {
+    static let accent = UIColor(red: 1, green: 0.55, blue: 0.4, alpha: 1)
+    /// A colour a program chose, as text on black: its hue, brought up until it reads well.
+    static func readable(_ v: UInt32) -> UIColor {
+        let c = [v >> 16 & 255, v >> 8 & 255, v & 255].map { Double($0) / 255 }
+        let light = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+        let k = light < 0.58 ? min(1, (0.58 - light) / max(0.01, 1 - light)) : 0 // towards white
+        let m = c.map { $0 + (1 - $0) * k }
+        return UIColor(red: m[0], green: m[1], blue: m[2], alpha: 1)
+    }
+}
+
 private struct TerminalRepresentable: UIViewRepresentable {
     func makeUIView(context: Context) -> TerminalUIView { TerminalUIView(frame: .zero) }
     func updateUIView(_ view: TerminalUIView, context: Context) {}
@@ -496,23 +520,32 @@ struct MacTerminalView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
 
+    private func glyph(_ name: String) -> some View {
+        Image(systemName: name).font(.system(size: 14, weight: .semibold)).foregroundStyle(.white).frame(width: 36, height: 36)
+            .background(Color(white: 0.07), in: Circle()).overlay(Circle().strokeBorder(.white.opacity(0.28), lineWidth: 1))
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 14) {
-                Button("Hide") { dismiss() }
-                Spacer()
-                Text(!session.said.isEmpty ? session.said : session.status.isEmpty ? app.name : session.status).font(.system(size: 13, weight: .medium)).lineLimit(2)
-                Spacer()
+            HStack(spacing: 9) {
+                Button { dismiss() } label: { glyph("chevron.down") }.accessibilityLabel("Hide")
+                HStack(spacing: 8) {
+                    Circle().fill(session.status.isEmpty ? Color(red: 0.19, green: 1, blue: 0.59) : Color(TerminalLook.accent)).frame(width: 8, height: 8)
+                    Text(!session.said.isEmpty ? session.said : session.status.isEmpty ? app.name : session.status)
+                        .font(.system(size: 15, weight: .semibold, design: .rounded)).foregroundStyle(.white).lineLimit(2).minimumScaleFactor(0.8)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.leading, 2)
                 // The system's: iOS refuses an app that reads what another copied by itself.
                 PasteButton(payloadType: String.self) { got in
                     DispatchQueue.main.async { if let t = got.first { session.paste(t) } else { session.note("Nothing to paste") } }
                 }
-                .labelStyle(.titleOnly).buttonBorderShape(.capsule).controlSize(.small).tint(.blue)
-                Button { session.copy(session.read { $0.allText }) } label: { Image(systemName: "doc.on.doc") }
+                .labelStyle(.titleOnly).buttonBorderShape(.capsule).controlSize(.small).tint(Color(TerminalLook.accent))
+                Button { session.copy(session.read { $0.allText }) } label: { glyph("doc.on.doc") }
                     .accessibilityLabel("Copy everything")
-                Button { if let v = session.view { _ = v.isFirstResponder ? v.resignFirstResponder() : v.becomeFirstResponder() } } label: { Image(systemName: "keyboard") }.accessibilityLabel("Keyboard")
+                Button { if let v = session.view { _ = v.isFirstResponder ? v.resignFirstResponder() : v.becomeFirstResponder() } } label: { glyph("keyboard") }.accessibilityLabel("Keyboard")
             }
-            .font(.system(size: 15)).padding(.horizontal, 14).padding(.vertical, 8).background(Color.black)
+            .padding(.horizontal, 12).padding(.vertical, 8).background(Color.black)
+            LinearGradient(colors: [Color(TerminalLook.accent), Color(TerminalLook.accent).opacity(0.15)], startPoint: .leading, endPoint: .trailing).frame(height: 1)
             TerminalRepresentable()
         }
         .background(Color.black).preferredColorScheme(.dark)
