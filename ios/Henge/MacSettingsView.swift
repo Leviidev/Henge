@@ -7,6 +7,8 @@ struct MacSettingsView: View {
     @State private var mac: VirtualMac
     @State private var confirmDelete = false
     @State private var movingExport = false
+    @State private var growTo: Int?
+    @State private var grew = false
     @AppStorage("henge.cpus") private var cpus = 4
 
     init(mac: VirtualMac) { _mac = State(initialValue: mac) }
@@ -116,6 +118,24 @@ struct MacSettingsView: View {
                         Text("of \(ByteText.string(UInt64(max(mac.diskBytes, 0))))").font(.system(size: 16)).foregroundStyle(Desk.dim)
                     }
                     DeskBar(fraction: Double(mac.bytesUsed) / Double(max(mac.diskBytes, 1)))
+                    if machines.growing != nil {
+                        Text("Making the disk bigger… keep Henge open").font(.system(size: 15)).frame(maxWidth: .infinity, alignment: .leading)
+                    } else if !mac.isLinux, !Machines.biggerDisks(than: mac.diskBytes).isEmpty {
+                        Menu {
+                            ForEach(Machines.biggerDisks(than: mac.diskBytes), id: \.self) { gb in Button("\(gb) GB") { growTo = gb } }
+                        } label: {
+                            HStack {
+                                Text("Make Disk Bigger…").font(.system(size: 16)).foregroundStyle(Desk.accentLight)
+                                Spacer()
+                            }
+                        }
+                        .disabled(machines.exporting != nil)
+                    }
+                    if grew {
+                        Text("Now start the Mac, open Terminal and run this, so macOS uses the new space:\n\ndiskutil apfs resizeContainer disk0s2 0")
+                            .font(.system(size: 13)).foregroundStyle(Desk.dim).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .padding(17)
                 .deskCard()
@@ -137,6 +157,13 @@ struct MacSettingsView: View {
             case .failure(let error): machines.lastError = error.localizedDescription
             }
         }
+        .confirmationDialog("Make the disk \(growTo ?? 0) GB?", isPresented: Binding(get: { growTo != nil }, set: { if !$0 { growTo = nil } }), titleVisibility: .visible, presenting: growTo) { gb in
+            Button("Make it \(gb) GB") {
+                machines.grow(mac, toGB: gb) { if let bigger = $0 { mac.diskBytes = bigger.diskBytes; grew = true } }
+            }
+        } message: { _ in
+            Text("Everything on the Mac is kept, and it only takes space as macOS uses it. It can't be made smaller again, so make a backup first. The Mac must be shut down; a saved Mac (instant resume) is dropped.")
+        }
         .confirmationDialog("Delete \(mac.name)?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 machines.delete(mac.id)
@@ -149,19 +176,23 @@ struct MacSettingsView: View {
 
     private var manage: some View {
         VStack(spacing: 0) {
+            if let error = machines.lastError {
+                Text(error).font(.system(size: 14)).foregroundStyle(Desk.bad).padding(17).frame(maxWidth: .infinity, alignment: .leading)
+                divider
+            }
             if let name = machines.exporting {
                 VStack(alignment: .leading, spacing: 9) {
-                    Text("Exporting \(name)… keep Henge open").font(.system(size: 15))
+                    Text(machines.checking ? "Checking \(name)'s backup… keep Henge open" : "Backing up \(name)… keep Henge open").font(.system(size: 15))
                     DeskBar(fraction: machines.exported)
                 }
                 .padding(17)
             } else {
-                row("Export", symbol: "square.and.arrow.up", tint: Desk.accentLight) { machines.export(mac) }
+                row("Back Up", symbol: "square.and.arrow.up", tint: Desk.accentLight) { machines.export(mac) }
             }
             if let folder = machines.lastExport {
                 divider
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Saved in Files, under Henge, Exports, \(folder.lastPathComponent). Deleting Henge deletes it too, so move it somewhere else first.")
+                    Text("\(ByteText.string(UInt64(max(machines.lastExportBytes, 0)))), compressed and checked. To restore it, choose Bring in a Mac and pick this folder. Saved in Files, under Henge, Exports, \(folder.lastPathComponent). Deleting Henge deletes it too, so move it somewhere else first.")
                         .font(.system(size: 13)).foregroundStyle(Desk.dim)
                     Button("Move Out of Henge…") { movingExport = true }
                         .font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
@@ -192,6 +223,7 @@ struct MacSettingsView: View {
 
     private func save() {
         if mac.name.isEmpty { mac.name = "Mac" }
+        guard machines.all.contains(where: { $0.id == mac.id }) else { return }
         machines.update(mac)
     }
 }
