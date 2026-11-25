@@ -252,6 +252,17 @@ PASS_UP(pressureChangeWithEvent) PASS_UP(beginGestureWithEvent) PASS_UP(endGestu
     });
 }
 
+/* Chromium puts sibling views (a page laid over another) in their order with this. */
+- (void)sortSubviewsUsingFunction:(NSInteger (*)(id, id, void *))compare context:(void *)context {
+    if (!compare) return;
+    NSArray<NSView *> *sorted = [_subviews sortedArrayUsingFunction:compare context:context];
+    if ([sorted isEqualToArray:_subviews]) return;
+    [_subviews setArray:sorted];
+    no_actions(^{
+        for (NSView *v in sorted) [self->_layer addSublayer:v.layer];
+    });
+}
+
 - (void)hk_setWindow:(NSWindow *)window {
     if (_window == window) return;
     [self viewWillMoveToWindow:window];
@@ -403,7 +414,18 @@ PASS_UP(pressureChangeWithEvent) PASS_UP(beginGestureWithEvent) PASS_UP(endGestu
     no_actions(^{
         l.hidden = hidden;
     });
+    if (!_superview.isHiddenOrHasHiddenAncestor) [self hk_didHide:hidden];
 }
+/* This view and those in it, except any hidden of its own accord (nothing changes for them). Chromium learns here
+   that a page is to be drawn. */
+- (void)hk_didHide:(BOOL)hidden {
+    if (hidden) [self viewDidHide];
+    else [self viewDidUnhide];
+    for (NSView *v in [_subviews copy])
+        if (!v.hidden) [v hk_didHide:hidden];
+}
+- (void)viewDidHide {}
+- (void)viewDidUnhide {}
 - (BOOL)isHidden { return [objc_getAssociatedObject(self, @selector(isHidden)) boolValue]; }
 - (BOOL)isHiddenOrHasHiddenAncestor {
     for (NSView *v = self; v; v = v->_superview)
@@ -701,7 +723,9 @@ static SEL delegate_selector(NSString *note, NSString *prefix) {
 - (NSScreen *)screen { return [NSScreen mainScreen]; }
 - (NSScreen *)deepestScreen { return [NSScreen mainScreen]; }
 - (NSArray<NSWindow *> *)childWindows { return [_children copy]; }
-- (NSWindowOcclusionState)occlusionState { return _visible ? NSWindowOcclusionStateVisible : 0; }
+/* AppKit's answer always has bit 13 set too, and Electron depends on it: BrowserWindow.isVisible() takes exactly
+   NSWindowOcclusionStateVisible to mean the window is covered. */
+- (NSWindowOcclusionState)occlusionState { return (1UL << 13) | (_visible ? NSWindowOcclusionStateVisible : 0); }
 - (NSEvent *)currentEvent { return NSApp.currentEvent; }
 - (NSView *)contentView { return _contentView; }
 - (NSAppearance *)effectiveAppearance { return _appearance ?: NSApp.effectiveAppearance; }

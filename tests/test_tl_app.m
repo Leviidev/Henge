@@ -8,7 +8,9 @@
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
+#include <objc/runtime.h>
 #include <sys/mman.h>
 #include <stdatomic.h>
 #include <pthread.h>
@@ -134,12 +136,39 @@ static void *input_thread(void *arg) {
 
 static void changed(void) { fprintf(stderr, "test_tl_app: %d windows\n", henge_tl_app_window_count()); }
 
+/* TEST_TL_LAYERS=1: each window's layers, with the view each belongs to. */
+static void show_layers(CALayer *l, int depth) {
+    id view = l.delegate;
+    fprintf(stderr, "layer %*s%s %s%s (%g,%g %gx%g)%s contents %s\n", depth * 2, "", object_getClassName(l), view ? object_getClassName(view) : "-",
+            l.hidden ? " HIDDEN" : "", l.frame.origin.x, l.frame.origin.y, l.frame.size.width, l.frame.size.height,
+            l.backgroundColor ? " bg" : "", l.contents ? object_getClassName(l.contents) : "none");
+    if (l.backgroundColor && CGColorGetNumberOfComponents(l.backgroundColor) == 4) {
+        const CGFloat *c = CGColorGetComponents(l.backgroundColor);
+        fprintf(stderr, "layer %*s  bg %g %g %g %g\n", depth * 2, "", c[0], c[1], c[2], c[3]);
+    }
+    if (l.contents && CFGetTypeID((__bridge CFTypeRef)l.contents) == IOSurfaceGetTypeID()) { /* how many different pixels it holds, sampled */
+        IOSurfaceRef io = (__bridge IOSurfaceRef)l.contents;
+        IOSurfaceLock(io, kIOSurfaceLockReadOnly, NULL);
+        NSCountedSet *set = [NSCountedSet set];
+        size_t W = IOSurfaceGetWidth(io), H = IOSurfaceGetHeight(io), row = IOSurfaceGetBytesPerRow(io);
+        const uint8_t *px = IOSurfaceGetBaseAddress(io);
+        if (IOSurfaceGetBytesPerElement(io) == 4)
+            for (size_t y = 0; y < H; y += 4)
+                for (size_t x = 0; x < W; x += 4) [set addObject:@(*(const uint32_t *)(px + y * row + x * 4))];
+        IOSurfaceUnlock(io, kIOSurfaceLockReadOnly, NULL);
+        fprintf(stderr, "layer %*s  surface %zux%zu, %zu different pixels, first %08x, seed %u\n", depth * 2, "", W, H, (size_t)set.count,
+                W && H ? *(const uint32_t *)px : 0, IOSurfaceGetSeed(io));
+    }
+    for (CALayer *s in l.sublayers) show_layers(s, depth + 1);
+}
+
 static void snap(CFRunLoopTimerRef t, void *info) {
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         int n = henge_tl_app_window_count();
         for (int i = 0; i < n; i++) {
             CALayer *root = (__bridge CALayer *)henge_tl_app_window_layer(i);
+            if (getenv("TEST_TL_LAYERS")) show_layers(root, 0);
             double x, y, w, h;
             henge_tl_app_window_frame(i, &x, &y, &w, &h);
             size_t W = (size_t)w * 2, H = (size_t)h * 2;

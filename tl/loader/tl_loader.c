@@ -2810,6 +2810,12 @@ static void *room_place_prot(size_t len, int prot) {
         size_t core = len + TL_PAGE - ((size_t)4 << 30);
         if (core >= ((size_t)64 << 20) && !(core & (core - 1))) slack = len - core, len = core; /* 4 GB alignment */
     }
+    /* V8 asks for less and less until it gets some (8 GB will do). Bigger would take the second 32 GB-aligned block,
+       which Oilpan needs for its cage and cannot do without. */
+    if (slack && len > ((size_t)8 << 30)) {
+        tl_log("a %.0f GB reservation (V8's) is left for a smaller one", (double)len / (1 << 30));
+        return NULL;
+    }
     /* The alignment its size implies (the largest power of two in it, at most 32 GB); 4 GB for V8's padded requests. */
     size_t align = TL_PAGE;
     while (align * 2 <= len && align < ((size_t)32 << 30)) align *= 2;
