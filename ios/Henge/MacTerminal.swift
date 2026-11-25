@@ -180,6 +180,11 @@ final class TerminalSession: ObservableObject {
     }
 }
 
+/// Scrolls also when the finger starts on a key.
+private final class KeyScroll: UIScrollView {
+    override func touchesShouldCancel(in view: UIView) -> Bool { true }
+}
+
 /// Draws the screen and takes the keyboard.
 final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInteractionDelegate {
     private let session = TerminalSession.shared
@@ -427,14 +432,14 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
     /// The keys above the keyboard, in a row that scrolls.
     private lazy var keys: UIView = {
         let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 46), inputViewStyle: .keyboard)
-        let scroll = UIScrollView(), row = UIStackView()
+        let scroll = KeyScroll(), row = UIStackView()
         scroll.showsHorizontalScrollIndicator = false
         row.spacing = 6
         func key(_ title: String, _ act: @escaping () -> Void) -> UIButton {
             var c = UIButton.Configuration.gray()
             c.title = title
             c.baseForegroundColor = .white
-            c.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11)
+            c.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 9, bottom: 6, trailing: 9)
             return UIButton(configuration: c, primaryAction: UIAction { _ in act() })
         }
         let c = key("ctrl") { [weak self] in self?.ctrl.toggle() }
@@ -449,20 +454,30 @@ final class TerminalUIView: UIView, UIKeyInput, UITextInputTraits, UIEditMenuInt
         for k in [pasteKey, key("esc") { [weak self] in self?.session.send("\u{1b}") }, key("tab") { [weak self] in self?.session.send("\t") },
                   key("⇧tab") { [weak self] in self?.session.send("\u{1b}[Z") }, c,
                   key("↑") { [weak self] in self?.arrow("A") }, key("↓") { [weak self] in self?.arrow("B") },
-                  key("←") { [weak self] in self?.arrow("D") }, key("→") { [weak self] in self?.arrow("C") },
-                  key("hide") { [weak self] in _ = self?.resignFirstResponder() }] { row.addArrangedSubview(k) }
+                  key("←") { [weak self] in self?.arrow("D") }, key("→") { [weak self] in self?.arrow("C") }] {
+            row.addArrangedSubview(k)
+            let w = k === pasteKey ? 68 : ceil(k.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize).width)
+            k.widthAnchor.constraint(equalToConstant: max(w, 38)).isActive = true
+        }
         scroll.translatesAutoresizingMaskIntoConstraints = false
         row.translatesAutoresizingMaskIntoConstraints = false
         scroll.addSubview(row)
         bar.addSubview(scroll)
+        // Always in reach, beside the row.
+        let hide = key("") { [weak self] in _ = self?.resignFirstResponder() }
+        hide.configuration?.image = UIImage(systemName: "keyboard.chevron.compact.down")
+        hide.accessibilityLabel = "Hide keyboard"
+        hide.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(hide)
         NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: bar.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
+            scroll.leadingAnchor.constraint(equalTo: bar.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: hide.leadingAnchor, constant: -6),
+            hide.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -8), hide.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            hide.widthAnchor.constraint(equalToConstant: 52),
             scroll.topAnchor.constraint(equalTo: bar.topAnchor), scroll.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
             row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8),
             row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8),
             row.centerYAnchor.constraint(equalTo: scroll.frameLayoutGuide.centerYAnchor),
-            row.topAnchor.constraint(greaterThanOrEqualTo: scroll.contentLayoutGuide.topAnchor),
-            row.bottomAnchor.constraint(lessThanOrEqualTo: scroll.contentLayoutGuide.bottomAnchor)])
+            scroll.contentLayoutGuide.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)])
         return bar
     }()
     override var inputAccessoryView: UIView? { keys }
@@ -495,7 +510,7 @@ struct MacTerminalView: View {
                 .labelStyle(.titleOnly).buttonBorderShape(.capsule).controlSize(.small).tint(.blue)
                 Button { session.copy(session.read { $0.allText }) } label: { Image(systemName: "doc.on.doc") }
                     .accessibilityLabel("Copy everything")
-                Button { _ = session.view?.becomeFirstResponder() } label: { Image(systemName: "keyboard") }.accessibilityLabel("Keyboard")
+                Button { if let v = session.view { _ = v.isFirstResponder ? v.resignFirstResponder() : v.becomeFirstResponder() } } label: { Image(systemName: "keyboard") }.accessibilityLabel("Keyboard")
             }
             .font(.system(size: 15)).padding(.horizontal, 14).padding(.vertical, 8).background(Color.black)
             TerminalRepresentable()
