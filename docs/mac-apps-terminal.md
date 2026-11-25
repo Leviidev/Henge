@@ -8,7 +8,8 @@ edit a project, compile it, link it into an iPhone app, run it without a window 
 - **Off by default**: Henge › Settings › **Mac apps without macOS**.
 - **Nothing in `core/`**: the engine, the virtual Mac and Linux machines run as before.
 
-Henge is Leviidev's. The Mac Apps loader this builds on (`tl/`) is part of Henge and is theirs too.
+**Credits:** Henge, its engine and the Mac Apps loader this builds on (`tl/`) are Leviidev's and Henge's contributors'. The
+terminal and toolchain were added by Tomba247.
 
 ## How to use it
 
@@ -18,7 +19,7 @@ program you want in the terminal.
 1. **Make the toolchain**, on a Mac with Xcode and Homebrew's `python`, `ninja` and `cmake`:
    `zsh tools/phone-kit/make_toolchain.sh ~/Toolchain` (set `BREW` to Homebrew's folder, such as `/opt/homebrew`).
    It copies Apple's compiler and iPhone SDK from your Xcode. They are Apple's: for your own use, **not to be shared**.
-   Nothing here contains them.
+   Nothing in this repository contains them.
 2. **Put it on the phone**: the folder goes in Files › On My iPhone › Henge › **Projects** › **Toolchain**.
 3. **Turn on** Settings › **Mac apps without macOS**.
 4. **Bring in the program** (Mac Apps): a program, an `.app`, or a `.dmg`, also one left in Files › Henge › Mac Apps. For Claude
@@ -100,7 +101,7 @@ A compiler expects a new process each time: it registers its options once, frees
 
 At launch Henge holds about 60 GB of an iPhone app's 64 GB of address space, for Mac apps whose allocators need a big
 range. The terminal does not use it, and with it held there may be no room for a compiler. It is given back at the
-first tool run, and the log says whether there was room before and after.
+first tool run. On an iPhone 18 Pro Max the log said there was no room for 512 MB before that, and room after.
 
 ### Projects (`ProjectMaker.swift`, `ProjectBuilder.swift`)
 
