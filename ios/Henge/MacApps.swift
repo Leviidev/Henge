@@ -70,6 +70,8 @@ struct MacApp: Identifiable, Hashable {
 final class MacAppsStore: ObservableObject {
     static let shared = MacAppsStore()
     @Published private(set) var apps: [MacApp] = []
+    /// Disk images put into Henge's Mac Apps folder with Files.
+    @Published private(set) var images: [URL] = []
     @Published var busy: String?
     @Published var problem: String?
 
@@ -86,7 +88,21 @@ final class MacAppsStore: ObservableObject {
             let found = items.filter { !$0.lastPathComponent.hasPrefix(".") && $0.pathExtension != "txt" }
                 .compactMap(MacApp.init(url:))
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            await MainActor.run { self.apps = found }
+            let images = items.filter { $0.pathExtension.lowercased() == "dmg" && !$0.lastPathComponent.hasPrefix(".") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            await MainActor.run { (self.apps, self.images) = (found, images) }
+        }
+    }
+
+    /// What the file picker gave back.
+    func picked(_ result: Result<URL, Error>) {
+        switch result {
+        case let .success(url):
+            HengeLog.log("macapps", "picked \(url.lastPathComponent)")
+            bring(in: url)
+        case let .failure(error):
+            HengeLog.log("macapps", "the file picker failed: \(error)")
+            problem = "The file couldn't be opened: \(error.localizedDescription)"
         }
     }
 
@@ -103,7 +119,10 @@ final class MacAppsStore: ObservableObject {
             if url.pathExtension.lowercased() == "dmg" {
                 var err = [CChar](repeating: 0, count: 512)
                 let copied = henge_tl_import_dmg(url.path, folder.path, &err, err.count)
-                if copied <= 0 { trouble = String(cString: err) }
+                if copied <= 0 {
+                    trouble = String(cString: err)
+                    if trouble?.isEmpty != false { trouble = "\(url.lastPathComponent) has no Mac app in it." }
+                }
                 HengeLog.log("macapps", "\(url.lastPathComponent): \(copied) items copied\(copied <= 0 ? " (\(String(cString: err)))" : "")")
             } else {
                 let to = folder.appendingPathComponent(url.lastPathComponent)
@@ -148,6 +167,7 @@ struct MacAppsView: View {
     @ObservedObject private var store = MacAppsStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var picking = false
+    @State private var pickingFolder = false
 
     var body: some View {
         NavigationStack {
@@ -163,10 +183,14 @@ struct MacAppsView: View {
                         VStack(spacing: 10) {
                             Image(systemName: "shippingbox").font(.system(size: 34)).foregroundStyle(Desk.faint)
                             Text("Nothing here yet").font(.system(size: 17, weight: .semibold))
-                            Text("Bring in a .dmg or an .app from Files, or try Henge's sample programs.")
+                            Text("Bring in a .dmg or an .app from Files, put one in Files → Henge → Mac Apps, or try Henge's sample programs.")
                                 .font(.system(size: 14)).foregroundStyle(Desk.dim).multilineTextAlignment(.center)
                         }
                         .padding(28).frame(maxWidth: .infinity).deskCard()
+                    }
+                    ForEach(store.images, id: \.self) { image in
+                        Button("Bring In \(image.lastPathComponent)") { store.bring(in: image) }
+                            .buttonStyle(DeskButtonStyle()).disabled(store.busy != nil).padding(.bottom, 10)
                     }
                     ForEach(store.apps) { app in
                         NavigationLink(value: app) { MacAppRow(app: app) }.buttonStyle(.plain).padding(.bottom, 10)
@@ -182,12 +206,18 @@ struct MacAppsView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
                 ToolbarItem(placement: .primaryAction) {
-                    Button { picking = true } label: { Image(systemName: "plus") }.accessibilityLabel("Bring in a Mac app")
+                    Menu {
+                        Button("A .dmg or a Program…") { picking = true }
+                        Button("An .app…") { pickingFolder = true }
+                    } label: { Image(systemName: "plus") }.accessibilityLabel("Bring in a Mac app")
                 }
             }
-            .fileImporter(isPresented: $picking, allowedContentTypes: [.diskImage, .applicationBundle, .folder, .unixExecutable, .data]) { result in
-                if case let .success(url) = result { store.bring(in: url) }
-            }
+            // Files and folders are asked for apart: asked for together, the picker chooses folders. One importer is
+            // put on each of two views, as a view keeps only the last one put on it.
+            .background(Color.clear.fileImporter(isPresented: $picking, allowedContentTypes: [.diskImage, .data]) { store.picked($0) })
+            .background(Color.clear.fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder, .applicationBundle]) { store.picked($0) })
+            // A file put in with Files while Henge was in the background.
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in store.reload() }
             .onAppear { store.reload() }
         }
     }
