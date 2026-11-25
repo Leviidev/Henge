@@ -213,10 +213,20 @@ void henge_tl_term_write(const char *bytes, size_t len) {
     pthread_mutex_lock(&lock);
     int canonical = (tio.c_lflag & ICANON) != 0, echo = (tio.c_lflag & ECHO) != 0;
     pthread_mutex_unlock(&lock);
+    if (!canonical) {
+        // In one go, so a program reads a key's bytes, or a paste, together.
+        for (size_t at = 0; at < len;) {
+            ssize_t n = write(host_fd, bytes + at, len - at);
+            if (n > 0) at += (size_t)n;
+            else if (n < 0 && (errno == EINTR || errno == EAGAIN)) usleep(1000);
+            else return;
+        }
+        return;
+    }
     for (size_t i = 0; i < len; i++) {
         char c = bytes[i];
-        if (canonical && c == '\r') c = '\n';
-        if (canonical && echo && on_output) {
+        if (c == '\r') c = '\n';
+        if (echo && on_output) {
             if (c == '\n') on_output("\r\n", 2);
             else on_output(&c, 1);
         }

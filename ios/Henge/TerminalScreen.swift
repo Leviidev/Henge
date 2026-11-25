@@ -11,6 +11,7 @@ final class TerminalScreen {
         var ch: Character = " "
         var style = Style()
         var wide = false, tail = false // a two-column character, and the column it covers
+        var wrapped = false // in a row's last column: the text goes on in the next row
     }
     typealias Row = [Cell]
 
@@ -31,6 +32,8 @@ final class TerminalScreen {
     private var params = "", osc: [UInt8] = []
     /// Answers the program asked for (the cursor's place and so on), for its input.
     var reply: (String) -> Void = { _ in }
+    /// Text the program put on the clipboard.
+    var copied: (String) -> Void = { _ in }
     static let scrollbackMax = 3000
 
     init(cols: Int, rows: Int) {
@@ -99,7 +102,7 @@ final class TerminalScreen {
         case .osc:
             if b == 0x07 { state = .text; finishOSC() }
             else if b == 0x1b { state = .oscEsc }
-            else if osc.count < 4096 { osc.append(b) }
+            else if osc.count < 1 << 20 { osc.append(b) }
         case .oscEsc:
             state = .text
             finishOSC()
@@ -151,7 +154,7 @@ final class TerminalScreen {
 
     private func put(_ ch: Character, wide: Bool = false) {
         if wrapNext || (wide && cx == cols - 1) {
-            if autowrap { cx = 0; newline() }
+            if autowrap { lines[cy][cols - 1].wrapped = true; cx = 0; newline() }
             wrapNext = false
         }
         clearHalf(cx)
@@ -222,6 +225,9 @@ final class TerminalScreen {
     private func finishOSC() {
         let s = String(decoding: osc, as: UTF8.self)
         osc = []
+        // The program copies something (52;c;BASE64). What it asks about the clipboard ("?") is not answered.
+        if s.hasPrefix("52;"), let i = s.lastIndex(of: ";"), let d = Data(base64Encoded: String(s[s.index(after: i)...]), options: .ignoreUnknownCharacters),
+           !d.isEmpty, let t = String(data: d, encoding: .utf8) { copied(t) }
         if s == "11;?" { reply("\u{1b}]11;rgb:1010/1010/1212\u{1b}\\") }
         if s == "10;?" { reply("\u{1b}]10;rgb:e6e6/e6e6/e6e6\u{1b}\\") }
     }
@@ -384,7 +390,57 @@ final class TerminalScreen {
         while s.last == " " { s.removeLast() }
         return s
     }
-    var allText: String { (scrollback + lines).map(Self.text).joined(separator: "\n").trimmingCharacters(in: .newlines) }
+    var allText: String { text(from: (0, 0), to: (count - 1, cols)).trimmingCharacters(in: .newlines) }
+
+    /// Rows counted from the oldest kept one.
+    var count: Int { scrollback.count + lines.count }
+    func row(_ i: Int) -> Row { i < 0 || i >= count ? [] : i < scrollback.count ? scrollback[i] : lines[i - scrollback.count] }
+    /// The text between two places (row, column), the last column not included. A row that only wrapped has no line end.
+    func text(from a: (row: Int, col: Int), to b: (row: Int, col: Int)) -> String {
+        guard a.row <= b.row else { return "" }
+        var out = ""
+        for y in max(a.row, 0)...max(min(b.row, count - 1), 0) {
+            let r = row(y), from = y == a.row ? max(a.col, 0) : 0, to = y == b.row ? min(b.col, r.count) : r.count
+            var s = from < to ? Self.text(Array(r[from..<to])) : ""
+            let wraps = to == r.count && r.last?.wrapped == true
+            if wraps, from < to { s = String(r[from..<to].filter { !$0.tail }.map(\.ch)) }
+            out += s
+            if y < b.row, !wraps { out += "\n" }
+        }
+        return out
+    }
+    /// The word at a place: up to blanks.
+    func word(row y: Int, col: Int) -> (from: Int, to: Int) {
+        let r = row(y)
+        guard col >= 0, col < r.count, r[col].ch != " " || r[col].tail else { return (max(col, 0), max(col, 0)) }
+        var a = col, b = col
+        while a > 0, r[a - 1].ch != " " || r[a - 1].tail { a -= 1 }
+        while b + 1 < r.count, r[b + 1].ch != " " || r[b + 1].tail { b += 1 }
+        return (a, b + 1)
+    }
+    /// The web address at a place, put together when it goes over several rows, whether the terminal wrapped it or the
+    /// program broke it at the edge (then its rows are full, or all but a margin).
+    func link(row y: Int, col: Int) -> URL? {
+        func bare(_ i: Int) -> String { Self.text(row(i)).trimmingCharacters(in: CharacterSet(charactersIn: " │┃|")) }
+        func full(_ i: Int) -> Bool { let r = row(i); return r.last?.wrapped == true || Self.text(r).trimmingCharacters(in: CharacterSet(charactersIn: " │┃|")).count >= cols - 8 }
+        func solid(_ t: String) -> Bool { !t.isEmpty && !t.contains(" ") }
+        var first = y
+        while first > 0, y - first < 40, !bare(first).contains("://"), full(first - 1), solid(bare(first)) || (first == y && row(y - 1).last?.wrapped == true && word(row: y, col: col).from == 0) { first -= 1 }
+        guard let start = bare(first).range(of: "https?://", options: .regularExpression) else { return nil }
+        var t = String(bare(first)[start.lowerBound...]), i = first
+        if let blank = t.firstIndex(of: " ") { t = String(t[..<blank]) } else {
+            while i + 1 < count, i - first < 40, full(i), !bare(i + 1).isEmpty, !bare(i + 1).contains("://") {
+                let next = bare(i + 1), wrapped = row(i).last?.wrapped == true
+                guard solid(next) || wrapped else { break }
+                i += 1
+                t += next.prefix { $0 != " " }
+                if !solid(next) { break }
+            }
+        }
+        if y == first, first == i { let c = word(row: y, col: col); if c.from == c.to { return nil } }
+        while let l = t.last, ".,;)>\"'".contains(l) { t.removeLast() }
+        return y <= i ? URL(string: t) : nil
+    }
 
     /// 0xRRGGBB for a colour of a cell, or nil for the default.
     static func rgb(_ c: UInt32) -> UInt32? {
