@@ -62,6 +62,9 @@ typedef struct TlHost {
     int high_rooms;
     /* Called for each image once it is fixed up, before its initializers run (app-specific adjustments). */
     void (*image_linked)(TlImage *image);
+    /* Where the programs tools start are found by name (ended by NULL), and how many compilers at once (0: 2). */
+    char *const *tool_folders;
+    int tool_copies;
 } TlHost;
 
 /* A region shaped like iOS's (an RX mapping plus an RW alias of the same
@@ -107,8 +110,14 @@ int tl_tool_run(TlImage *tool, int argc, const char **argv, void (*output)(void 
    ("NAME=value", ended by NULL). */
 int tl_tool_run_at(TlImage *tool, const char *entry, int argc, const char **argv, const char **env,
                    void (*output)(void *context, const char *bytes, size_t len), void *context);
-/* The running tool ends at its next look at the clock or wait. */
-void tl_tool_stop(void);
+/* The same by path, in a folder of its own: copies are kept for the next time, and a newer file replaces them. What
+   it starts itself (posix_spawn) runs the same way, if it is a Mach-O file or a name in host->tool_folders. */
+int tl_tool_command(const char *path, int argc, const char **argv, const char **env, const char *cwd,
+                    void (*output)(void *context, const char *bytes, size_t len), void *context);
+/* The running tool ends at its next look at the clock or wait; NULL: all of them. */
+void tl_tool_stop(TlImage *tool);
+/* Those tl_tool_command started in this folder, and what they started. */
+void tl_tool_stop_in(const char *cwd);
 /* A program to run with tl_tool_run_at that is built again and again: each build loads in place of the one before
    (replacing; NULL for the first). Its Objective-C classes are not registered. */
 TlImage *tl_load_replaceable(const char *path, TlImage *replacing, char *err, size_t errlen);

@@ -276,6 +276,8 @@ struct MacAppRunView: View {
     @State private var result: String?
     @State private var confirmDelete = false
     @State private var showScreen = false
+    @State private var github = ""
+    @State private var githubSaved = GitHubToken.read() != nil
     @State private var showTerminal = false
     @AppStorage("terminal.arguments") private var arguments = ""
 
@@ -302,6 +304,17 @@ struct MacAppRunView: View {
                     TextField("Arguments (optional)", text: $arguments)
                         .font(.system(size: 15, design: .monospaced)).textInputAutocapitalization(.never).autocorrectionDisabled()
                         .padding(12).deskCard().padding(.top, 12)
+                    if (app.executable as NSString).lastPathComponent.lowercased().hasPrefix("claude") {
+                        HStack {
+                            SecureField(githubSaved ? "GitHub: connected (paste a new token to change)" : "GitHub token (optional)", text: $github)
+                                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            Button(github.isEmpty && githubSaved ? "Forget" : "Save") { GitHubToken.write(github); github = ""; githubSaved = GitHubToken.read() != nil }
+                                .disabled(github.isEmpty && !githubSaved)
+                        }
+                        .font(.system(size: 15)).padding(12).deskCard().padding(.top, 12)
+                        Text("Connects GitHub: private repositories, and saving work to a branch. Make a fine-grained token on github.com (Settings › Developer settings) for only the repositories you choose. It stays in this iPhone's Keychain and, while Claude runs, in a file only Henge reads. Public repositories need none.")
+                            .font(.system(size: 13)).foregroundStyle(Desk.dim).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
+                    }
                     Button(TerminalSession.shared.started ? "Show Terminal" : "Open in a Terminal") { showTerminal = true }
                         .buttonStyle(DeskButtonStyle())
                         .disabled(!TerminalSession.shared.started && henge_tl_ran_program() != 0).padding(.top, 10)

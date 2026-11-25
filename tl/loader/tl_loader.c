@@ -79,13 +79,14 @@ uint64_t tl_missing_data(const char *sym);     /* tl_stubs.m: a stand-in if the 
 uint64_t tl_missing_data_any(const char *sym); /* tl_stubs.m: a stand-in for something known to be data */
 void *tl_runtime_lookup(const char *symbol);
 static TlImage *g_images, *g_main;
-#define TL_MAX_NS 64
+#define TL_MAX_NS 256
 static TlImage *g_ns_main[TL_MAX_NS]; /* each namespace's executable */
 static _Atomic char g_is_tool[TL_MAX_NS]; /* namespaces of tools run again and again (tl_tool_run) */
+static int g_want_slot;                /* the program being loaded is to be replaceable */
 static char g_no_objc[TL_MAX_NS];      /* namespaces whose Objective-C is not registered (tl_load_replaceable) */
 typedef struct TlSlot { uint8_t *at; size_t size; uint8_t *data; } TlSlot; /* data: where the first segment after __TEXT goes */
 static TlSlot g_slot[TL_MAX_NS];
-static void *tool_lookup(const char *sym);
+static void *tool_lookup(const char *sym, int ns);
 static void tool_snapshot(TlImage *im);
 static int g_loading_ns;              /* the namespace being loaded and bound (under g_lock) */
 static TlImage *main_of(int ns) { return ns >= 0 && ns < TL_MAX_NS ? g_ns_main[ns] : NULL; }
@@ -521,7 +522,7 @@ static int map_segments(TlImage *im, char *err, size_t errlen) {
     if (g_data_inplace < 0 && getenv("TL_DATA_INPLACE")) g_data_inplace = inplace_works() ? 1 : 0;
     if (g_code_alias == 1) return map_segments_aliased(im, err, errlen);
     uint8_t *base;
-    TlSlot *slot = g_no_objc[im->ns] && im->fmh->filetype == MH_EXECUTE ? &g_slot[im->ns] : NULL;
+    TlSlot *slot = g_want_slot && g_no_objc[im->ns] && im->fmh->filetype == MH_EXECUTE ? &g_slot[im->ns] : NULL;
     if (slot) {
         /* A program that new builds of itself replace: its code ends and its data begins at the same place in each,
            so no page changes between the two. */
@@ -531,7 +532,7 @@ static int map_segments(TlImage *im, char *err, size_t errlen) {
                 text = im->segs[i].vmaddr + im->segs[i].vmsize - im->vmmin;
         text = (text + TL_PAGE - 1) & ~(TL_PAGE - 1);
         if (!slot->at) {
-            const size_t spare = (size_t)16 << 20;
+            const size_t spare = im->vmsize > (uint64_t)64 << 20 ? (size_t)16 << 20 : (size_t)4 << 20;
             size_t want = ((im->vmsize + TL_PAGE - 1) & ~(TL_PAGE - 1)) + 2 * spare;
             slot->at = region_take(want);
             if (slot->at) slot->size = want, slot->data = slot->at + spare + text;
@@ -918,7 +919,7 @@ static void *cf_override(const char *sym);
 static uint64_t host_symbol(void *handle, const char *install_name, const char *sym, int *found) {
     *found = 0;
     if (g_is_tool[g_loading_ns]) {
-        void *s = tool_lookup(sym);
+        void *s = tool_lookup(sym, g_loading_ns);
         if (s) { *found = 1; return (uint64_t)s; }
     }
     if (install_name && strstr(install_name, "/CoreFoundation.framework/")) {
@@ -1817,6 +1818,10 @@ static void *rt_dlsym(void *handle, const char *name) {
             if (found) return (void *)v;
         }
         if (handle == RTLD_MAIN_ONLY) return NULL;
+        if (ns > 0 && ns < TL_MAX_NS && g_is_tool[ns]) {
+            void *s = tool_lookup(sym, ns);
+            if (s) return s;
+        }
         if (g_host->shim_lookup) {
             void *s = g_host->shim_lookup("", sym);
             if (s) return s;
@@ -1841,7 +1846,9 @@ static void *rt_dlsym(void *handle, const char *name) {
         if (t0) tl_log("  ... %s in %.1f ms", v ? "found" : "not found", ((double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
         return v;
     }
-    return dlsym(handle, name);
+    int ns = ns_of(__builtin_return_address(0));
+    void *s = ns > 0 && ns < TL_MAX_NS && g_is_tool[ns] ? tool_lookup(sym, ns) : NULL; /* a tool opens the system's library */
+    return s ? s : dlsym(handle, name);
 }
 
 static int rt_dladdr(const void *addr, Dl_info *info) {

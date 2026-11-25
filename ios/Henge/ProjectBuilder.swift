@@ -25,7 +25,17 @@ final class ProjectBuilder {
         var app: String
         var ipa: String
         var run: Run?
+        // Of a project Claude described (ProjectMaker):
+        var swift: Swift?
+        /// Run first, one after another.
+        var commands: [String]?
+        /// What they made, to be the app's program.
+        var made: String?
+        /// Whether there is an app around the program (nil: yes).
+        var bundle: Bool?
     }
+    /// All Swift sources, compiled as one.
+    struct Swift: Codable { var tool: String; var args: [String]; var obj: String; var deps: [String] }
     /// How the built program runs in Henge itself, without its window.
     struct Run: Codable {
         var entry: String
@@ -41,14 +51,21 @@ final class ProjectBuilder {
         var missing: String
     }
     private struct Seen: Codable { var size: Int; var time: Double; var hash: String }
-    private struct Made: Codable { var deps: [String]; var hashes: [String] }
+    private struct Made: Codable { var deps: [String]; var hashes: [String]; var flags: String? }
     private struct State: Codable { var seen: [String: Seen] = [:]; var made: [String: Made] = [:]; var linked = "" }
 
     let root: URL
-    let run: (_ tool: String, _ args: [String]) -> (code: Int32, output: String)
+    typealias RunTool = (_ tool: String, _ args: [String], _ env: [String], _ cwd: String?) -> (code: Int32, output: String)
+    let run: RunTool
+    private let lock = NSLock()
     private var state = State()
+    /// The shared toolchain, and how many compilers at once.
+    var tools: URL?
+    var lanes = 1
+    /// A shell command in the project's folder.
+    var shell: ((String) -> (code: Int32, output: String))?
 
-    init(root: URL, run: @escaping (String, [String]) -> (code: Int32, output: String)) {
+    init(root: URL, run: @escaping RunTool) {
         self.root = root.resolvingSymlinksInPath()
         self.run = run
     }
@@ -58,6 +75,17 @@ final class ProjectBuilder {
     }
     func full(_ path: String) -> String { path.hasPrefix("/") ? path : root.path + "/" + path }
     private func expand(_ arg: String) -> String { arg.replacingOccurrences(of: "$KIT", with: root.path) }
+    /// Whether a folder is a project, described by Claude or made as a kit.
+    static func isProject(_ root: URL) -> Bool {
+        ["henge-build.json", ProjectMaker.file].contains { FileManager.default.fileExists(atPath: root.appendingPathComponent($0).path) }
+    }
+    static func anyPlan(in root: URL, tools: URL?) throws -> Plan {
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent(ProjectMaker.file).path) {
+            guard let tools else { throw ProjectMaker.Failure("no toolchain") }
+            return try ProjectMaker.plan(root, tools: tools)
+        }
+        return try plan(in: root)
+    }
     private var stateFile: URL { root.appendingPathComponent(".henge-build-state.json") }
 
     /// A file's hash; read again only when its size or date changed. Nil when it is not there.
@@ -93,54 +121,102 @@ final class ProjectBuilder {
     func build(progress: (String) -> Void = { _ in }) -> (ok: Bool, text: String) {
         let began = Date()
         let plan: Plan
-        do { plan = try Self.plan(in: root) } catch { return (false, "henge-build.json cannot be read: \(error)") }
+        do { plan = try Self.anyPlan(in: root, tools: tools) }
+        catch let e as ProjectMaker.Failure { return (false, "BUILD FAILED: \(e.text)") }
+        catch { return (false, "BUILD FAILED: henge-build.json cannot be read: \(error)") }
         if let d = try? Data(contentsOf: stateFile), let s = try? JSONDecoder().decode(State.self, from: d) { state = s }
         defer { if let d = try? JSONEncoder().encode(state) { try? d.write(to: stateFile) } }
         var log = "", compiled = 0, failed = 0
+        for c in plan.commands ?? [] {
+            progress(c)
+            let r = shell?(c) ?? (code: 127, output: "no shell")
+            if r.code != 0 { return (false, "BUILD FAILED: \(c): code \(r.code)\n" + Self.clip(r.output)) }
+            log += Self.clip(r.output).suffix(1500)
+        }
+        var todo = [(Unit, String)]()
+        let keys = plan.flags.map { $0.joined(separator: "\0").hashValueStable }
         for u in plan.units {
             let now: Bool
             if !FileManager.default.fileExists(atPath: full(u.obj)) { now = true }
-            else if let m = state.made[u.obj] { now = zip(m.deps, m.hashes).contains { hash($0) != $1 } }
+            else if let m = state.made[u.obj] { now = m.flags.map { $0 != keys[u.flags] } ?? false || zip(m.deps, m.hashes).contains { hash($0) != $1 } }
             else if let d = u.deps, !d.isEmpty { now = d.contains { hash(plan.files[$0]) != plan.hashes[$0] } }
             else { now = true }
-            guard now else { continue }
-            progress("compiling \(u.src)")
-            try? FileManager.default.createDirectory(atPath: (full(u.obj) as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            let d = full(u.obj) + ".d"
-            let args = plan.flags[u.flags].map(expand) + ["-fintegrated-cc1", "-fno-color-diagnostics", "-MMD", "-MF", d, "-o", full(u.obj), "-c", full(u.src)]
-            let r = run(full(plan.clang), args)
-            if !r.output.isEmpty { log += "\(u.src):\n" + r.output.replacingOccurrences(of: root.path + "/", with: "") + "\n" }
-            if r.code != 0 {
-                failed += 1
-                log += "\(u.src): the compiler ended with \(r.code)\n"
-                state.made[u.obj] = nil
-                unlink(full(u.obj))
-                if failed >= 5 { log += "Stopped after \(failed) files with errors.\n"; break }
-                continue
+            if now { todo.append((u, keys[u.flags])) }
+        }
+        var next = 0
+        func lane() {
+            while true {
+                lock.lock()
+                guard failed < 5, next < todo.count else { lock.unlock(); return }
+                let (u, key) = todo[next]
+                next += 1
+                progress("compiling \(u.src) (\(next) of \(todo.count))")
+                lock.unlock()
+                try? FileManager.default.createDirectory(atPath: (full(u.obj) as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                let d = full(u.obj) + ".d"
+                let args = plan.flags[u.flags].map(expand) + ["-fintegrated-cc1", "-fno-color-diagnostics", "-MMD", "-MF", d, "-o", full(u.obj), "-c", full(u.src)]
+                let r = run(full(plan.clang), args, [], nil)
+                lock.lock()
+                if !r.output.isEmpty { log += "\(u.src):\n" + r.output.replacingOccurrences(of: root.path + "/", with: "") + "\n" }
+                if r.code != 0 {
+                    failed += 1
+                    log += "\(u.src): the compiler ended with \(r.code)\n"
+                    state.made[u.obj] = nil
+                    unlink(full(u.obj))
+                } else {
+                    compiled += 1
+                    let deps = Self.dependencies((try? String(contentsOfFile: d, encoding: .utf8)) ?? "", root: root.path)
+                    var seen = Set<String>()
+                    let uniq = deps.filter { seen.insert($0).inserted }
+                    state.made[u.obj] = Made(deps: uniq, hashes: uniq.map { hash($0) ?? "" }, flags: key)
+                }
+                unlink(d)
+                lock.unlock()
             }
-            compiled += 1
-            let deps = Self.dependencies((try? String(contentsOfFile: d, encoding: .utf8)) ?? "", root: root.path)
-            unlink(d)
-            var seen = Set<String>()
-            let uniq = deps.filter { seen.insert($0).inserted }
-            state.made[u.obj] = Made(deps: uniq, hashes: uniq.map { hash($0) ?? "" })
+        }
+        if lanes > 1 && todo.count > 1 { DispatchQueue.concurrentPerform(iterations: min(lanes, todo.count)) { _ in lane() } } else { lane() }
+        if failed >= 5 { log += "Stopped after \(failed) files with errors.\n" }
+        if failed == 0, let s = plan.swift {
+            let key = s.args.joined(separator: "\0").hashValueStable
+            let m = state.made[s.obj]
+            if m == nil || m!.flags != key || m!.deps != s.deps || !FileManager.default.fileExists(atPath: full(s.obj)) || zip(s.deps, m!.hashes).contains(where: { hash($0) != $1 }) {
+                progress("compiling \(s.deps.count) Swift file(s)")
+                try? FileManager.default.createDirectory(atPath: (full(s.obj) as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+                let r = run(s.tool, s.args.map(expand) + ["-o", full(s.obj)], [], nil)
+                if !r.output.isEmpty { log += "Swift:\n" + r.output.replacingOccurrences(of: root.path + "/", with: "") + "\n" }
+                if r.code != 0 { failed += 1; state.made[s.obj] = nil; log += "the Swift compiler ended with \(r.code)\n" }
+                else { compiled += 1; state.made[s.obj] = Made(deps: s.deps, hashes: s.deps.map { hash($0) ?? "" }, flags: key) }
+            }
         }
         func took() -> String { String(format: "%.1f s", Date().timeIntervalSince(began)) }
         if failed > 0 { return (false, "BUILD FAILED: \(failed) file(s) did not compile (\(took()))\n" + Self.clip(log)) }
         let program = full(plan.program), linkKey = plan.link.joined(separator: " ").hashValueStable
-        if compiled > 0 || state.linked != linkKey || !FileManager.default.fileExists(atPath: program) {
+        if let made = plan.made {
+            guard FileManager.default.fileExists(atPath: full(made)) else { return (false, "BUILD FAILED: the commands did not make \(made)\n" + Self.clip(log)) }
+            try? FileManager.default.createDirectory(atPath: (program as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            if full(made) != program {
+                unlink(program)
+                do { try FileManager.default.copyItem(atPath: full(made), toPath: program) } catch { return (false, "BUILD FAILED: \(error.localizedDescription)") }
+            }
+            chmod(program, 0o755)
+        } else if plan.link.isEmpty {
+            return (true, "BUILD OK in \(took()): the commands ran; no \"executable\" or \"sources\" to make an app of.\n" + Self.clip(log))
+        } else if compiled > 0 || state.linked != linkKey || !FileManager.default.fileExists(atPath: program) {
             progress("linking")
             state.linked = ""
             try? FileManager.default.createDirectory(atPath: (program as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            let r = run(full(plan.ld), plan.link.map(expand))
+            let r = run(full(plan.ld), plan.link.map(expand), [], nil)
             if !r.output.isEmpty { log += "link:\n" + r.output.replacingOccurrences(of: root.path + "/", with: "") + "\n" }
             if r.code != 0 { return (false, "BUILD FAILED: it did not link, code \(r.code) (\(took()))\n" + Self.clip(log)) }
             chmod(program, 0o755)
             state.linked = linkKey
         }
+        if plan.bundle == false { return (true, "BUILD OK in \(took()): \(compiled) file(s) compiled, program at \(plan.program)\n" + Self.clip(log)) }
         progress("packing")
         do {
+            if plan.bundle == true { try ProjectMaker.bundle(root, plan) }
             try StoredZip.pack(folder: full(plan.app), inside: "Payload/" + (plan.app as NSString).lastPathComponent, executable: program, to: full(plan.ipa))
+        } catch let e as ProjectMaker.Failure { return (false, "BUILD FAILED: \(e.text)")
         } catch { return (false, "BUILD FAILED: the IPA could not be written: \(error.localizedDescription)") }
         return (true, "BUILD OK in \(took()): \(compiled) file(s) compiled, unsigned IPA at \(plan.ipa)\n" + Self.clip(log))
     }

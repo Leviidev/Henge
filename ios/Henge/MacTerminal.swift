@@ -59,14 +59,15 @@ final class TerminalSession: ObservableObject {
     }
 
     /// One of the kit's tools, run in this process.
-    private static func runTool(_ tool: String, _ args: [String]) -> (code: Int32, output: String) {
+    private static func runTool(_ tool: String, _ args: [String], _ env: [String], _ cwd: String?) -> (code: Int32, output: String) {
+        var e: [UnsafePointer<CChar>?] = env.map { UnsafePointer(strdup($0)) } + [nil]
         let got = Collected()
         var argv: [UnsafePointer<CChar>?] = ([tool] + args).map { UnsafePointer(strdup($0)) } + [nil]
-        let rc = henge_tl_tool_run(tool, Int32(args.count + 1), &argv, { ctx, p, n in
+        let rc = henge_tl_tool_run(tool, Int32(args.count + 1), &argv, &e, cwd, { ctx, p, n in
             guard let ctx, let p else { return }
             Unmanaged<Collected>.fromOpaque(ctx).takeUnretainedValue().add(p, n)
         }, Unmanaged.passUnretained(got).toOpaque())
-        for p in argv where p != nil { free(UnsafeMutableRawPointer(mutating: p)) }
+        for p in argv + e where p != nil { free(UnsafeMutableRawPointer(mutating: p)) }
         return (rc, String(decoding: got.data, as: UTF8.self))
     }
     private final class Collected {
@@ -108,12 +109,12 @@ final class TerminalSession: ObservableObject {
         var args = arguments.split(separator: " ").map(String.init)
         let projects = ProjectTools.projects(in: Self.projects)
         if (app.executable as NSString).lastPathComponent.lowercased().hasPrefix("claude") {
-            let s = ToolServer(tools: ProjectTools.make(folder: Self.projects, run: Self.runTool, program: Self.runProgram, stop: { henge_tl_tool_stop() }) {
+            let s = ToolServer(tools: ProjectTools.make(folder: Self.projects, home: Self.home, token: { GitHubToken.read() }, run: Self.runTool, program: Self.runProgram, stop: { henge_tl_program_stop() }, stopTools: { henge_tl_tool_stop($0) }) {
                 HengeLog.log("macapps", "terminal: \($0)")
             })
             if s.start() {
                 let config = Self.home.appendingPathComponent("henge-tools.json")
-                s.writeConfig(to: config)
+                s.writeConfig(to: config, github: GitHubToken.read())
                 args += ["--mcp-config", config.path]
                 env += ["MCP_TOOL_TIMEOUT=1800000", "MCP_TIMEOUT=60000"]
                 server = s
@@ -139,6 +140,10 @@ final class TerminalSession: ObservableObject {
                 DispatchQueue.main.async { TerminalSession.shared.status = "Ended (\(code)). Quit Henge to run it again." }
             }, &err, err.count)
             let why = String(cString: err)
+            if rc == 0 {
+                var folders: [UnsafePointer<CChar>?] = [UnsafePointer(strdup(Self.projects.appendingPathComponent("Toolchain/bin").path)), nil]
+                henge_tl_tool_setup(&folders, 3)
+            }
             if rc != 0 { HengeLog.log("macapps", "terminal: could not start \(name): \(why)") }
             await MainActor.run {
                 self.status = rc == 0 ? "" : "Could not start it: \(why)"
@@ -359,5 +364,25 @@ struct MacTerminalView: View {
             Button("Copy Link") { UIPasteboard.general.string = url.absoluteString }
             Button("Cancel", role: .cancel) {}
         } message: { url in Text("\(app.name) wants to open \(url.host ?? "a page").") }
+    }
+}
+
+/// The user's GitHub token (Mac Apps > GitHub), in the Keychain.
+enum GitHubToken {
+    private static let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "henge.github", kSecAttrAccount as String: "token"]
+    static func read() -> String? {
+        var q = query, out: CFTypeRef?
+        q[kSecReturnData as String] = true
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data, let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
+        return s
+    }
+    @discardableResult static func write(_ s: String) -> Bool {
+        SecItemDelete(query as CFDictionary)
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return true }
+        var q = query
+        q[kSecValueData as String] = Data(t.utf8)
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
     }
 }

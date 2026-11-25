@@ -77,6 +77,7 @@ targets:
           - "-lresolv"
           - "-lcompression"
           - "-lhengetl"
+          - "-lc++"
           # Henge's AppKit is found by name at run time (objc_getClass): keep every Objective-C class it has.
           - "-ObjC"
           - "-lbz2"

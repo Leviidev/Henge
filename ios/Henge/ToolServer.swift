@@ -42,9 +42,13 @@ final class ToolServer {
     }
 
     /// The file that tells Claude Code about this server.
-    func writeConfig(to url: URL) {
-        let c: [String: Any] = ["mcpServers": ["henge": ["type": "http", "url": "http://127.0.0.1:\(port)/mcp", "headers": ["Authorization": "Bearer \(secret)"]]]]
-        try? JSONSerialization.data(withJSONObject: c).write(to: url, options: .atomic)
+    /// With a GitHub token, GitHub's own server (its hosted MCP) as well.
+    func writeConfig(to url: URL, github: String? = nil) {
+        var all: [String: Any] = ["henge": ["type": "http", "url": "http://127.0.0.1:\(port)/mcp", "headers": ["Authorization": "Bearer \(secret)"]]]
+        if let github { all["github"] = ["type": "http", "url": "https://api.githubcopilot.com/mcp/", "headers": ["Authorization": "Bearer \(github)"]] }
+        guard let d = try? JSONSerialization.data(withJSONObject: ["mcpServers": all]) else { return }
+        unlink(url.path)
+        FileManager.default.createFile(atPath: url.path, contents: d, attributes: [.posixPermissions: 0o600])
     }
 
     private func serve(_ fd: Int32) {
@@ -127,7 +131,7 @@ final class ToolServer {
 enum ProjectTools {
     static func projects(in folder: URL) -> [URL] {
         let all = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
-        return all.filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("henge-build.json").path) }.sorted { $0.path < $1.path }
+        return all.filter { $0.lastPathComponent != "Toolchain" && ProjectBuilder.isProject($0) }.sorted { $0.path < $1.path }
     }
     static func pick(_ a: [String: Any], in folder: URL) -> URL? {
         let all = projects(in: folder)
@@ -136,22 +140,61 @@ enum ProjectTools {
     }
     static func missing(_ folder: URL) -> String {
         let names = projects(in: folder).map(\.lastPathComponent)
-        return names.isEmpty ? "No project with a henge-build.json in \(folder.path)." : "Name the project: \(names.joined(separator: ", "))."
+        return names.isEmpty ? "No project in \(folder.path): one is a folder with a henge-project.json (project_help)." : "Name the project: \(names.joined(separator: ", "))."
     }
 
-    static func make(folder: URL, run: @escaping (String, [String]) -> (code: Int32, output: String),
-                     program: @escaping ProgramRunner.Start, stop: @escaping () -> Void, log: @escaping (String) -> Void) -> [ToolServer.Tool] {
+    static func make(folder: URL, home: URL, token: @escaping () -> String?, run: @escaping ProjectBuilder.RunTool,
+                     program: @escaping ProgramRunner.Start, stop: @escaping () -> Void, stopTools: @escaping (String) -> Void, log: @escaping (String) -> Void) -> [ToolServer.Tool] {
         let one = NSLock()
-        let runner = ProgramRunner(start: program, stop: stop)
+        let tools = folder.appendingPathComponent("Toolchain")
+        let runner = ProgramRunner(start: program, stop: stop, tools: tools)
+        let shell = Shell(tools: tools, home: home, run: run, stop: stopTools)
         return [
             .init(name: "build", about: "Compile what changed in the project, link it and pack the unsigned iPhone app (IPA). Returns the compiler's errors.",
                   inputs: [("project", "string", "The project folder's name; not needed when there is only one")]) { a in
                 one.lock(); defer { one.unlock() }
                 guard let p = pick(a, in: folder) else { return (false, missing(folder)) }
                 if !runner.end() { return (false, "The program that runs does not end. Quit Henge and open it again.") }
-                let r = ProjectBuilder(root: p, run: run).build { log("build: \($0)") }
+                let b = ProjectBuilder(root: p, run: run)
+                b.tools = tools
+                // A kit may hold a program that needs the memory a second compiler would take.
+                b.lanes = FileManager.default.fileExists(atPath: p.appendingPathComponent("henge-build.json").path) ? 1 : 3
+                b.shell = { shell.run($0, in: p, timeout: 3600) }
+                let r = b.build { log("build: \($0)") }
                 log(r.text.components(separatedBy: "\n")[0])
                 return r
+            },
+            .init(name: "project_help", about: "How to make a project (an iPhone app or a program) here: the format of henge-project.json, what is in the toolchain, what works and what does not. Read it before starting or porting a project.", inputs: []) { _ in (true, help) },
+            .init(name: "run_command", about: "Run a shell command line (a small POSIX-like shell: pipes, && || ;, redirection, if/for/while, $(...)) in a folder of the projects. Has clang, clang++, ld, ar, cmake, ninja, python3, the built-in cp mv rm mkdir ls cat head tail wc echo test, and any program built here (./build/x). No git, make, sed, awk, grep: use python3 and the other tools. Returns its output and exit code; the whole output is in .henge-output.txt.",
+                  inputs: [("command", "string", "The command line"), ("folder", "string", "Folder, relative to the projects folder; it is made if not there"),
+                           ("timeout_seconds", "integer", "Most time it may take (default 600)")]) { a in
+                guard let c = a["command"] as? String, let d = inside(a["folder"] as? String ?? "", folder) else { return (false, "A command and a folder inside the projects folder are needed.") }
+                try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+                log("run: \(c.prefix(120))")
+                let r = shell.run(c, in: d, timeout: a["timeout_seconds"] as? Int ?? 600)
+                try? r.output.write(to: d.appendingPathComponent(".henge-output.txt"), atomically: false, encoding: .utf8)
+                return (r.code == 0, "exit code \(r.code)\n" + ProjectBuilder.clip(r.output))
+            },
+            .init(name: "download", about: "Download a file over https into the projects folder; a .zip, .tar.gz, .tar.xz or .tar.bz2 can be unpacked. For a GitHub repository use github_download.",
+                  inputs: [("url", "string", "https address"), ("to", "string", "File, or folder when unpacking, relative to the projects folder"), ("unpack", "boolean", "Unpack it into the folder")]) { a in
+                guard let u = a["url"] as? String, let to = inside(a["to"] as? String ?? "", folder), to.path != folder.path else { return (false, "An https url and a place inside the projects folder are needed.") }
+                return Fetch.file(u, to: to, unpack: a["unpack"] as? Bool == true, shell: shell)
+            },
+            .init(name: "github_download", about: "Put a GitHub repository's files (with its submodules) into a folder of the projects, to read, search and build. Public ones need no sign-in.",
+                  inputs: [("repo", "string", "owner/name"), ("ref", "string", "Branch, tag or commit; default its default branch"), ("folder", "string", "Where, relative to the projects folder; default its name")]) { a in
+                guard let repo = a["repo"] as? String, GitHub.isRepo(repo) else { return (false, "repo must be owner/name.") }
+                guard let to = inside(a["folder"] as? String ?? (repo as NSString).lastPathComponent, folder), to.path != folder.path else { return (false, "The folder must be inside the projects folder.") }
+                log("github: \(repo)")
+                return GitHub(token: token()).download(repo, ref: a["ref"] as? String, to: to, shell: shell)
+            },
+            .init(name: "github_save", about: "Commit files of a folder to a branch of a GitHub repository the user can write to (never forced; the branch is made when it is not there). Only files that differ are sent. Say exactly what will be sent and where before calling it. Not for game data, discs, keys or anything the user has not agreed to put online.",
+                  inputs: [("folder", "string", "The folder that is the repository's top, relative to the projects folder"), ("repo", "string", "owner/name"), ("branch", "string", "Branch to commit to"),
+                           ("paths", "string", "Files and folders to send, separated by commas, relative to the folder"), ("message", "string", "The commit's message")]) { a in
+                guard let t = token() else { return (false, "GitHub is not connected: the user adds a token in Henge, Mac Apps > GitHub.") }
+                guard let repo = a["repo"] as? String, GitHub.isRepo(repo), let branch = a["branch"] as? String, let d = inside(a["folder"] as? String ?? "", folder),
+                      let m = a["message"] as? String, let p = a["paths"] as? String, !branch.isEmpty, !p.isEmpty else { return (false, "folder, repo, branch, paths and message are needed.") }
+                log("github: saving to \(repo) \(branch)")
+                return GitHub(token: t).save(d, repo: repo, branch: branch, paths: p.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }, message: m)
             },
             .init(name: "search", about: "Search file contents with a regular expression (grep). Returns path:line: text.",
                   inputs: [("pattern", "string", "Regular expression (ICU)"), ("path", "string", "File or folder to search; default the projects folder"),
@@ -182,6 +225,16 @@ enum ProjectTools {
         ]
     }
 
+    /// A place in the projects folder, never outside it.
+    static func inside(_ path: String, _ folder: URL) -> URL? {
+        let base = folder.resolvingSymlinksInPath().standardizedFileURL
+        var rel = path
+        for b in [folder.path, base.path] where rel == b || rel.hasPrefix(b + "/") { rel = String(rel.dropFirst(b.count)) }
+        if rel.hasPrefix("/") && !path.hasPrefix(base.path) && !path.hasPrefix(folder.path) { return nil }
+        let u = rel.isEmpty ? base : base.appendingPathComponent(rel).standardizedFileURL.resolvingSymlinksInPath()
+        return u.path == base.path || u.path.hasPrefix(base.path + "/") ? u : nil
+    }
+
     private static func walk(_ path: String?, _ folder: URL) -> [String] {
         let base = path.map { $0.hasPrefix("/") ? $0 : folder.path + "/" + $0 } ?? folder.path
         var dir: ObjCBool = false
@@ -190,7 +243,7 @@ enum ProjectTools {
         guard let e = FileManager.default.enumerator(at: URL(fileURLWithPath: base), includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
         var out = [String]()
         for case let u as URL in e {
-            let skip = ["build", "toolchain", "sdk", ".git"].contains(u.lastPathComponent)
+            let skip = ["build", "toolchain", "Toolchain", "sdk", ".git"].contains(u.lastPathComponent)
             if skip && path == nil || u.lastPathComponent == ".git" { e.skipDescendants(); continue }
             if (try? u.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true { out.append(u.path) }
         }
@@ -233,7 +286,9 @@ final class ProgramRunner {
     private var lines = Data()
     private var file: FileHandle?
 
-    init(start: @escaping Start, stop: @escaping () -> Void) { self.start = start; self.stop = stop }
+    private let tools: URL?
+
+    init(start: @escaping Start, stop: @escaping () -> Void, tools: URL? = nil) { self.start = start; self.stop = stop; self.tools = tools }
 
     private func locked<T>(_ f: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return f() }
     private var isRunning: Bool { locked { running } }
@@ -244,14 +299,14 @@ final class ProgramRunner {
     func begin(_ root: URL) -> (ok: Bool, text: String) {
         if !end() { return (false, "The program that runs does not end. Quit Henge and open it again.") }
         let fm = FileManager.default
-        guard let plan = try? ProjectBuilder.plan(in: root), let r = plan.run else { return (false, "henge-build.json does not say how to run it.") }
+        guard let plan = try? ProjectBuilder.anyPlan(in: root, tools: tools), let r = plan.run else { return (false, "The project does not say how to run it (\"run\", see project_help).") }
         func b(_ p: String) -> URL { root.appendingPathComponent(p) }
         guard fm.fileExists(atPath: b(plan.program).path) else { return (false, "Build it first.") }
         let home = b(r.home)
         try? fm.createDirectory(at: home.appendingPathComponent("Documents"), withIntermediateDirectories: true)
         let re = try? NSRegularExpression(pattern: r.needs)
         let there = (try? fm.subpathsOfDirectory(atPath: home.path)) ?? []
-        if let re, !there.contains(where: { re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil }) { return (false, r.missing) }
+        if let re, !r.needs.isEmpty, !there.contains(where: { re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil }) { return (false, r.missing) }
         for (n, text) in r.files {
             try? fm.createDirectory(at: b(n).deletingLastPathComponent(), withIntermediateDirectories: true)
             try? text.write(to: b(n), atomically: true, encoding: .utf8)
@@ -274,9 +329,10 @@ final class ProgramRunner {
             }
             locked { running = false; ended = "The program ended with \(code)."; try? file?.close(); file = nil }
         }
-        for _ in 0..<300 {
+        for i in 0..<300 {
             usleep(100_000)
-            if !isRunning { return (false, tail()) }
+            if !isRunning { return (r.port == 0, tail()) }
+            if r.port == 0 { if i > 20 { return (true, "Running (it takes no commands).\n" + tail()) }; continue }
             if let fd = connect() { close(fd); return (true, "Running; it takes commands.\n" + tail()) }
         }
         return (true, "Running, but it takes no commands yet.\n" + tail())
