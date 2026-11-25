@@ -603,8 +603,8 @@ static const char install_script[] =
     "echo 'Henge is set up. You can close this window.'\n";
 
 /* What "curl -s http://10.0.2.4/.henge/lighten | sh" runs in macOS: less background work and drawing, for a Mac
-   whose CPUs are emulated: less animation and drawing, and the system part (update checks, Time Machine) with the
-   Mac's password once. Apple's own background agents can't be turned off with System Integrity Protection on
+   whose CPUs are emulated: less animation and drawing, and no automatic downloads of macOS updates (the Mac's
+   password once; what it was is kept in net.henge.lighten for the undo; checks and security files stay on). Apple's own background agents can't be turned off with System Integrity Protection on
    (launchctl disable of gui/ agents did not survive a log out on the Mac bench, 2026-11-08), so it doesn't try.
    Reduce Motion and Reduce Transparency need System Settings (a script can't write com.apple.universalaccess).
    Nothing reads the script's own stdin (sh is reading the script from it). */
@@ -636,6 +636,19 @@ static const char lighten_script[] =
     "killall Dock 2>/dev/null\n"
     "echo 'Done: window and Dock animations, desktop widgets, the screen saver and a moving wallpaper are off.'\n"
     "echo 'Also turn on Reduce Motion and Reduce Transparency: System Settings, Accessibility.'\n"
+    "F=/Library/Preferences/com.apple.SoftwareUpdate\n"
+    "echo 'Last: turning off automatic downloads of macOS updates, which needs the password of this Mac.'\n"
+    "echo 'Nothing shows as you type it. To leave updates as they are, press Control-C.'\n"
+    "OLD=$(defaults read $F AutomaticDownload 2>/dev/null </dev/null) || OLD=none\n"
+    "trap : INT\n"
+    "if sudo sh -c \"defaults write $F AutomaticDownload -bool false && { killall softwareupdated 2>/dev/null; :; }\" </dev/null; then\n"
+    "  defaults read net.henge.lighten AutomaticDownload >/dev/null 2>&1 </dev/null || "
+    "defaults write net.henge.lighten AutomaticDownload -string \"$OLD\" </dev/null\n"
+    "  echo 'Done: macOS does not download updates by itself. Look for them in System Settings, General, Software Update.'\n"
+    "else\n"
+    "  echo 'Automatic downloads of updates are as they were.'\n"
+    "fi\n"
+    "trap - INT\n"
     "echo 'Log out and back in for all of it to take effect. To undo: curl -s http://" HV_SHARE_ADDR "/.henge/unlighten | sh'\n";
 
 /* And back. The wallpaper stays as it is: pick one in System Settings. */
@@ -650,6 +663,18 @@ static const char unlighten_script[] =
     "defaults write com.apple.WindowManager StandardHideWidgets -int 0 </dev/null\n"
     "defaults write com.apple.WindowManager StageManagerHideWidgets -int 0 </dev/null\n"
     "killall Dock 2>/dev/null\n"
+    "F=/Library/Preferences/com.apple.SoftwareUpdate\n"
+    "if OLD=$(defaults read net.henge.lighten AutomaticDownload 2>/dev/null </dev/null); then\n"
+    "  case $OLD in none) C=\"defaults delete $F AutomaticDownload\";; 0) C=:;; *) C=\"defaults write $F AutomaticDownload -bool true\";; esac\n"
+    "  echo 'Automatic downloads of updates go back too, which needs the password of this Mac.'\n"
+    "  trap : INT\n"
+    "  if sudo sh -c \"$C; killall softwareupdated 2>/dev/null; :\" </dev/null; then\n"
+    "    defaults delete net.henge.lighten AutomaticDownload </dev/null\n"
+    "  else\n"
+    "    echo 'Not changed: automatic downloads of updates are still off.'\n"
+    "  fi\n"
+    "  trap - INT\n"
+    "fi\n"
     "echo 'Back as it was, apart from the wallpaper (System Settings, Wallpaper).'\n"
     "echo 'Log out and back in (or restart) for all of it to take effect.'\n";
 
