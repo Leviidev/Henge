@@ -95,7 +95,8 @@ int hv_disk_grow(const char *path, uint64_t new_size, char *err, unsigned long e
     }
     if (fsync(fd) != 0) FAIL("Writing failed: %s", strerror(errno));
     if (rec) put64(rec + 32, rnew), put64(rec + 40, rnew + rlen - 1);
-    put64(main_p + 40, (rec ? rnew : new_last) - 1);
+    /* The main partition's own entry stays: diskutil grows the partition and the container together, into the free
+       space after it, and refuses a partition that was made bigger than its container beforehand. */
     uint32_t tcrc = crc(table, TABLE);
     uint8_t back[SECTOR];
     put64(h + 48, usable);

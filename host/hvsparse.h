@@ -15,8 +15,8 @@ int hv_sparse_pack_compressed(const char *src, const char *dst, void (*progress)
 /* Reads a whole packed file of either kind, checking it, without writing anything. Returns 0 or -1. */
 int hv_sparse_verify(const char *src, void (*progress)(uint64_t done, uint64_t total, void *opaque), void *opaque);
 
-/* Make a Mac's disk image bigger: the Recovery partition (the last) moves to the new end, and the main APFS partition
-   takes the room up to it. macOS still has to grow its container: diskutil apfs resizeContainer disk0s2 0. The image
+/* Make a Mac's disk image bigger: the Recovery partition (the last) moves to the new end, and the
+   free space is left after the main one. macOS then takes it: diskutil apfs resizeContainer disk0s2 0. The image
    must not be in use. Returns 0, or -1 with the reason in err; nothing is changed when it returns before writing the
    partition table, which is the last thing it does. */
 int hv_disk_grow(const char *path, uint64_t new_size, char *err, unsigned long errlen);
