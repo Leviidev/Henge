@@ -130,7 +130,7 @@ final class TerminalSession: ObservableObject {
         let pre = fm.temporaryDirectory.appendingPathComponent("terminal-preload.js")
         try? "globalThis.SharedArrayBuffer ??= ArrayBuffer;\n".write(to: pre, atomically: true, encoding: .utf8)
         var env = ["HOME=\(Self.home.path)", "TMPDIR=\(tmp)", "TERM=xterm-256color", "COLORTERM=truecolor",
-                   "LANG=en_US.UTF-8", "SHELL=/bin/sh", "PATH=/usr/bin:/bin", "USER=mobile"]
+                   "LANG=en_US.UTF-8", "SHELL=/bin/sh", "PATH=/henge/bin:/usr/bin:/bin", "USER=mobile"]
         env += ["BUN_JSC_useJIT=0", "BUN_OPTIONS=--preload=\(pre.path)", "CLAUDE_CODE_TMPDIR=\(tmp)", "DISABLE_AUTOUPDATER=1"]
         var args = arguments.split(separator: " ").map(String.init)
         let projects = ProjectTools.projects(in: Self.projects)

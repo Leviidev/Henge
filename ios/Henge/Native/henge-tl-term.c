@@ -2,8 +2,11 @@
    as a terminal does (isatty, the window size, raw mode), since an iOS app gets no pseudo-terminal of its own. The
    program runs on a thread of this process, one per launch (henge-tl.c). Other processes it tries to start are
    refused, as iOS does; a web page it opens (/usr/bin/open URL: signing in) is handed to the app. */
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -12,9 +15,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -114,6 +119,7 @@ static int security_tool(pid_t *pid, const char *path, char *const argv[]) {
     unsigned i = atomic_fetch_add(&security_next, 1) % SECURITY_PIDS;
     atomic_store(&security_code[i], (unsigned char)((lookup ? NOT_FOUND : 1) + 1));
     if (pid) *pid = SECURITY_PID + (pid_t)i;
+    fprintf(stderr, "henge: term: security %.24s: answered %d (%u)\n", verb ? verb : "", lookup ? NOT_FOUND : 1, i); /* not its arguments: a secret is one */
     return 1;
 }
 static pid_t term_wait4(pid_t pid, int *status, int options, struct rusage *ru) {
@@ -121,6 +127,15 @@ static pid_t term_wait4(pid_t pid, int *status, int options, struct rusage *ru) 
         int code = atomic_exchange(&security_code[pid - SECURITY_PID], 0);
         if (!code) return errno = ECHILD, -1;
         if (status) *status = (code - 1) << 8;
+        fprintf(stderr, "henge: term: security: told it ended (%d)\n", pid - SECURITY_PID);
+        if (code - 1 != NOT_FOUND)
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                char file[PATH_MAX];
+                struct stat st;
+                snprintf(file, sizeof file, "%s/.claude/.credentials.json", getenv("HOME") ? getenv("HOME") : "");
+                if (stat(file, &st)) fprintf(stderr, "henge: term: no private sign-in file: %s\n", strerror(errno));
+                else fprintf(stderr, "henge: term: private sign-in file: %lld bytes\n", (long long)st.st_size);
+            });
         if (ru) memset(ru, 0, sizeof *ru);
         return pid;
     }
@@ -146,11 +161,75 @@ static int term_spawn(pid_t *pid, const char *path, const posix_spawn_file_actio
     return refuse ? refuse(pid, path, fa, attr, argv, envp) : EPERM;
 }
 
+/* A program looks for the tool on its PATH (/henge/bin is first there) before it starts it, and iOS has no such file:
+   it sees a file that is there, Henge's own. */
+#define SECURITY_PATH "/henge/bin/security"
+static const char *seen(const char *path) {
+    static char own[PATH_MAX];
+    if (!path || strcmp(path, SECURITY_PATH)) return path;
+    uint32_t n = sizeof own;
+    if (!own[0] && _NSGetExecutablePath(own, &n)) own[0] = 0;
+    return own[0] ? own : path;
+}
+static int term_open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    const char *p = seen(path);
+    if (p != path) return open(p, O_RDONLY | O_CLOEXEC);
+    int (*next)(const char *, int, ...) = tl_runtime_lookup("_open");
+    return (next ? next : open)(path, flags, mode);
+}
+static int term_access(const char *path, int mode) {
+    const char *p = seen(path);
+    int (*next)(const char *, int) = tl_runtime_lookup("_access");
+    return (next ? next : access)(p, p == path ? mode : F_OK);
+}
+static int term_stat(const char *path, struct stat *st) {
+    int (*next)(const char *, struct stat *) = tl_runtime_lookup("_stat");
+    return (next ? next : stat)(seen(path), st);
+}
+
+/* A watch on such a process fails as the kernel's does on one that is gone, whatever this kernel would say. */
+static int is_security(uint64_t ident, int16_t filter) {
+    return filter == EVFILT_PROC && ident >= SECURITY_PID && ident < SECURITY_PID + SECURITY_PIDS;
+}
+#define FLAGS_COMMA ,
+#define KEVENT(name, type, extra_decl, extra)                                                                              \
+    static int term_##name(int kq, const type *ch, int nch, type *ev, int nev, extra_decl const struct timespec *t) {      \
+        int mine = 0;                                                                                                      \
+        for (int i = 0; i < nch; i++) mine += is_security(ch[i].ident, ch[i].filter);                                      \
+        if (!mine) return name(kq, ch, nch, ev, nev, extra t);                                                             \
+        fprintf(stderr, "henge: term: security: watched\n");                                                              \
+        type *rest = calloc((size_t)nch, sizeof *rest);                                                                    \
+        int n = 0, out = 0;                                                                                                \
+        for (int i = 0; i < nch; i++)                                                                                      \
+            if (!is_security(ch[i].ident, ch[i].filter)) rest[n++] = ch[i];                                                \
+            else if (out < nev) ev[out] = ch[i], ev[out].flags = EV_ERROR, ev[out++].data = ESRCH;                         \
+        struct timespec now = {0, 0};                                                                                      \
+        int rc = n || (out && out < nev) ? name(kq, rest, n, ev + out, nev - out, extra &now) : 0;                         \
+        free(rest);                                                                                                        \
+        if (rc < 0) return rc;                                                                                             \
+        if (!out) return errno = ESRCH, -1;                                                                                \
+        return out + rc;                                                                                                   \
+    }
+KEVENT(kevent, struct kevent, , )
+KEVENT(kevent64, struct kevent64_s, unsigned flags FLAGS_COMMA, flags FLAGS_COMMA)
+
 /* The loader answers these itself: asked first. */
 static void *first_lookup(const char *symbol) {
     if (!strcmp(symbol, "_posix_spawn") || !strcmp(symbol, "_posix_spawnp")) return (void *)term_spawn;
     if (!strcmp(symbol, "_wait4")) return (void *)term_wait4;
     if (!strcmp(symbol, "_waitpid")) return (void *)term_waitpid;
+    if (!strcmp(symbol, "_open")) return (void *)term_open;
+    if (!strcmp(symbol, "_access")) return (void *)term_access;
+    if (!strcmp(symbol, "_stat")) return (void *)term_stat;
+    if (!strcmp(symbol, "_kevent")) return (void *)term_kevent;
+    if (!strcmp(symbol, "_kevent64")) return (void *)term_kevent64;
     return NULL;
 }
 
