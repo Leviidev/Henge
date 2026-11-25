@@ -1,0 +1,101 @@
+#!/bin/bash
+# iosapp new NAME    a new SwiftUI app in ./NAME
+# iosapp build       in an app's folder: builds build/NAME.ipa (and puts it in ~/Henge, the folder shared with the phone)
+K=${IOSDEV:-$HOME/iosdev}
+die() { echo "iosapp: $*" >&2; exit 1; }
+new() {
+  N=$1; [[ "$N" =~ ^[A-Za-z][A-Za-z0-9]*$ ]] || die "a name of letters and digits, as in: iosapp new MyApp"
+  [ -e "$N" ] && die "$N is already here"
+  mkdir -p "$N/Sources" "$N/Resources"
+  low=$(echo "$N" | tr A-Z a-z)
+  cat > "$N/app.conf" <<C
+NAME=$N
+BUNDLE_ID=com.example.$low
+VERSION=1.0
+BUILD=1
+MIN_IOS=17.0
+C
+  cat > "$N/Sources/${N}App.swift" <<C
+import SwiftUI
+
+@main
+struct ${N}App: App {
+    var body: some Scene { WindowGroup { ContentView() } }
+}
+C
+  cat > "$N/Sources/ContentView.swift" <<C
+import SwiftUI
+
+struct ContentView: View {
+    @State private var count = 0
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("$N").font(.largeTitle.bold())
+            Button("Tapped \(count) times") { count += 1 }.buttonStyle(.borderedProminent)
+        }
+    }
+}
+C
+  cat > "$N/CLAUDE.md" <<C
+# $N: an iPhone app, built without Xcode
+
+- Build with \`iosapp build\` in this folder; fix what it reports and build again. It writes build/$N.ipa.
+- All Swift files in Sources/ are one module. Files in Resources/ are copied into the app as they are.
+- C and Objective-C files in Sources/ work too, with Sources/Bridge.h as the bridging header.
+- app.conf has the name, bundle id, version and lowest iOS. Extra Info.plist keys go in Info.extra.plist.
+- There is no Xcode project, simulator, storyboard, Swift package or .xcassets here: use SwiftUI or UIKit code,
+  and plain image files in Resources/ (an icon: Resources/AppIcon60x60@2x.png, 120 x 120).
+- The app runs only on a real iPhone, installed with a sideloader, which signs it.
+C
+  echo "Made $N. Now: cd $N && iosapp build"
+}
+build() {
+  [ -f app.conf ] || die "no app.conf here: cd into the app's folder"
+  . ./app.conf
+  [ -x "$K/tc/usr/bin/swiftc" ] || die "run setup.sh first"
+  SDK=$(ls -d "$K"/sdk/iPhoneOS*.sdk | head -1); TGT=arm64-apple-ios$MIN_IOS
+  APP=build/Payload/$NAME.app; mkdir -p build/obj "$APP"
+  rm -rf "build/Payload/$NAME.app"; mkdir -p "$APP"
+  objs=(); bridge=(); inc=()
+  while IFS= read -r f; do
+    o=build/obj/$(echo "$f" | tr '/ ' '__').o
+    if [ ! "$o" -nt "$f" ]; then
+      case "$f" in *.m|*.mm) arc=-fobjc-arc ;; *) arc= ;; esac
+      "$K/tc/usr/bin/clang" -target $TGT -isysroot "$SDK" -O2 $arc -ISources -c "$f" -o "$o" || exit 1
+    fi
+    objs+=(-Xlinker "$PWD/$o")
+  done < <(find Sources -name '*.c' -o -name '*.m' -o -name '*.mm' -o -name '*.cpp')
+  [ -f Sources/Bridge.h ] && bridge=(-import-objc-header Sources/Bridge.h -Xcc -ISources)
+  find Sources -name '*.mm' -o -name '*.cpp' | grep -q . && inc=(-lc++)
+  swift=(); while IFS= read -r f; do swift+=("$f"); done < <(find Sources -name '*.swift' | sort)
+  [ ${#swift[@]} -gt 0 ] || die "no Swift files in Sources"
+  start=$SECONDS
+  lib=(); grep -lqs '@main' "${swift[@]}" && lib=(-parse-as-library)
+  "$K/tc/usr/bin/swiftc" "${lib[@]}" ${OPT:--O} -wmo -module-name "$NAME" -sdk "$SDK" -target $TGT -module-cache-path "$K/cache" \
+    -tools-directory "$K/tc/usr/bin" -plugin-path "$K/plugins" \
+    -external-plugin-path "$K/plugins#$K/tc/usr/bin/swift-plugin-server" "${bridge[@]}" "${inc[@]}" \
+    "${swift[@]}" "${objs[@]}" -o "$APP/$NAME" 2> build/log.txt
+  rc=$?; grep -av "legacy driver" build/log.txt >&2
+  [ $rc = 0 ] || die "the build failed"
+  cat > "$APP/Info.plist" <<C
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>$BUNDLE_ID</string><key>CFBundleExecutable</key><string>$NAME</string>
+<key>CFBundleName</key><string>$NAME</string><key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleVersion</key><string>$BUILD</string><key>CFBundleShortVersionString</key><string>$VERSION</string>
+<key>MinimumOSVersion</key><string>$MIN_IOS</string><key>LSRequiresIPhoneOS</key><true/><key>UILaunchScreen</key><dict/>
+<key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+<key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+<key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array>
+<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+</dict></plist>
+C
+  [ -f Info.extra.plist ] && { /usr/libexec/PlistBuddy -c "Merge Info.extra.plist" "$APP/Info.plist" >/dev/null || die "Info.extra.plist is not right"; }
+  [ -d Resources ] && cp -R Resources/. "$APP/"
+  codesign -f -s - "$APP" 2>/dev/null || die "signing failed"
+  rm -f "build/$NAME.ipa"; (cd build && zip -qry "$NAME.ipa" Payload) || die "zip failed"
+  echo "Built build/$NAME.ipa ($(du -h "build/$NAME.ipa" | cut -f1 | tr -d ' '), $((SECONDS - start)) s)"
+  if [ -d "$HOME/Henge" ] && cp "build/$NAME.ipa" "$HOME/Henge/" 2>/dev/null; then echo "Also in ~/Henge: on the phone, Files > Henge > Shared"; fi
+}
+case "$1" in new) new "$2" ;; build) build ;; *) sed -n '2,3p' "$0" | cut -c3- ;; esac
