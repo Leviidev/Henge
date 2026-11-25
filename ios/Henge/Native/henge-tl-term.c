@@ -13,7 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -90,6 +92,46 @@ static void term_exit(int code) {
         pause(); /* another of its threads called it: the main one may still be running */
     }
 }
+/* /usr/bin/security, the Mac's keychain tool, which iOS has not: it runs, finds nothing and can save nothing, so a
+   program (Claude Code) keeps its sign-in in its own private file instead. Refusing to start it says only "try again
+   later". The "process" has ended when it is returned; the kernel knows no such pid, so a watch on it fails at once
+   and the program asks wait4. */
+enum { SECURITY_PID = 0x40000000, SECURITY_PIDS = 4096, NOT_FOUND = 44 };
+static _Atomic unsigned security_next;
+static _Atomic unsigned char security_code[SECURITY_PIDS]; /* 0: no such process; else the exit code + 1 */
+static int security_tool(pid_t *pid, const char *path, char *const argv[]) {
+    if (!path || !argv || !argv[0]) return 0;
+    const char *base = strrchr(path, '/'), *verb = argv[1];
+    base = base ? base + 1 : path;
+    if (!strcmp(base, "sh") && argv[1] && !strcmp(argv[1], "-c") && argv[2]) {
+        const char *cmd = argv[2];
+        if (!strncmp(cmd, "/usr/bin/", 9)) cmd += 9;
+        if (strncmp(cmd, "security ", 9) || strpbrk(cmd, ";|&\n")) return 0;
+        verb = cmd + 9;
+    } else if (strcmp(base, "security"))
+        return 0;
+    int lookup = verb && (!strncmp(verb, "find-", 5) || !strncmp(verb, "delete-", 7));
+    unsigned i = atomic_fetch_add(&security_next, 1) % SECURITY_PIDS;
+    atomic_store(&security_code[i], (unsigned char)((lookup ? NOT_FOUND : 1) + 1));
+    if (pid) *pid = SECURITY_PID + (pid_t)i;
+    return 1;
+}
+static pid_t term_wait4(pid_t pid, int *status, int options, struct rusage *ru) {
+    if (pid >= SECURITY_PID && pid < SECURITY_PID + SECURITY_PIDS) {
+        int code = atomic_exchange(&security_code[pid - SECURITY_PID], 0);
+        if (!code) return errno = ECHILD, -1;
+        if (status) *status = (code - 1) << 8;
+        if (ru) memset(ru, 0, sizeof *ru);
+        return pid;
+    }
+    pid_t (*next)(pid_t, int *, int, struct rusage *) = tl_runtime_lookup("_wait4");
+    return next ? next(pid, status, options, ru) : wait4(pid, status, options, ru);
+}
+static pid_t term_waitpid(pid_t pid, int *status, int options) {
+    if (pid >= SECURITY_PID && pid < SECURITY_PID + SECURITY_PIDS) return term_wait4(pid, status, options, NULL);
+    pid_t (*next)(pid_t, int *, int) = tl_runtime_lookup("_waitpid");
+    return next ? next(pid, status, options) : waitpid(pid, status, options);
+}
 static int term_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *fa, const posix_spawnattr_t *attr,
                       char *const argv[], char *const envp[]) {
     size_t n = path ? strlen(path) : 0;
@@ -99,15 +141,23 @@ static int term_spawn(pid_t *pid, const char *path, const posix_spawn_file_actio
                 on_open(argv[i]);
                 return EPERM; /* there is no such process to wait for: the program shows the address as well */
             }
+    if (security_tool(pid, path, argv)) return 0;
     int (*refuse)(pid_t *, const char *, const void *, const void *, char *const[], char *const[]) = tl_runtime_lookup("_posix_spawn");
     return refuse ? refuse(pid, path, fa, attr, argv, envp) : EPERM;
+}
+
+/* The loader answers these itself: asked first. */
+static void *first_lookup(const char *symbol) {
+    if (!strcmp(symbol, "_posix_spawn") || !strcmp(symbol, "_posix_spawnp")) return (void *)term_spawn;
+    if (!strcmp(symbol, "_wait4")) return (void *)term_wait4;
+    if (!strcmp(symbol, "_waitpid")) return (void *)term_waitpid;
+    return NULL;
 }
 
 static void *shim_lookup(const char *install_name, const char *symbol) {
     static const struct { const char *name; void *fn; } table[] = {
         {"_isatty", (void *)term_isatty}, {"_tcgetattr", (void *)term_tcgetattr}, {"_tcsetattr", (void *)term_tcsetattr},
         {"_ioctl", (void *)term_ioctl}, {"_exit", (void *)term_exit}, {"__exit", (void *)term_exit}, {"__Exit", (void *)term_exit},
-        {"_posix_spawn", (void *)term_spawn}, {"_posix_spawnp", (void *)term_spawn},
     };
     if (!strstr(install_name, "libSystem")) return NULL;
     for (size_t i = 0; i < sizeof table / sizeof *table; i++)
@@ -168,6 +218,7 @@ int henge_tl_term_start(const char *path, const char *const *args, const char *c
     tl_host_init_region(&host, jit->rx_addr + keep, jit->rw_addr + keep, jit->size - keep);
     host.map_install_name = tl_ios_map_install_name;
     host.shim_lookup = shim_lookup;
+    host.first_lookup = first_lookup;
     host.log = log_line;
     host.soft_missing = 1;
     host.no_processes = 1;

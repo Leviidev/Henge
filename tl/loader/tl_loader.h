@@ -28,6 +28,8 @@ typedef struct TlHost {
     /* A symbol the host provides itself for a library (AppKit on iOS, say), or
        NULL. Asked before the real library, so a shim can replace it. */
     void *(*shim_lookup)(const char *install_name, const char *symbol);
+    /* Asked before the loader's own answers (which tl_runtime_lookup gives). NULL: none of its. */
+    void *(*first_lookup)(const char *symbol);
     /* Messages ("tl: ..."); NULL writes them to stderr. */
     void (*log)(const char *line);
     /* A missing non-weak symbol fails the load (1) or binds to a stub that

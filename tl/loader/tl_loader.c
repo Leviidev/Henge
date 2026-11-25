@@ -928,7 +928,9 @@ static uint64_t host_symbol(void *handle, const char *install_name, const char *
     }
     if (!install_name || strstr(install_name, "libSystem") || !strncmp(install_name, "/usr/lib/system/", 16) ||
         strstr(install_name, "/libbsm.") || strstr(install_name, "/libsandbox.")) {
-        void *s = tl_runtime_lookup(sym);
+        void *s = g_host->first_lookup ? g_host->first_lookup(sym) : NULL;
+        if (s) { *found = 1; return (uint64_t)s; }
+        s = tl_runtime_lookup(sym);
         if (s) { *found = 1; return (uint64_t)s; }
     }
     if (g_host->shim_lookup && install_name) {
