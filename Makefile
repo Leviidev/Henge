@@ -178,6 +178,10 @@ ios-lib: $(IB)/libhengevm.a $(IB)/libhengetl.a
 $(B)/test_tl_glue: tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c | $(B)
 	$(CC) $(CFLAGS) -fblocks -Iios/Henge/Native tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(filter-out %.m,$(TL_SRC)) host/jit_region.c \
 	  -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -framework Foundation -lz -lbz2 -lcompression -o $@
+# The terminal for command-line Mac programs (ios/Henge/Native/henge-tl-term.c) on the Mac.
+$(B)/test_tl_term: tests/test_tl_term.c ios/Henge/Native/henge-tl-term.c ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c | $(B)
+	$(CC) $(CFLAGS) -fblocks -Iios/Henge/Native tests/test_tl_term.c ios/Henge/Native/henge-tl-term.c ios/Henge/Native/henge-tl.c $(filter-out %.m,$(TL_SRC)) host/jit_region.c \
+	  -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -framework Foundation -lz -lbz2 -lcompression -o $@
 # The glue for Mac apps with windows (ios/Henge/Native/henge-tl-app.m) on the Mac, against Henge's AppKit as tl/
 # builds it: test_tl_app APP SNAPDIR [SECONDS] runs the app and draws its windows to PNG files.
 $(B)/test_tl_app: tests/test_tl_app.m ios/Henge/Native/henge-tl-app.m ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c tl/shim/appkit/*.m tl/shim/appkit/*.h | $(B)

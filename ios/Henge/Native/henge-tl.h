@@ -35,6 +35,18 @@ int henge_tl_run(const char *path, const char *out_path, char *err, size_t errle
 int henge_tl_used(void);
 int henge_tl_ran_program(void);
 
+/* ---- a command-line program in a terminal (experimental; henge-tl-term.c), one per launch, no Mac after it ---- */
+typedef void (*HengeTlTermOutput)(const char *bytes, size_t len); /* what it draws; on a thread of its own */
+typedef void (*HengeTlTermOpen)(const char *url);                 /* a web page it wants opened */
+typedef void (*HengeTlTermExit)(int code);
+/* Loads and starts path with args (NULL-terminated, without the program's name), env ("NAME=value", NULL-terminated,
+   set in this process) and dir as the current folder, in a terminal of cols by rows. 0 once it runs, or -1 with a
+   reason in err. */
+int henge_tl_term_start(const char *path, const char *const *args, const char *const *env, const char *dir, int cols, int rows,
+                        HengeTlTermOutput output, HengeTlTermOpen open_url, HengeTlTermExit ended, char *err, size_t errlen);
+void henge_tl_term_write(const char *bytes, size_t len);
+void henge_tl_term_resize(int cols, int rows);
+
 /* ---- Mac apps with windows (experimental; henge-tl-app.m): an AppKit app runs on the main thread against Henge's
    AppKit, one per launch, and no Mac can start after it. ---- */
 /* The screen the app sees, in points, and its scale. Before henge_tl_app_load. */

@@ -9,6 +9,7 @@
 #include <mach-o/fat.h>
 #include <mach-o/fixup-chains.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <sys/sysctl.h>
@@ -609,6 +610,12 @@ static int load_deps_of(TlImage *im, char *err, size_t errlen) {
         const char *name = dep->install_name;
         if (name[0] == '@') {
             char path[PATH_MAX];
+            /* As for dyld, a library already loaded under that very name serves, wherever it was found: Xcode's
+               platforms have copies of the compiler's Swift libraries, and two would not know each other's types. */
+            if (!strncmp(name, "@rpath/", 7))
+                for (TlImage *l = g_images; l && !dep->tl; l = l->next)
+                    if (l != im && l->ns == im->ns && l->id && !strcmp(l->id, name)) dep->tl = l;
+            if (dep->tl) continue;
             if (expand_path(im, name, path, sizeof path) && file_exists(path)) {
                 char real[PATH_MAX];
                 if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
@@ -616,10 +623,6 @@ static int load_deps_of(TlImage *im, char *err, size_t errlen) {
                 if (!dep->tl) return -1;
                 continue;
             }
-            /* As for dyld, a library already loaded under that very name serves, wherever it was found. */
-            for (TlImage *l = g_images; l && !dep->tl; l = l->next)
-                if (l != im && l->ns == im->ns && l->id && !strcmp(l->id, name)) dep->tl = l;
-            if (dep->tl) continue;
             if (dep->weak) { dep->no_library = 1; continue; }
             set_err(err, errlen, "%s needs %s, which is not in the app", im->path, name);
             return -1;
@@ -2005,6 +2008,45 @@ static TlProc *proc_load(const char *path, int parent_ns, char *const argv[], ch
     p->exe = exe;
     if (g_host->process_started) g_host->process_started(ns, path);
     return p;
+}
+
+/* A command-line program kept loaded beside the main one, in a namespace of its own, for the host to run again and
+   again (tl_run_main): nothing is unloaded between runs, and the host answers its exit. */
+TlImage *tl_load_tool(const char *path, char *err, size_t errlen) {
+    if (!g_host) { set_err(err, errlen, "nothing loaded yet"); return NULL; }
+    char *argv[] = {(char *)path, NULL};
+    TlProc *p = proc_new(0, argv, environ);
+    if (!p) { set_err(err, errlen, "too many programs"); return NULL; }
+    p->exe = load_library_in(path, p->ns, err, errlen);
+    if (!p->exe) { g_procs[p->ns] = NULL; return NULL; }
+    return p->exe;
+}
+
+/* The address of a symbol of the image's own table, local ones included, and the room to the next symbol (its size
+   or a little more); NULL when it has none. */
+void *tl_image_local_symbol(TlImage *im, const char *sym, size_t *room) {
+    const struct load_command *lc = (const void *)(im->fmh + 1);
+    for (uint32_t i = 0; i < im->fmh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SYMTAB) continue;
+        const struct symtab_command *st = (const void *)lc;
+        if ((uint64_t)st->symoff + (uint64_t)st->nsyms * sizeof(struct nlist_64) > im->slicelen ||
+            (uint64_t)st->stroff + st->strsize > im->slicelen)
+            return NULL;
+        const struct nlist_64 *syms = (const void *)(im->slice + st->symoff);
+        const char *strs = (const char *)im->slice + st->stroff;
+        uint64_t at = 0, next = UINT64_MAX;
+        for (uint32_t k = 0; k < st->nsyms && !at; k++)
+            if (!(syms[k].n_type & N_STAB) && (syms[k].n_type & N_TYPE) == N_SECT && syms[k].n_un.n_strx < st->strsize &&
+                !strcmp(strs + syms[k].n_un.n_strx, sym))
+                at = syms[k].n_value;
+        if (!at) return NULL;
+        for (uint32_t k = 0; k < st->nsyms; k++)
+            if (!(syms[k].n_type & N_STAB) && (syms[k].n_type & N_TYPE) == N_SECT && syms[k].n_value > at && syms[k].n_value < next)
+                next = syms[k].n_value;
+        if (room) *room = next == UINT64_MAX ? 0 : (size_t)(next - at);
+        return (void *)(uintptr_t)(at + (uint64_t)im->slide);
+    }
+    return NULL;
 }
 
 /* A Chromium helper's switches for running inside the app: its sandbox policy would come through an inherited file

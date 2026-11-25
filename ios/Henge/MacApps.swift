@@ -276,6 +276,8 @@ struct MacAppRunView: View {
     @State private var result: String?
     @State private var confirmDelete = false
     @State private var showScreen = false
+    @State private var showTerminal = false
+    @AppStorage("terminal.arguments") private var arguments = ""
 
     var body: some View {
         ScrollView {
@@ -297,6 +299,14 @@ struct MacAppRunView: View {
                 if app.canRun {
                     Button(running ? "Running…" : "Run") { run() }
                         .buttonStyle(DeskButtonStyle()).disabled(running || (result == nil && henge_tl_ran_program() != 0)).padding(.top, 16)
+                    TextField("Arguments (optional)", text: $arguments)
+                        .font(.system(size: 15, design: .monospaced)).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .padding(12).deskCard().padding(.top, 12)
+                    Button(TerminalSession.shared.started ? "Show Terminal" : "Open in a Terminal") { showTerminal = true }
+                        .buttonStyle(DeskButtonStyle())
+                        .disabled(!TerminalSession.shared.started && henge_tl_ran_program() != 0).padding(.top, 10)
+                    Text("A terminal suits programs you type into, such as Claude Code. It starts in Files → Henge → Projects. Programs it tries to start are refused, as iOS allows none.")
+                        .font(.system(size: 13)).foregroundStyle(Desk.dim).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
                     Text("Programs run inside Henge, one per launch. After one has run, quit Henge and open it again to run another or to start a Mac.")
                         .font(.system(size: 13)).foregroundStyle(Desk.dim).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
                     if result != nil || !output.isEmpty {
@@ -322,6 +332,7 @@ struct MacAppRunView: View {
         }
         .background(Desk.page)
         .navigationTitle(app.name)
+        .fullScreenCover(isPresented: $showTerminal) { MacTerminalView(app: app, arguments: arguments) }
         .fullScreenCover(isPresented: $showScreen) { MacAppScreen(app: app) }
         .confirmationDialog("Delete \(app.name)?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { store.delete(app); dismiss() }

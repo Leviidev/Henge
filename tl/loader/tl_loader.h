@@ -94,6 +94,11 @@ int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp);
 void *tl_runtime_lookup(const char *symbol);
 /* Loads a library (and what it links) as dlopen does for the program. NULL with a reason in err. */
 TlImage *tl_load_library(const char *path, char *err, size_t errlen);
+/* A command-line program kept loaded beside the main one, in a namespace of its own (processes_as_threads), to be run
+   again and again with tl_run_main; the host answers its exit. NULL with a reason in err. After tl_load. */
+TlImage *tl_load_tool(const char *path, char *err, size_t errlen);
+/* The address of a symbol in the image's own symbol table, local ones included, and the room up to the next symbol. */
+void *tl_image_local_symbol(TlImage *image, const char *symbol, size_t *room);
 /* While an image's imports are being bound: whether it links AppKit's classes directly (_OBJC_CLASS_$_NS... from
    AppKit), as Objective-C apps do, rather than finding them by name, as Rust's objc2 does. Hosts route the
    program's objc_getClass through their AppKit only for the second kind (Chromium breaks when its objc_getClass is
