@@ -42,7 +42,7 @@ if [ -n "$TMP" ]; then rm -rf "$HOME/.iosdev-unpack"; fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$D/bin"
 if [ -f "$HERE/iosapp" ]; then cp "$HERE/iosapp" "$D/bin/iosapp"; else
-  curl -fsSL https://raw.githubusercontent.com/Tomba247/Henge/mac-speed/tools/ios-kit/iosapp -o "$D/bin/iosapp"; fi
+  curl -fsSL https://raw.githubusercontent.com/Leviidev/Henge/main/tools/ios-kit/iosapp -o "$D/bin/iosapp"; fi
 chmod +x "$D/bin/iosapp"
 grep -qs 'iosdev/bin' "$HOME/.zprofile" || echo 'export PATH="$HOME/iosdev/bin:$PATH"' >> "$HOME/.zprofile"
 echo "Done: $(du -sh "$D" | cut -f1) in $D. Open a new Terminal window, then: iosapp new MyApp"
