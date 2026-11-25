@@ -68,6 +68,8 @@ struct TlImage {
     int initialized, visiting;
     pthread_key_t tlv_key;
     uint64_t tlv_start, tlv_size, tlv_init_size; /* vmaddrs */
+    uint8_t *fresh;  /* a tool's writable data as it was before its initializers (tl_tool_run puts it back) */
+    int objc_loaded; /* its +load methods have run */
     int ns;          /* the "process" it belongs to: 0 the program, 1.. what it started (processes as threads) */
     TlImage *next;
 };
@@ -79,6 +81,12 @@ void *tl_runtime_lookup(const char *symbol);
 static TlImage *g_images, *g_main;
 #define TL_MAX_NS 64
 static TlImage *g_ns_main[TL_MAX_NS]; /* each namespace's executable */
+static _Atomic char g_is_tool[TL_MAX_NS]; /* namespaces of tools run again and again (tl_tool_run) */
+static char g_no_objc[TL_MAX_NS];      /* namespaces whose Objective-C is not registered (tl_load_replaceable) */
+typedef struct TlSlot { uint8_t *at; size_t size; uint8_t *data; } TlSlot; /* data: where the first segment after __TEXT goes */
+static TlSlot g_slot[TL_MAX_NS];
+static void *tool_lookup(const char *sym);
+static void tool_snapshot(TlImage *im);
 static int g_loading_ns;              /* the namespace being loaded and bound (under g_lock) */
 static TlImage *main_of(int ns) { return ns >= 0 && ns < TL_MAX_NS ? g_ns_main[ns] : NULL; }
 
@@ -512,7 +520,28 @@ static int map_segments(TlImage *im, char *err, size_t errlen) {
     if (g_code_alias < 0 && getenv("TL_CODE_ALIAS")) g_code_alias = alias_works() ? 1 : 0;
     if (g_data_inplace < 0 && getenv("TL_DATA_INPLACE")) g_data_inplace = inplace_works() ? 1 : 0;
     if (g_code_alias == 1) return map_segments_aliased(im, err, errlen);
-    uint8_t *base = region_take(im->vmsize);
+    uint8_t *base;
+    TlSlot *slot = g_no_objc[im->ns] && im->fmh->filetype == MH_EXECUTE ? &g_slot[im->ns] : NULL;
+    if (slot) {
+        /* A program that new builds of itself replace: its code ends and its data begins at the same place in each,
+           so no page changes between the two. */
+        uint64_t text = 0;
+        for (int i = 0; i < im->nsegs; i++)
+            if (im->segs[i].prot & VM_PROT_EXECUTE && im->segs[i].vmaddr + im->segs[i].vmsize - im->vmmin > text)
+                text = im->segs[i].vmaddr + im->segs[i].vmsize - im->vmmin;
+        text = (text + TL_PAGE - 1) & ~(TL_PAGE - 1);
+        if (!slot->at) {
+            const size_t spare = (size_t)16 << 20;
+            size_t want = ((im->vmsize + TL_PAGE - 1) & ~(TL_PAGE - 1)) + 2 * spare;
+            slot->at = region_take(want);
+            if (slot->at) slot->size = want, slot->data = slot->at + spare + text;
+        }
+        base = slot->at ? slot->data - text : NULL;
+        if (base && (base < slot->at || base + im->vmsize > slot->at + slot->size)) {
+            set_err(err, errlen, "%s has grown too much to replace the build before it", im->path);
+            return -1;
+        }
+    } else base = region_take(im->vmsize);
     if (!base) { set_err(err, errlen, "%s: the executable region is full", im->path); return -1; }
     im->base = base;
     im->slide = (int64_t)((uint64_t)base - im->vmmin);
@@ -888,6 +917,10 @@ static void *cf_override(const char *sym);
 
 static uint64_t host_symbol(void *handle, const char *install_name, const char *sym, int *found) {
     *found = 0;
+    if (g_is_tool[g_loading_ns]) {
+        void *s = tool_lookup(sym);
+        if (s) { *found = 1; return (uint64_t)s; }
+    }
     if (install_name && strstr(install_name, "/CoreFoundation.framework/")) {
         void *s = cf_override(sym);
         if (s) { *found = 1; return (uint64_t)s; }
@@ -1445,7 +1478,8 @@ static void run_initializers(TlImage *im) {
         if (im->deps[i].tl) run_initializers(im->deps[i].tl);
     im->visiting = 0;
     im->initialized = 1;
-    if (has_objc(im)) {
+    if (has_objc(im) && !im->objc_loaded && !g_no_objc[im->ns]) {
+        im->objc_loaded = 1;
         void (*load)(const char *, const void *) = dlsym(RTLD_DEFAULT, "_objc_load_image");
         if (load) load(im->path, im->base);
     }
@@ -1533,6 +1567,18 @@ static void keep_own_categories(TlImage *im) {
         }
 }
 
+/* An image whose Objective-C the runtime is not told of (it could never be unloaded): its code can still message the
+   system's classes, once its selectors are the runtime's. */
+static void own_selectors(TlImage *im) {
+    void *(*reg)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+    static const char *const segs[] = {"__DATA", "__DATA_CONST"};
+    for (int g = 0; reg && g < 2; g++) {
+        uint64_t size = 0;
+        const char **refs = (const char **)find_section(im, segs[g], "__objc_selrefs", &size);
+        for (uint64_t k = 0; refs && k < size / 8; k++) refs[k] = (const char *)reg(refs[k]);
+    }
+}
+
 /* Loads path and what it links; fixes up, registers and initializes whatever was new. Takes g_lock itself. */
 static TlImage *load_and_link(const char *path, int ns, char *err, size_t errlen) {
     pthread_mutex_lock(&g_lock);
@@ -1560,18 +1606,23 @@ static TlImage *load_and_link(const char *path, int ns, char *err, size_t errlen
         for (int i = 0; i < n; i++) g_host->image_linked(batch[i]);
     for (int i = 0; i < n; i++) register_swift(batch[i]);
     for (int i = 0; i < n; i++)
-        if (batch[i]->ns) keep_own_categories(batch[i]);
+        if (batch[i]->ns && !g_no_objc[ns]) keep_own_categories(batch[i]);
     const struct mach_header *mhs[512];
     const char *paths[512];
     int nobjc = 0;
     for (int i = n - 1; i >= 0; i--) /* libraries first, as dyld hands them over */
-        if (has_objc(batch[i])) mhs[nobjc] = (const void *)batch[i]->base, paths[nobjc++] = batch[i]->path;
+        if (g_no_objc[ns]) own_selectors(batch[i]);
+        else if (has_objc(batch[i])) mhs[nobjc] = (const void *)batch[i]->base, paths[nobjc++] = batch[i]->path;
     if (nobjc) {
         void (*map)(unsigned, const char *const *, const struct mach_header *const *) = dlsym(RTLD_DEFAULT, "_objc_map_images");
         if (!map) { set_err(err, errlen, "this host's Objective-C runtime cannot take images (needs iOS 16 or macOS 13)"); pthread_mutex_unlock(&g_lock); return NULL; }
         map((unsigned)nobjc, paths, mhs);
     }
     pthread_mutex_unlock(&g_lock);
+    if (g_is_tool[ns]) {
+        for (int i = 0; i < n; i++) tool_snapshot(batch[i]);
+        if (!main_of(ns) || main_of(ns) == exe) return exe; /* the tool itself: initialized by each run */
+    }
     run_initializers(exe);
     return exe;
 }
@@ -2010,17 +2061,7 @@ static TlProc *proc_load(const char *path, int parent_ns, char *const argv[], ch
     return p;
 }
 
-/* A command-line program kept loaded beside the main one, in a namespace of its own, for the host to run again and
-   again (tl_run_main): nothing is unloaded between runs, and the host answers its exit. */
-TlImage *tl_load_tool(const char *path, char *err, size_t errlen) {
-    if (!g_host) { set_err(err, errlen, "nothing loaded yet"); return NULL; }
-    char *argv[] = {(char *)path, NULL};
-    TlProc *p = proc_new(0, argv, environ);
-    if (!p) { set_err(err, errlen, "too many programs"); return NULL; }
-    p->exe = load_library_in(path, p->ns, err, errlen);
-    if (!p->exe) { g_procs[p->ns] = NULL; return NULL; }
-    return p->exe;
-}
+#include "tl_tool.h"
 
 /* The address of a symbol of the image's own table, local ones included, and the room to the next symbol (its size
    or a little more); NULL when it has none. */

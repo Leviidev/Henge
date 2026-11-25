@@ -94,9 +94,24 @@ int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp);
 void *tl_runtime_lookup(const char *symbol);
 /* Loads a library (and what it links) as dlopen does for the program. NULL with a reason in err. */
 TlImage *tl_load_library(const char *path, char *err, size_t errlen);
-/* A command-line program kept loaded beside the main one, in a namespace of its own (processes_as_threads), to be run
-   again and again with tl_run_main; the host answers its exit. NULL with a reason in err. After tl_load. */
+/* A command-line program (a compiler, a linker) kept loaded beside the main one, in a namespace of its own, to be run
+   again and again. NULL with a reason in err. After tl_load. */
 TlImage *tl_load_tool(const char *path, char *err, size_t errlen);
+/* Runs it from a clean state: its variables as first loaded, a heap of its own thrown away afterwards; what it writes
+   to standard output and error goes to output. One run at a time, whatever the tool. Its exit code; TL_TOOL_STUCK when
+   it ended from a thread of its own while others still ran: this copy cannot be used again (load another). */
+#define TL_TOOL_STUCK 1000
+int tl_tool_run(TlImage *tool, int argc, const char **argv, void (*output)(void *context, const char *bytes, size_t len),
+                void *context);
+/* The same, from a symbol of its own instead of main (NULL: main), with environment variables over the app's
+   ("NAME=value", ended by NULL). */
+int tl_tool_run_at(TlImage *tool, const char *entry, int argc, const char **argv, const char **env,
+                   void (*output)(void *context, const char *bytes, size_t len), void *context);
+/* The running tool ends at its next look at the clock or wait. */
+void tl_tool_stop(void);
+/* A program to run with tl_tool_run_at that is built again and again: each build loads in place of the one before
+   (replacing; NULL for the first). Its Objective-C classes are not registered. */
+TlImage *tl_load_replaceable(const char *path, TlImage *replacing, char *err, size_t errlen);
 /* The address of a symbol in the image's own symbol table, local ones included, and the room up to the next symbol. */
 void *tl_image_local_symbol(TlImage *image, const char *symbol, size_t *room);
 /* While an image's imports are being bound: whether it links AppKit's classes directly (_OBJC_CLASS_$_NS... from

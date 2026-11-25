@@ -231,3 +231,51 @@ void henge_tl_term_resize(int cols, int rows) {
     pthread_mutex_unlock(&lock);
     if (changed && host_fd >= 0 && !atomic_load(&ended)) kill(getpid(), SIGWINCH);
 }
+
+/* The compiler and linker beside it (tl_tool_run): loaded at their first use and kept. */
+static struct { char *path; TlImage *im; } tools[8];
+static pthread_mutex_t tools_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int henge_tl_tool_run(const char *path, int argc, const char *const *argv, HengeTlToolOutput output, void *context) {
+    if (!image) return -1;
+    pthread_mutex_lock(&tools_lock);
+    int at = -1, rc = -1;
+    for (int i = 0; i < 8 && at < 0; i++)
+        if (!tools[i].path || !strcmp(tools[i].path, path)) at = i;
+    if (at >= 0) {
+        for (int go = 0; go < 2; go++) {
+            if (!tools[at].im) {
+                char err[512] = "";
+                if (!tools[at].path) tools[at].path = strdup(path);
+                tools[at].im = tl_load_tool(path, err, sizeof err);
+                if (!tools[at].im) { output(context, err, strlen(err)); break; }
+                fprintf(stderr, "henge: term: loaded %s, %zu MB of the region in use\n", path, host.used >> 20);
+            }
+            rc = tl_tool_run(tools[at].im, argc, (const char **)argv, output, context);
+            if (rc != TL_TOOL_STUCK) break;
+            tools[at].im = NULL; /* its last run never ended: a new copy */
+        }
+    }
+    pthread_mutex_unlock(&tools_lock);
+    return rc;
+}
+
+static TlImage *program;
+
+int henge_tl_program_run(const char *path, const char *argv0, const char *entry, const char *const *env, HengeTlToolOutput output, void *context) {
+    if (!image) return -1;
+    char err[512] = "";
+    pthread_mutex_lock(&tools_lock);
+    TlImage *im = tl_load_replaceable(path, program, err, sizeof err);
+    if (im) program = im;
+    pthread_mutex_unlock(&tools_lock);
+    if (!im) {
+        output(context, err, strlen(err));
+        return -1;
+    }
+    fprintf(stderr, "henge: term: loaded %s, %zu MB of the region in use\n", path, host.used >> 20);
+    const char *argv[] = {argv0, NULL};
+    return tl_tool_run_at(im, entry, 1, argv, (const char **)env, output, context);
+}
+
+void henge_tl_tool_stop(void) { tl_tool_stop(); }

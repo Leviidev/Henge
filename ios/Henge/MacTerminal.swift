@@ -58,6 +58,39 @@ final class TerminalSession: ObservableObject {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Terminal Home", isDirectory: true)
     }
 
+    /// One of the kit's tools, run in this process.
+    private static func runTool(_ tool: String, _ args: [String]) -> (code: Int32, output: String) {
+        let got = Collected()
+        var argv: [UnsafePointer<CChar>?] = ([tool] + args).map { UnsafePointer(strdup($0)) } + [nil]
+        let rc = henge_tl_tool_run(tool, Int32(args.count + 1), &argv, { ctx, p, n in
+            guard let ctx, let p else { return }
+            Unmanaged<Collected>.fromOpaque(ctx).takeUnretainedValue().add(p, n)
+        }, Unmanaged.passUnretained(got).toOpaque())
+        for p in argv where p != nil { free(UnsafeMutableRawPointer(mutating: p)) }
+        return (rc, String(decoding: got.data, as: UTF8.self))
+    }
+    private final class Collected {
+        private let lock = NSLock()
+        private(set) var data = Data()
+        private let pass: ((Data) -> Void)?
+        init(_ pass: ((Data) -> Void)? = nil) { self.pass = pass }
+        func add(_ p: UnsafePointer<CChar>, _ n: Int) {
+            let d = Data(bytes: p, count: n)
+            if let pass { pass(d); return }
+            lock.lock(); data.append(d); lock.unlock()
+        }
+    }
+    private static func runProgram(_ path: String, _ argv0: String, _ entry: String, _ env: [String], _ output: @escaping (Data) -> Void) -> Int32 {
+        var e: [UnsafePointer<CChar>?] = env.map { UnsafePointer(strdup($0)) } + [nil]
+        // Kept: a thread of the program that outlives it may still write.
+        let box = Unmanaged.passRetained(Collected(output))
+        return henge_tl_program_run(path, strdup(argv0), entry, &e, { ctx, p, n in
+            guard let ctx, let p else { return }
+            Unmanaged<Collected>.fromOpaque(ctx).takeUnretainedValue().add(p, n)
+        }, box.toOpaque())
+    }
+    private var server: ToolServer?
+
     func start(_ app: MacApp, arguments: String) {
         guard !started else { return }
         started = true
@@ -69,12 +102,27 @@ final class TerminalSession: ObservableObject {
         // What Bun programs (Claude Code) need where no code may be generated: no JIT, and a SharedArrayBuffer.
         let pre = fm.temporaryDirectory.appendingPathComponent("terminal-preload.js")
         try? "globalThis.SharedArrayBuffer ??= ArrayBuffer;\n".write(to: pre, atomically: true, encoding: .utf8)
-        var env = ["HOME=\(Self.home.path)", "PWD=\(Self.projects.path)", "TMPDIR=\(tmp)", "TERM=xterm-256color", "COLORTERM=truecolor",
+        var env = ["HOME=\(Self.home.path)", "TMPDIR=\(tmp)", "TERM=xterm-256color", "COLORTERM=truecolor",
                    "LANG=en_US.UTF-8", "SHELL=/bin/sh", "PATH=/usr/bin:/bin", "USER=mobile"]
         env += ["BUN_JSC_useJIT=0", "BUN_OPTIONS=--preload=\(pre.path)", "CLAUDE_CODE_TMPDIR=\(tmp)", "DISABLE_AUTOUPDATER=1"]
-        let args = arguments.split(separator: " ").map(String.init)
+        var args = arguments.split(separator: " ").map(String.init)
+        let projects = ProjectTools.projects(in: Self.projects)
+        if (app.executable as NSString).lastPathComponent.lowercased().hasPrefix("claude") {
+            let s = ToolServer(tools: ProjectTools.make(folder: Self.projects, run: Self.runTool, program: Self.runProgram, stop: { henge_tl_tool_stop() }) {
+                HengeLog.log("macapps", "terminal: \($0)")
+            })
+            if s.start() {
+                let config = Self.home.appendingPathComponent("henge-tools.json")
+                s.writeConfig(to: config)
+                args += ["--mcp-config", config.path]
+                env += ["MCP_TOOL_TIMEOUT=1800000", "MCP_TIMEOUT=60000"]
+                server = s
+                HengeLog.log("macapps", "terminal: build tools on port \(s.port), \(projects.count) project(s)")
+            }
+        }
+        env.append("PWD=\((projects.count == 1 ? projects[0] : Self.projects).path)")
         let (cols, rows) = read { ($0.cols, $0.rows) }
-        let path = app.executable, dir = Self.projects.path, name = app.name
+        let path = app.executable, dir = (projects.count == 1 ? projects[0] : Self.projects).path, name = app.name
         HengeLog.log("macapps", "terminal: opening \(name) (\(cols) by \(rows))")
         Task.detached(priority: .userInitiated) {
             var err = [CChar](repeating: 0, count: 512)
