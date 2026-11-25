@@ -87,6 +87,8 @@ HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes);
 /* The high address blocks held for a Mac app's large reservations (Chromium's allocators), handed out once into
    base[3]/bytes[3]: how many, 0 if none. */
 int henge_ios_take_high_room(void **base, size_t *bytes);
+/* Give those blocks back for a Mac's RAM (no effect once a Mac app has taken them). */
+HENGE_EXPORT void henge_ios_release_high_room(void);
 HENGE_EXPORT bool henge_ios_jit_prewarm_self(size_t bytes);
 
 /*
