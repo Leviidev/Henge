@@ -120,7 +120,7 @@ struct MacSettingsView: View {
                     DeskBar(fraction: Double(mac.bytesUsed) / Double(max(mac.diskBytes, 1)))
                     if machines.growing != nil {
                         Text("Making the disk bigger… keep Henge open").font(.system(size: 15)).frame(maxWidth: .infinity, alignment: .leading)
-                    } else if !mac.isLinux, !Machines.biggerDisks(than: mac.diskBytes).isEmpty {
+                    } else if !Machines.biggerDisks(than: mac.diskBytes).isEmpty {
                         Menu {
                             ForEach(Machines.biggerDisks(than: mac.diskBytes), id: \.self) { gb in Button("\(gb) GB") { growTo = gb } }
                         } label: {

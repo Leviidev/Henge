@@ -14,6 +14,7 @@
 static HvJitRegion jit;
 static HengeDualMapping mapping;
 _Atomic int henge_tl_ran;
+void henge_ios_release_high_room(void) {}
 int henge_vm_state(void) { return 0; }
 HengeDualMapping *henge_ios_jit_get_mapping(void) { return &mapping; }
 static FILE *out;
