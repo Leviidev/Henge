@@ -95,11 +95,11 @@ final class MacAppsStore: ObservableObject {
     }
 
     /// What the file picker gave back.
-    func picked(_ result: Result<URL, Error>) {
+    func picked(_ result: Result<URL, Error>, copied: Bool = false) {
         switch result {
         case let .success(url):
             HengeLog.log("macapps", "picked \(url.lastPathComponent)")
-            bring(in: url)
+            bring(in: url, copied: copied)
         case let .failure(error):
             HengeLog.log("macapps", "the file picker failed: \(error)")
             problem = "The file couldn't be opened: \(error.localizedDescription)"
@@ -107,13 +107,17 @@ final class MacAppsStore: ObservableObject {
     }
 
     /// A .dmg (its apps and programs are copied out), an .app, or a lone program.
-    func bring(in url: URL) {
+    /// `copied`: iOS's own copy in Henge's temporary folder, deleted afterwards.
+    func bring(in url: URL, copied temporary: Bool = false) {
         let scoped = url.startAccessingSecurityScopedResource()
         busy = "Bringing in \(url.lastPathComponent)…"
         problem = nil
         let folder = Self.folder
         Task.detached(priority: .userInitiated) {
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            defer {
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                if temporary, url.path.contains("-Inbox/") { try? FileManager.default.removeItem(at: url) }
+            }
             try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             var trouble: String?
             if url.pathExtension.lowercased() == "dmg" {
@@ -212,13 +216,36 @@ struct MacAppsView: View {
                     } label: { Image(systemName: "plus") }.accessibilityLabel("Bring in a Mac app")
                 }
             }
-            // Files and folders are asked for apart: asked for together, the picker chooses folders. One importer is
-            // put on each of two views, as a view keeps only the last one put on it.
-            .background(Color.clear.fileImporter(isPresented: $picking, allowedContentTypes: [.diskImage, .data]) { store.picked($0) })
+            .sheet(isPresented: $picking) { MacAppFilePicker { store.picked($0, copied: true) }.ignoresSafeArea() }
             .background(Color.clear.fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder, .applicationBundle]) { store.picked($0) })
             // A file put in with Files while Henge was in the background.
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in store.reload() }
             .onAppear { store.reload() }
+        }
+    }
+}
+
+/// Files' picker, giving a copy of the file: a sideloaded app is not always let into the file itself.
+private struct MacAppFilePicker: UIViewControllerRepresentable {
+    let done: (Result<URL, Error>) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(done) }
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        HengeLog.log("macapps", "opening the file picker")
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.delegate = context.coordinator
+        return picker
+    }
+    func updateUIViewController(_ picker: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let done: (Result<URL, Error>) -> Void
+        init(_ done: @escaping (Result<URL, Error>) -> Void) { self.done = done }
+        func documentPicker(_ picker: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first { done(.success(url)) } else { HengeLog.log("macapps", "the file picker gave nothing") }
+        }
+        func documentPickerWasCancelled(_ picker: UIDocumentPickerViewController) {
+            HengeLog.log("macapps", "the file picker was closed without a file")
         }
     }
 }
