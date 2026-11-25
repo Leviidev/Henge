@@ -42,6 +42,7 @@ typedef struct TlDep {
 
 struct TlImage {
     char *path, *dir;
+    char *id;             /* its own install name (LC_ID_DYLIB), if any */
     int fd;
     uint8_t *map;
     size_t maplen;
@@ -355,6 +356,9 @@ static int parse(TlImage *im, char *err, size_t errlen) {
             dep->reexport = lc->cmd == LC_REEXPORT_DYLIB;
             break;
         }
+        case LC_ID_DYLIB:
+            if (!im->id) im->id = strdup((const char *)lc + ((const struct dylib_command *)lc)->dylib.name.offset);
+            break;
         case LC_RPATH: {
             const struct rpath_command *r = (const void *)lc;
             if (im->nrpaths < TL_MAX_RPATHS) im->rpaths[im->nrpaths++] = strdup((const char *)lc + r->path.offset);
@@ -563,17 +567,30 @@ static int file_exists(const char *p) {
     return stat(p, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-/* @executable_path, @loader_path and @rpath against this image and the executable. */
+/* The images whose libraries are being loaded, outermost first (loading is serial): as for dyld, a library's @rpath is
+   also looked for in the search paths of what loads it. */
+#define LOADING_MAX 64
+static TlImage *g_loading[LOADING_MAX];
+static int g_nloading;
+
+/* @executable_path, @loader_path and @rpath against this image, what loads it and the executable. */
 static int expand_path(TlImage *im, const char *in, char *out, size_t len) {
     TlImage *exe = main_of(im->ns);
     const char *exe_dir = exe ? exe->dir : im->dir;
     if (!strncmp(in, "@executable_path/", 17)) return snprintf(out, len, "%s/%s", exe_dir, in + 17) < (int)len;
     if (!strncmp(in, "@loader_path/", 13)) return snprintf(out, len, "%s/%s", im->dir, in + 13) < (int)len;
+    /* A search path may be the word alone (Xcode's Swift libraries' is "@loader_path"). */
+    if (!strcmp(in, "@executable_path")) return snprintf(out, len, "%s", exe_dir) < (int)len;
+    if (!strcmp(in, "@loader_path")) return snprintf(out, len, "%s", im->dir) < (int)len;
     if (!strncmp(in, "@rpath/", 7)) {
-        TlImage *owners[2] = {im, exe && exe != im ? exe : NULL};
-        for (int o = 0; o < 2; o++) {
+        TlImage *owners[LOADING_MAX + 2];
+        int n = 0;
+        owners[n++] = im;
+        for (int o = g_nloading - 1; o >= 0; o--)
+            if (g_loading[o] != im) owners[n++] = g_loading[o];
+        if (exe && exe != im) owners[n++] = exe;
+        for (int o = 0; o < n; o++) {
             TlImage *who = owners[o];
-            if (!who) continue;
             for (int i = 0; i < who->nrpaths; i++) {
                 char base[PATH_MAX];
                 if (!expand_path(who, who->rpaths[i], base, sizeof base)) continue;
@@ -586,7 +603,7 @@ static int expand_path(TlImage *im, const char *in, char *out, size_t len) {
     return snprintf(out, len, "%s", in) < (int)len;
 }
 
-static int load_deps(TlImage *im, char *err, size_t errlen) {
+static int load_deps_of(TlImage *im, char *err, size_t errlen) {
     for (int i = 0; i < im->ndeps; i++) {
         TlDep *dep = &im->deps[i];
         const char *name = dep->install_name;
@@ -599,6 +616,10 @@ static int load_deps(TlImage *im, char *err, size_t errlen) {
                 if (!dep->tl) return -1;
                 continue;
             }
+            /* As for dyld, a library already loaded under that very name serves, wherever it was found. */
+            for (TlImage *l = g_images; l && !dep->tl; l = l->next)
+                if (l != im && l->ns == im->ns && l->id && !strcmp(l->id, name)) dep->tl = l;
+            if (dep->tl) continue;
             if (dep->weak) { dep->no_library = 1; continue; }
             set_err(err, errlen, "%s needs %s, which is not in the app", im->path, name);
             return -1;
@@ -613,6 +634,14 @@ static int load_deps(TlImage *im, char *err, size_t errlen) {
         }
     }
     return 0;
+}
+
+static int load_deps(TlImage *im, char *err, size_t errlen) {
+    int pushed = g_nloading < LOADING_MAX;
+    if (pushed) g_loading[g_nloading++] = im;
+    int rc = load_deps_of(im, err, errlen);
+    if (pushed) g_nloading--;
+    return rc;
 }
 
 /* ---- symbols ---- */
