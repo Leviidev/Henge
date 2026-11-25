@@ -540,7 +540,7 @@ struct SessionView: View {
                             await Keys.typeSlowly(Sharing.unlightenCommand)
                         }
                     }
-                    Text("Less drawing for the emulated CPUs: window and Dock animations, desktop widgets, the screen saver and a moving wallpaper go. Open Terminal on the Mac, tap the button and press Return, then log out and back in. Also turn on Reduce Motion and Reduce Transparency in the Mac's System Settings, Accessibility. Undo puts it back, apart from the wallpaper. Needs the Mac's keyboard layout to be U.S.")
+                    Text("Less drawing for the emulated CPUs: window and Dock animations, desktop widgets, the screen saver and a moving wallpaper go, and macOS stops downloading updates by itself (look for them in System Settings, Software Update). Open Terminal on the Mac, tap the button and press Return, type the Mac's password when it asks, then log out and back in. Also turn on Reduce Motion and Reduce Transparency in the Mac's System Settings, Accessibility. Undo puts it back, apart from the wallpaper. Needs the Mac's keyboard layout to be U.S.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Log") {

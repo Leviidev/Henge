@@ -28,6 +28,8 @@ typedef struct TlHost {
     /* A symbol the host provides itself for a library (AppKit on iOS, say), or
        NULL. Asked before the real library, so a shim can replace it. */
     void *(*shim_lookup)(const char *install_name, const char *symbol);
+    /* Asked before the loader's own answers (which tl_runtime_lookup gives). NULL: none of its. */
+    void *(*first_lookup)(const char *symbol);
     /* Messages ("tl: ..."); NULL writes them to stderr. */
     void (*log)(const char *line);
     /* A missing non-weak symbol fails the load (1) or binds to a stub that
@@ -62,6 +64,9 @@ typedef struct TlHost {
     int high_rooms;
     /* Called for each image once it is fixed up, before its initializers run (app-specific adjustments). */
     void (*image_linked)(TlImage *image);
+    /* Where the programs tools start are found by name (ended by NULL), and how many compilers at once (0: 2). */
+    char *const *tool_folders;
+    int tool_copies;
 } TlHost;
 
 /* A region shaped like iOS's (an RX mapping plus an RW alias of the same
@@ -94,6 +99,32 @@ int tl_run_main(TlImage *exe, int argc, const char **argv, const char **envp);
 void *tl_runtime_lookup(const char *symbol);
 /* Loads a library (and what it links) as dlopen does for the program. NULL with a reason in err. */
 TlImage *tl_load_library(const char *path, char *err, size_t errlen);
+/* A command-line program (a compiler, a linker) kept loaded beside the main one, in a namespace of its own, to be run
+   again and again. NULL with a reason in err. After tl_load. */
+TlImage *tl_load_tool(const char *path, char *err, size_t errlen);
+/* Runs it from a clean state: its variables as first loaded, a heap of its own thrown away afterwards; what it writes
+   to standard output and error goes to output. One run at a time, whatever the tool. Its exit code; TL_TOOL_STUCK when
+   it ended from a thread of its own while others still ran: this copy cannot be used again (load another). */
+#define TL_TOOL_STUCK 1000
+int tl_tool_run(TlImage *tool, int argc, const char **argv, void (*output)(void *context, const char *bytes, size_t len),
+                void *context);
+/* The same, from a symbol of its own instead of main (NULL: main), with environment variables over the app's
+   ("NAME=value", ended by NULL). */
+int tl_tool_run_at(TlImage *tool, const char *entry, int argc, const char **argv, const char **env,
+                   void (*output)(void *context, const char *bytes, size_t len), void *context);
+/* The same by path, in a folder of its own: copies are kept for the next time, and a newer file replaces them. What
+   it starts itself (posix_spawn) runs the same way, if it is a Mach-O file or a name in host->tool_folders. */
+int tl_tool_command(const char *path, int argc, const char **argv, const char **env, const char *cwd,
+                    void (*output)(void *context, const char *bytes, size_t len), void *context);
+/* The running tool ends at its next look at the clock or wait; NULL: all of them. */
+void tl_tool_stop(TlImage *tool);
+/* Those tl_tool_command started in this folder, and what they started. */
+void tl_tool_stop_in(const char *cwd);
+/* A program to run with tl_tool_run_at that is built again and again: each build loads in place of the one before
+   (replacing; NULL for the first). Its Objective-C classes are not registered. */
+TlImage *tl_load_replaceable(const char *path, TlImage *replacing, char *err, size_t errlen);
+/* The address of a symbol in the image's own symbol table, local ones included, and the room up to the next symbol. */
+void *tl_image_local_symbol(TlImage *image, const char *symbol, size_t *room);
 /* While an image's imports are being bound: whether it links AppKit's classes directly (_OBJC_CLASS_$_NS... from
    AppKit), as Objective-C apps do, rather than finding them by name, as Rust's objc2 does. Hosts route the
    program's objc_getClass through their AppKit only for the second kind (Chromium breaks when its objc_getClass is

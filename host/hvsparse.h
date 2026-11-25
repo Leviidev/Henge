@@ -8,6 +8,19 @@
      "HVSPARSE" magic, u64 logical size, then records {u64 offset, u64 length, data}
      until a record with length 0. Little-endian. */
 
+/* Packed and compressed (a backup): "HVSPARZ1", u64 logical size, then records {u64 offset, u32 length, u32 packed
+   length, u32 CRC-32 of the data, u32 0, packed data} (LZFSE; stored as it is when that is no smaller), until a record
+   with length 0 whose offset is the number of records before it. Where Apple's compression isn't (Linux) these return -1. */
+int hv_sparse_pack_compressed(const char *src, const char *dst, void (*progress)(uint64_t done, uint64_t total, void *opaque), void *opaque);
+/* Reads a whole packed file of either kind, checking it, without writing anything. Returns 0 or -1. */
+int hv_sparse_verify(const char *src, void (*progress)(uint64_t done, uint64_t total, void *opaque), void *opaque);
+
+/* Make a Mac's disk image bigger: the Recovery partition (the last) moves to the new end, and the
+   free space is left after the main one. macOS then takes it: diskutil apfs resizeContainer disk0s2 0. The image
+   must not be in use. Returns 0, or -1 with the reason in err; nothing is changed when it returns before writing the
+   partition table, which is the last thing it does. */
+int hv_disk_grow(const char *path, uint64_t new_size, char *err, unsigned long errlen);
+
 /* Pack src (a sparse raw image) into dst. Returns 0 or -1. */
 int hv_sparse_pack(const char *src, const char *dst);
 /* The same; progress(position, size, opaque) may be NULL. */

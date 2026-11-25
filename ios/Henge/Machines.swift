@@ -45,6 +45,7 @@ enum GuestMemory {
         let free = (try? mac.directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? 0
         let room = free > 0 ? UInt64(max(free - (2 << 30), 0)) >> 20 : UInt64.max
+        henge_ios_release_high_room() // the blocks held for Mac apps would cap this Mac at 2 GB
         let reach = henge_largest_mapping_mb()
         let ram = min(UInt64(mac.ramMB), room, reach > 512 ? reach - 512 : 0) / 512 * 512
         HengeLog.log("session", "guest RAM \(ram) MB (asked \(mac.ramMB), disk room \(room), largest mapping \(reach))")
@@ -82,6 +83,9 @@ final class Machines: ObservableObject {
     /// While a Mac is being exported: its name and how far along.
     @Published private(set) var exporting: String?
     @Published private(set) var exported: Double = 0
+    /// Written; being read back.
+    @Published private(set) var checking = false
+    @Published private(set) var lastExportBytes: Int64 = 0
     /// The last finished export, ready to be moved out of Henge.
     @Published var lastExport: URL?
 
@@ -197,7 +201,16 @@ final class Machines: ObservableObject {
                         Task { @MainActor in Machines.shared.unpacked = fraction }
                     }, nil) == 0
                 }.value
-                guard ok else { try? fm.removeItem(at: dest); throw message("The packed disk could not be unpacked (not enough space?).") }
+                guard ok else {
+                // A moved folder's own files go back: they were the backup.
+                if move {
+                    for name in ["AVPBooter.vmapple2.bin", "auxiliary.bin", "machine.json", "Image", "initrd.img"] {
+                        try? fm.moveItem(at: dest.appendingPathComponent(name), to: folder.appendingPathComponent(name))
+                    }
+                }
+                try? fm.removeItem(at: dest)
+                throw message("The packed disk could not be unpacked (not enough space, or a damaged backup).")
+            }
                 if move { try? fm.removeItem(at: packed) }
             }
             if move { try? fm.removeItem(at: folder) }
@@ -212,12 +225,45 @@ final class Machines: ObservableObject {
         importing = nil
     }
 
+    /// What macOS's disk can be made to hold, for a Mac that has `bytes` now.
+    nonisolated static func biggerDisks(than bytes: Int64) -> [Int] { [64, 128, 256, 512].filter { Int64($0) << 30 > bytes + (8 << 30) } }
+
+    /// A bigger disk for a Mac that is shut down, its files kept (hv_disk_grow). It takes no space until macOS uses it.
+    @Published private(set) var growing: String?
+    func grow(_ mac: VirtualMac, toGB gb: Int, done: @escaping (VirtualMac?) -> Void) {
+        guard growing == nil, exporting == nil, importing == nil else { return }
+        guard [0, 2].contains(henge_vm_state()) else { lastError = "Shut the Mac down first."; return done(nil) }
+        growing = mac.name
+        lastError = nil
+        Task {
+            InstantResume.discard(for: mac) // a saved Mac belongs to the disk as it was
+            let path = mac.disk.path
+            let problem = await Task.detached { () -> String? in
+                var err = [CChar](repeating: 0, count: 256)
+                return hv_disk_grow(path, UInt64(gb) << 30, &err, 256) == 0 ? nil : String(cString: err)
+            }.value
+            growing = nil
+            if let problem {
+                lastError = "\(mac.name)'s disk was not made bigger. \(problem)"
+                HengeLog.log("machines", "growing \(mac.name) to \(gb) GB failed: \(problem)")
+                return done(nil)
+            }
+            var bigger = mac
+            bigger.diskBytes = Int64(gb) << 30
+            update(bigger)
+            HengeLog.log("machines", "\(mac.name)'s disk is \(gb) GB now")
+            done(bigger)
+        }
+    }
+
     /// Makes a folder "Bring in a Mac" can read back (the same files tools/export_ios.sh writes),
     /// in Documents/Exports, which the Files app can reach. Deleting Henge deletes that folder too,
     /// so it has to be moved out of Henge before a reinstall that replaces the app's data.
     func export(_ mac: VirtualMac) {
-        guard exporting == nil, importing == nil else { return }
+        guard exporting == nil, importing == nil, growing == nil else { return }
+        guard [0, 2].contains(henge_vm_state()) else { lastError = "Shut the Mac down first."; return } // a disk in use is not one moment's
         exporting = mac.name
+        checking = false
         exported = 0
         lastExport = nil
         lastError = nil
@@ -242,12 +288,11 @@ final class Machines: ObservableObject {
         // Not under its final name until it is whole, so a cut-short export can't be mistaken for a Mac.
         let partial = exports.appendingPathComponent(safeName + ".partial", isDirectory: true)
         try? fm.removeItem(at: partial)
-        try? fm.removeItem(at: final)
         let used = (try? mac.disk.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0
         let free = (try? Self.root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage ?? 0
         let needed = Int64(used) + (256 << 20)
         if free > 0 && free < needed {
-            throw message("Exporting \(mac.name) needs about \(ByteText.string(UInt64(needed))) free; this \(Device.name) has \(ByteText.string(UInt64(free))). Deleting a downloaded macOS installer (Install macOS, swipe it) frees about 16 GB.")
+            throw message("Backing up \(mac.name) needs up to \(ByteText.string(UInt64(needed))) free; this \(Device.name) has \(ByteText.string(UInt64(free))). Deleting a downloaded macOS installer (Install macOS, swipe it) frees about 16 GB.")
         }
         try fm.createDirectory(at: partial, withIntermediateDirectories: true)
         do {
@@ -257,12 +302,26 @@ final class Machines: ObservableObject {
             try JSONSerialization.data(withJSONObject: info).write(to: partial.appendingPathComponent("machine.json"))
             let source = mac.disk.path, target = partial.appendingPathComponent(Self.packedDisk).path
             let ok = await Task.detached { () -> Bool in
-                hv_sparse_pack_progress(source, target, { done, total, _ in
+                hv_sparse_pack_compressed(source, target, { done, total, _ in
                     let fraction = Double(done) / Double(max(total, 1))
                     Task { @MainActor in Machines.shared.exported = fraction }
                 }, nil) == 0
             }.value
             guard ok else { throw message("The disk could not be written (not enough space?).") }
+            // Read back and checked before it is called a backup.
+            exported = 0
+            checking = true
+            let whole = await Task.detached { () -> Bool in
+                hv_sparse_verify(target, { done, total, _ in
+                    let fraction = Double(done) / Double(max(total, 1))
+                    Task { @MainActor in Machines.shared.exported = fraction }
+                }, nil) == 0
+            }.value
+            guard whole else { throw message("The backup did not read back as it was written, so it was not kept.") }
+            let size = (try? fm.attributesOfItem(atPath: target)[.size] as? Int64) ?? 0
+            lastExportBytes = size
+            HengeLog.log("machines", "backup: \(ByteText.string(UInt64(used))) packed to \(ByteText.string(UInt64(max(size, 0))))")
+            try? fm.removeItem(at: final) // the one before, only now that the new one is whole
             try fm.moveItem(at: partial, to: final)
         } catch {
             try? fm.removeItem(at: partial)

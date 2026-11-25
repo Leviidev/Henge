@@ -70,6 +70,8 @@ struct MacApp: Identifiable, Hashable {
 final class MacAppsStore: ObservableObject {
     static let shared = MacAppsStore()
     @Published private(set) var apps: [MacApp] = []
+    /// Disk images put into Henge's Mac Apps folder with Files.
+    @Published private(set) var images: [URL] = []
     @Published var busy: String?
     @Published var problem: String?
 
@@ -86,24 +88,45 @@ final class MacAppsStore: ObservableObject {
             let found = items.filter { !$0.lastPathComponent.hasPrefix(".") && $0.pathExtension != "txt" }
                 .compactMap(MacApp.init(url:))
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-            await MainActor.run { self.apps = found }
+            let images = items.filter { $0.pathExtension.lowercased() == "dmg" && !$0.lastPathComponent.hasPrefix(".") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            await MainActor.run { (self.apps, self.images) = (found, images) }
+        }
+    }
+
+    /// What the file picker gave back.
+    func picked(_ result: Result<URL, Error>, copied: Bool = false) {
+        switch result {
+        case let .success(url):
+            HengeLog.log("macapps", "picked \(url.lastPathComponent)")
+            bring(in: url, copied: copied)
+        case let .failure(error):
+            HengeLog.log("macapps", "the file picker failed: \(error)")
+            problem = "The file couldn't be opened: \(error.localizedDescription)"
         }
     }
 
     /// A .dmg (its apps and programs are copied out), an .app, or a lone program.
-    func bring(in url: URL) {
+    /// `copied`: iOS's own copy in Henge's temporary folder, deleted afterwards.
+    func bring(in url: URL, copied temporary: Bool = false) {
         let scoped = url.startAccessingSecurityScopedResource()
         busy = "Bringing in \(url.lastPathComponent)…"
         problem = nil
         let folder = Self.folder
         Task.detached(priority: .userInitiated) {
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            defer {
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                if temporary, url.path.contains("-Inbox/") { try? FileManager.default.removeItem(at: url) }
+            }
             try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             var trouble: String?
             if url.pathExtension.lowercased() == "dmg" {
                 var err = [CChar](repeating: 0, count: 512)
                 let copied = henge_tl_import_dmg(url.path, folder.path, &err, err.count)
-                if copied <= 0 { trouble = String(cString: err) }
+                if copied <= 0 {
+                    trouble = String(cString: err)
+                    if trouble?.isEmpty != false { trouble = "\(url.lastPathComponent) has no Mac app in it." }
+                }
                 HengeLog.log("macapps", "\(url.lastPathComponent): \(copied) items copied\(copied <= 0 ? " (\(String(cString: err)))" : "")")
             } else {
                 let to = folder.appendingPathComponent(url.lastPathComponent)
@@ -148,6 +171,7 @@ struct MacAppsView: View {
     @ObservedObject private var store = MacAppsStore.shared
     @Environment(\.dismiss) private var dismiss
     @State private var picking = false
+    @State private var pickingFolder = false
 
     var body: some View {
         NavigationStack {
@@ -163,10 +187,14 @@ struct MacAppsView: View {
                         VStack(spacing: 10) {
                             Image(systemName: "shippingbox").font(.system(size: 34)).foregroundStyle(Desk.faint)
                             Text("Nothing here yet").font(.system(size: 17, weight: .semibold))
-                            Text("Bring in a .dmg or an .app from Files, or try Henge's sample programs.")
+                            Text("Bring in a .dmg or an .app from Files, put one in Files → Henge → Mac Apps, or try Henge's sample programs.")
                                 .font(.system(size: 14)).foregroundStyle(Desk.dim).multilineTextAlignment(.center)
                         }
                         .padding(28).frame(maxWidth: .infinity).deskCard()
+                    }
+                    ForEach(store.images, id: \.self) { image in
+                        Button("Bring In \(image.lastPathComponent)") { store.bring(in: image) }
+                            .buttonStyle(DeskButtonStyle()).disabled(store.busy != nil).padding(.bottom, 10)
                     }
                     ForEach(store.apps) { app in
                         NavigationLink(value: app) { MacAppRow(app: app) }.buttonStyle(.plain).padding(.bottom, 10)
@@ -182,13 +210,42 @@ struct MacAppsView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
                 ToolbarItem(placement: .primaryAction) {
-                    Button { picking = true } label: { Image(systemName: "plus") }.accessibilityLabel("Bring in a Mac app")
+                    Menu {
+                        Button("A .dmg or a Program…") { picking = true }
+                        Button("An .app…") { pickingFolder = true }
+                    } label: { Image(systemName: "plus") }.accessibilityLabel("Bring in a Mac app")
                 }
             }
-            .fileImporter(isPresented: $picking, allowedContentTypes: [.diskImage, .applicationBundle, .folder, .unixExecutable, .data]) { result in
-                if case let .success(url) = result { store.bring(in: url) }
-            }
+            .sheet(isPresented: $picking) { MacAppFilePicker { store.picked($0, copied: true) }.ignoresSafeArea() }
+            .background(Color.clear.fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder, .applicationBundle]) { store.picked($0) })
+            // A file put in with Files while Henge was in the background.
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in store.reload() }
             .onAppear { store.reload() }
+        }
+    }
+}
+
+/// Files' picker, giving a copy of the file: a sideloaded app is not always let into the file itself.
+private struct MacAppFilePicker: UIViewControllerRepresentable {
+    let done: (Result<URL, Error>) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(done) }
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        HengeLog.log("macapps", "opening the file picker")
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.delegate = context.coordinator
+        return picker
+    }
+    func updateUIViewController(_ picker: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let done: (Result<URL, Error>) -> Void
+        init(_ done: @escaping (Result<URL, Error>) -> Void) { self.done = done }
+        func documentPicker(_ picker: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first { done(.success(url)) } else { HengeLog.log("macapps", "the file picker gave nothing") }
+        }
+        func documentPickerWasCancelled(_ picker: UIDocumentPickerViewController) {
+            HengeLog.log("macapps", "the file picker was closed without a file")
         }
     }
 }
@@ -219,6 +276,10 @@ struct MacAppRunView: View {
     @State private var result: String?
     @State private var confirmDelete = false
     @State private var showScreen = false
+    @State private var github = ""
+    @State private var githubSaved = GitHubToken.read() != nil
+    @State private var showTerminal = false
+    @AppStorage("terminal.arguments") private var arguments = ""
 
     var body: some View {
         ScrollView {
@@ -240,6 +301,25 @@ struct MacAppRunView: View {
                 if app.canRun {
                     Button(running ? "Running…" : "Run") { run() }
                         .buttonStyle(DeskButtonStyle()).disabled(running || (result == nil && henge_tl_ran_program() != 0)).padding(.top, 16)
+                    TextField("Arguments (optional)", text: $arguments)
+                        .font(.system(size: 15, design: .monospaced)).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .padding(12).deskCard().padding(.top, 12)
+                    if (app.executable as NSString).lastPathComponent.lowercased().hasPrefix("claude") {
+                        HStack {
+                            SecureField(githubSaved ? "GitHub: connected (paste a new token to change)" : "GitHub token (optional)", text: $github)
+                                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            Button(github.isEmpty && githubSaved ? "Forget" : "Save") { GitHubToken.write(github); github = ""; githubSaved = GitHubToken.read() != nil }
+                                .disabled(github.isEmpty && !githubSaved)
+                        }
+                        .font(.system(size: 15)).padding(12).deskCard().padding(.top, 12)
+                        Text("Connects GitHub: private repositories, and saving work to a branch. Make a fine-grained token on github.com (Settings › Developer settings) for only the repositories you choose. It stays in this iPhone's Keychain and, while Claude runs, in a file only Henge reads. Public repositories need none.")
+                            .font(.system(size: 13)).foregroundStyle(Desk.dim).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
+                    }
+                    Button(TerminalSession.shared.started ? "Show Terminal" : "Open in a Terminal") { showTerminal = true }
+                        .buttonStyle(DeskButtonStyle())
+                        .disabled(!TerminalSession.shared.started && henge_tl_ran_program() != 0).padding(.top, 10)
+                    Text("A terminal suits programs you type into, such as Claude Code. It starts in Files → Henge → Projects. Programs it tries to start are refused, as iOS allows none.")
+                        .font(.system(size: 13)).foregroundStyle(Desk.dim).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
                     Text("Programs run inside Henge, one per launch. After one has run, quit Henge and open it again to run another or to start a Mac.")
                         .font(.system(size: 13)).foregroundStyle(Desk.dim).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
                     if result != nil || !output.isEmpty {
@@ -265,6 +345,7 @@ struct MacAppRunView: View {
         }
         .background(Desk.page)
         .navigationTitle(app.name)
+        .fullScreenCover(isPresented: $showTerminal) { MacTerminalView(app: app, arguments: arguments) }
         .fullScreenCover(isPresented: $showScreen) { MacAppScreen(app: app) }
         .confirmationDialog("Delete \(app.name)?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { store.delete(app); dismiss() }

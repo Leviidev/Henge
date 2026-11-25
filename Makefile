@@ -103,8 +103,8 @@ test-vm-lifecycle: $(B)/test_vm_lifecycle
 $(B)/test_pvg_lifecycle: tests/test_pvg_lifecycle.m $(ENGINE) $(DEV)
 	$(CC) $(CFLAGS) -fobjc-arc $^ $(METAL_LIBS) -o $@
 
-$(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
-	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
+$(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/diskgrow.c host/hvsparse.h | $(B)
+	$(CC) $(CFLAGS) -fblocks tools/hvsparse_main.c host/hvsparse.c host/diskgrow.c -lz -lcompression -o $@
 
 # Block-level tests: test_X.c plus X_programs.S, run natively and through the JIT.
 $(B)/test_devices: tests/test_devices.c tests/devices_programs.S tests/harness.S tests/harness.h $(ENGINE) $(DEV)
@@ -135,7 +135,7 @@ IOS_CC = xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isy
 IOS_DEPS ?= $(if $(wildcard ios/deps/include/slirp/libslirp.h),$(CURDIR)/ios/deps,$(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot)
 IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)/include/slirp
 IB = build/ios
-IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/dt_fixup.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
+IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/snapshot.c host/dt_fixup.c host/net_slirp.c host/dns_proxy.c host/share.c host/audio_mac.c host/hvsparse.c host/diskgrow.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
 
@@ -155,7 +155,7 @@ $(IB)/libhengevm.a: $(IOS_OBJ)
 	rm -f $@
 	xcrun --sdk iphoneos libtool -static -o $@ $(IOS_OBJ)
 # The translation layer (tl/) for the app's experimental Mac apps: its loader and disk-image reader, not the toy AppKit.
-TL_SRC = tl/loader/tl_loader.c tl/loader/tl_bundle.m tl/loader/tl_stubs.m tl/loader/tl_tlv.S tl/dmg/udif.c tl/dmg/volume.c tl/dmg/hfsplus.c tl/dmg/apfs.c tl/dmg/appinfo.c
+TL_SRC = tl/loader/tl_loader.c tl/loader/tl_bundle.m tl/loader/tl_stubs.m tl/loader/tl_cout.cpp tl/loader/tl_tlv.S tl/dmg/udif.c tl/dmg/volume.c tl/dmg/hfsplus.c tl/dmg/apfs.c tl/dmg/appinfo.c
 TL_IOS_OBJ = $(patsubst %,$(IB)/%.o,$(TL_SRC))
 # Henge's AppKit, for Mac apps with windows, and the table of its C symbols (made from these objects).
 TL_SHIM = $(wildcard tl/shim/appkit/*.m)
@@ -175,15 +175,28 @@ ios-lib: $(IB)/libhengevm.a $(IB)/libhengetl.a
 .PHONY: ios-lib
 
 # The app's glue to it (ios/Henge/Native/henge-tl.c) on the Mac: import a disk image, describe what it holds, run a program.
-$(B)/test_tl_glue: tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c | $(B)
-	$(CC) $(CFLAGS) -fblocks -Iios/Henge/Native tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(filter-out %.m,$(TL_SRC)) host/jit_region.c \
-	  -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -framework Foundation -lz -lbz2 -lcompression -o $@
+$(B)/tl_cout.o: tl/loader/tl_cout.cpp | $(B)
+	$(CXX) -O2 -g -std=c++17 -c $< -o $@
+$(B)/test_tl_glue: tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c $(B)/tl_cout.o | $(B)
+	$(CC) $(CFLAGS) -fblocks -Iios/Henge/Native tests/test_tl_glue.c ios/Henge/Native/henge-tl.c $(filter-out %.m %.cpp,$(TL_SRC)) $(B)/tl_cout.o host/jit_region.c \
+	  -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -framework Foundation -lc++ -lz -lbz2 -lcompression -o $@
+# The terminal for command-line Mac programs (ios/Henge/Native/henge-tl-term.c) on the Mac.
+$(B)/test_tl_term: tests/test_tl_term.c ios/Henge/Native/henge-tl-term.c ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c $(B)/tl_cout.o | $(B)
+	$(CC) $(CFLAGS) -fblocks -Iios/Henge/Native tests/test_tl_term.c ios/Henge/Native/henge-tl-term.c ios/Henge/Native/henge-tl.c $(filter-out %.m %.cpp,$(TL_SRC)) $(B)/tl_cout.o host/jit_region.c \
+	  -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -framework Foundation -lc++ -lz -lbz2 -lcompression -o $@
+# The build and search tools the terminal offers (ios/Henge/ProjectBuilder.swift, ToolServer.swift) on the Mac.
+$(B)/test_project: tests/test_project.swift tests/test_project.c tests/test_project.h ios/Henge/ProjectBuilder.swift ios/Henge/ProjectMaker.swift ios/Henge/ProjectTools.swift ios/Henge/ToolServer.swift ios/Henge/Native/henge-tl-term.c ios/Henge/Native/henge-tl.c $(TL_SRC) tl/loader/tl_tool.h host/jit_region.c $(B)/tl_cout.o | $(B)
+	$(CC) $(CFLAGS) -fblocks -Iios/Henge/Native -Itests -dynamiclib -undefined dynamic_lookup -install_name @rpath/libtest_project.dylib tests/test_project.c ios/Henge/Native/henge-tl-term.c ios/Henge/Native/henge-tl.c $(filter-out %.m %.cpp,$(TL_SRC)) $(B)/tl_cout.o host/jit_region.c \
+	  -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -framework Foundation -lc++ -lz -lbz2 -lcompression -o $(B)/libtest_project.dylib
+	cp tests/test_project.swift $(B)/main.swift
+	swiftc -O -swift-version 5 -import-objc-header tests/test_project.h -Xcc -Iios/Henge/Native -Xcc -Icore -Xcc -Ihost ios/Henge/ProjectBuilder.swift ios/Henge/ProjectMaker.swift ios/Henge/ProjectTools.swift ios/Henge/ToolServer.swift $(B)/main.swift -L$(B) -ltest_project -Xlinker -rpath -Xlinker @executable_path -o $@
+
 # The glue for Mac apps with windows (ios/Henge/Native/henge-tl-app.m) on the Mac, against Henge's AppKit as tl/
 # builds it: test_tl_app APP SNAPDIR [SECONDS] runs the app and draws its windows to PNG files.
 $(B)/test_tl_app: tests/test_tl_app.m ios/Henge/Native/henge-tl-app.m ios/Henge/Native/henge-tl.c $(TL_SRC) host/jit_region.c tl/shim/appkit/*.m tl/shim/appkit/*.h | $(B)
 	$(MAKE) -C tl build/tlios
 	$(CC) $(CFLAGS) -fblocks -Iios/Henge/Native tests/test_tl_app.m -x objective-c -fobjc-arc ios/Henge/Native/henge-tl-app.m -x none \
-	  ios/Henge/Native/henge-tl.c $(filter-out %.m,$(TL_SRC)) host/jit_region.c -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -x none \
+	  ios/Henge/Native/henge-tl.c $(filter-out %.m %.cpp,$(TL_SRC)) $(B)/tl_cout.o host/jit_region.c -x objective-c -fobjc-arc tl/loader/tl_bundle.m tl/loader/tl_stubs.m -x none \
 	  tl/build/shim/*.o tl/build/shim/hk_symbols.c -framework Foundation -framework QuartzCore -framework Metal -framework CoreGraphics \
 	  -framework CoreText -framework ImageIO -framework IOSurface -framework CoreVideo -framework UniformTypeIdentifiers \
 	  -lz -lbz2 -lcompression -o $@

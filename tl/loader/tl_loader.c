@@ -9,6 +9,7 @@
 #include <mach-o/fat.h>
 #include <mach-o/fixup-chains.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <sys/sysctl.h>
@@ -42,6 +43,7 @@ typedef struct TlDep {
 
 struct TlImage {
     char *path, *dir;
+    char *id;             /* its own install name (LC_ID_DYLIB), if any */
     int fd;
     uint8_t *map;
     size_t maplen;
@@ -66,6 +68,8 @@ struct TlImage {
     int initialized, visiting;
     pthread_key_t tlv_key;
     uint64_t tlv_start, tlv_size, tlv_init_size; /* vmaddrs */
+    uint8_t *fresh;  /* a tool's writable data as it was before its initializers (tl_tool_run puts it back) */
+    int objc_loaded; /* its +load methods have run */
     int ns;          /* the "process" it belongs to: 0 the program, 1.. what it started (processes as threads) */
     TlImage *next;
 };
@@ -75,8 +79,15 @@ uint64_t tl_missing_data(const char *sym);     /* tl_stubs.m: a stand-in if the 
 uint64_t tl_missing_data_any(const char *sym); /* tl_stubs.m: a stand-in for something known to be data */
 void *tl_runtime_lookup(const char *symbol);
 static TlImage *g_images, *g_main;
-#define TL_MAX_NS 64
+#define TL_MAX_NS 256
 static TlImage *g_ns_main[TL_MAX_NS]; /* each namespace's executable */
+static _Atomic char g_is_tool[TL_MAX_NS]; /* namespaces of tools run again and again (tl_tool_run) */
+static int g_want_slot;                /* the program being loaded is to be replaceable */
+static char g_no_objc[TL_MAX_NS];      /* namespaces whose Objective-C is not registered (tl_load_replaceable) */
+typedef struct TlSlot { uint8_t *at; size_t size; uint8_t *data; } TlSlot; /* data: where the first segment after __TEXT goes */
+static TlSlot g_slot[TL_MAX_NS];
+static void *tool_lookup(const char *sym, int ns);
+static void tool_snapshot(TlImage *im);
 static int g_loading_ns;              /* the namespace being loaded and bound (under g_lock) */
 static TlImage *main_of(int ns) { return ns >= 0 && ns < TL_MAX_NS ? g_ns_main[ns] : NULL; }
 
@@ -355,6 +366,9 @@ static int parse(TlImage *im, char *err, size_t errlen) {
             dep->reexport = lc->cmd == LC_REEXPORT_DYLIB;
             break;
         }
+        case LC_ID_DYLIB:
+            if (!im->id) im->id = strdup((const char *)lc + ((const struct dylib_command *)lc)->dylib.name.offset);
+            break;
         case LC_RPATH: {
             const struct rpath_command *r = (const void *)lc;
             if (im->nrpaths < TL_MAX_RPATHS) im->rpaths[im->nrpaths++] = strdup((const char *)lc + r->path.offset);
@@ -507,7 +521,28 @@ static int map_segments(TlImage *im, char *err, size_t errlen) {
     if (g_code_alias < 0 && getenv("TL_CODE_ALIAS")) g_code_alias = alias_works() ? 1 : 0;
     if (g_data_inplace < 0 && getenv("TL_DATA_INPLACE")) g_data_inplace = inplace_works() ? 1 : 0;
     if (g_code_alias == 1) return map_segments_aliased(im, err, errlen);
-    uint8_t *base = region_take(im->vmsize);
+    uint8_t *base;
+    TlSlot *slot = g_want_slot && g_no_objc[im->ns] && im->fmh->filetype == MH_EXECUTE ? &g_slot[im->ns] : NULL;
+    if (slot) {
+        /* A program that new builds of itself replace: its code ends and its data begins at the same place in each,
+           so no page changes between the two. */
+        uint64_t text = 0;
+        for (int i = 0; i < im->nsegs; i++)
+            if (im->segs[i].prot & VM_PROT_EXECUTE && im->segs[i].vmaddr + im->segs[i].vmsize - im->vmmin > text)
+                text = im->segs[i].vmaddr + im->segs[i].vmsize - im->vmmin;
+        text = (text + TL_PAGE - 1) & ~(TL_PAGE - 1);
+        if (!slot->at) {
+            const size_t spare = im->vmsize > (uint64_t)64 << 20 ? (size_t)16 << 20 : (size_t)4 << 20;
+            size_t want = ((im->vmsize + TL_PAGE - 1) & ~(TL_PAGE - 1)) + 2 * spare;
+            slot->at = region_take(want);
+            if (slot->at) slot->size = want, slot->data = slot->at + spare + text;
+        }
+        base = slot->at ? slot->data - text : NULL;
+        if (base && (base < slot->at || base + im->vmsize > slot->at + slot->size)) {
+            set_err(err, errlen, "%s has grown too much to replace the build before it", im->path);
+            return -1;
+        }
+    } else base = region_take(im->vmsize);
     if (!base) { set_err(err, errlen, "%s: the executable region is full", im->path); return -1; }
     im->base = base;
     im->slide = (int64_t)((uint64_t)base - im->vmmin);
@@ -563,17 +598,30 @@ static int file_exists(const char *p) {
     return stat(p, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-/* @executable_path, @loader_path and @rpath against this image and the executable. */
+/* The images whose libraries are being loaded, outermost first (loading is serial): as for dyld, a library's @rpath is
+   also looked for in the search paths of what loads it. */
+#define LOADING_MAX 64
+static TlImage *g_loading[LOADING_MAX];
+static int g_nloading;
+
+/* @executable_path, @loader_path and @rpath against this image, what loads it and the executable. */
 static int expand_path(TlImage *im, const char *in, char *out, size_t len) {
     TlImage *exe = main_of(im->ns);
     const char *exe_dir = exe ? exe->dir : im->dir;
     if (!strncmp(in, "@executable_path/", 17)) return snprintf(out, len, "%s/%s", exe_dir, in + 17) < (int)len;
     if (!strncmp(in, "@loader_path/", 13)) return snprintf(out, len, "%s/%s", im->dir, in + 13) < (int)len;
+    /* A search path may be the word alone (Xcode's Swift libraries' is "@loader_path"). */
+    if (!strcmp(in, "@executable_path")) return snprintf(out, len, "%s", exe_dir) < (int)len;
+    if (!strcmp(in, "@loader_path")) return snprintf(out, len, "%s", im->dir) < (int)len;
     if (!strncmp(in, "@rpath/", 7)) {
-        TlImage *owners[2] = {im, exe && exe != im ? exe : NULL};
-        for (int o = 0; o < 2; o++) {
+        TlImage *owners[LOADING_MAX + 2];
+        int n = 0;
+        owners[n++] = im;
+        for (int o = g_nloading - 1; o >= 0; o--)
+            if (g_loading[o] != im) owners[n++] = g_loading[o];
+        if (exe && exe != im) owners[n++] = exe;
+        for (int o = 0; o < n; o++) {
             TlImage *who = owners[o];
-            if (!who) continue;
             for (int i = 0; i < who->nrpaths; i++) {
                 char base[PATH_MAX];
                 if (!expand_path(who, who->rpaths[i], base, sizeof base)) continue;
@@ -586,12 +634,18 @@ static int expand_path(TlImage *im, const char *in, char *out, size_t len) {
     return snprintf(out, len, "%s", in) < (int)len;
 }
 
-static int load_deps(TlImage *im, char *err, size_t errlen) {
+static int load_deps_of(TlImage *im, char *err, size_t errlen) {
     for (int i = 0; i < im->ndeps; i++) {
         TlDep *dep = &im->deps[i];
         const char *name = dep->install_name;
         if (name[0] == '@') {
             char path[PATH_MAX];
+            /* As for dyld, a library already loaded under that very name serves, wherever it was found: Xcode's
+               platforms have copies of the compiler's Swift libraries, and two would not know each other's types. */
+            if (!strncmp(name, "@rpath/", 7))
+                for (TlImage *l = g_images; l && !dep->tl; l = l->next)
+                    if (l != im && l->ns == im->ns && l->id && !strcmp(l->id, name)) dep->tl = l;
+            if (dep->tl) continue;
             if (expand_path(im, name, path, sizeof path) && file_exists(path)) {
                 char real[PATH_MAX];
                 if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
@@ -613,6 +667,14 @@ static int load_deps(TlImage *im, char *err, size_t errlen) {
         }
     }
     return 0;
+}
+
+static int load_deps(TlImage *im, char *err, size_t errlen) {
+    int pushed = g_nloading < LOADING_MAX;
+    if (pushed) g_loading[g_nloading++] = im;
+    int rc = load_deps_of(im, err, errlen);
+    if (pushed) g_nloading--;
+    return rc;
 }
 
 /* ---- symbols ---- */
@@ -856,13 +918,19 @@ static void *cf_override(const char *sym);
 
 static uint64_t host_symbol(void *handle, const char *install_name, const char *sym, int *found) {
     *found = 0;
+    if (g_is_tool[g_loading_ns]) {
+        void *s = tool_lookup(sym, g_loading_ns);
+        if (s) { *found = 1; return (uint64_t)s; }
+    }
     if (install_name && strstr(install_name, "/CoreFoundation.framework/")) {
         void *s = cf_override(sym);
         if (s) { *found = 1; return (uint64_t)s; }
     }
     if (!install_name || strstr(install_name, "libSystem") || !strncmp(install_name, "/usr/lib/system/", 16) ||
         strstr(install_name, "/libbsm.") || strstr(install_name, "/libsandbox.")) {
-        void *s = tl_runtime_lookup(sym);
+        void *s = g_host->first_lookup ? g_host->first_lookup(sym) : NULL;
+        if (s) { *found = 1; return (uint64_t)s; }
+        s = tl_runtime_lookup(sym);
         if (s) { *found = 1; return (uint64_t)s; }
     }
     if (g_host->shim_lookup && install_name) {
@@ -1413,7 +1481,8 @@ static void run_initializers(TlImage *im) {
         if (im->deps[i].tl) run_initializers(im->deps[i].tl);
     im->visiting = 0;
     im->initialized = 1;
-    if (has_objc(im)) {
+    if (has_objc(im) && !im->objc_loaded && !g_no_objc[im->ns]) {
+        im->objc_loaded = 1;
         void (*load)(const char *, const void *) = dlsym(RTLD_DEFAULT, "_objc_load_image");
         if (load) load(im->path, im->base);
     }
@@ -1457,7 +1526,7 @@ static TlImage *load_one(const char *path, char *err, size_t errlen) {
     if (im->fd < 0 || fstat(im->fd, &st)) { set_err(err, errlen, "cannot open %s: %s", path, strerror(errno)); return NULL; }
     im->maplen = (size_t)st.st_size;
     im->map = mmap(NULL, im->maplen, PROT_READ, MAP_PRIVATE, im->fd, 0);
-    if (im->map == MAP_FAILED) { set_err(err, errlen, "cannot read %s", path); return NULL; }
+    if (im->map == MAP_FAILED) { set_err(err, errlen, "cannot read %s (%zu bytes): %s", path, im->maplen, strerror(errno)); return NULL; }
     if (parse(im, err, errlen) || map_segments(im, err, errlen)) return NULL;
     if (im->fmh->filetype == MH_EXECUTE && !main_of(im->ns)) {
         if (im->ns < TL_MAX_NS) g_ns_main[im->ns] = im;
@@ -1501,6 +1570,18 @@ static void keep_own_categories(TlImage *im) {
         }
 }
 
+/* An image whose Objective-C the runtime is not told of (it could never be unloaded): its code can still message the
+   system's classes, once its selectors are the runtime's. */
+static void own_selectors(TlImage *im) {
+    void *(*reg)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
+    static const char *const segs[] = {"__DATA", "__DATA_CONST"};
+    for (int g = 0; reg && g < 2; g++) {
+        uint64_t size = 0;
+        const char **refs = (const char **)find_section(im, segs[g], "__objc_selrefs", &size);
+        for (uint64_t k = 0; refs && k < size / 8; k++) refs[k] = (const char *)reg(refs[k]);
+    }
+}
+
 /* Loads path and what it links; fixes up, registers and initializes whatever was new. Takes g_lock itself. */
 static TlImage *load_and_link(const char *path, int ns, char *err, size_t errlen) {
     pthread_mutex_lock(&g_lock);
@@ -1528,18 +1609,23 @@ static TlImage *load_and_link(const char *path, int ns, char *err, size_t errlen
         for (int i = 0; i < n; i++) g_host->image_linked(batch[i]);
     for (int i = 0; i < n; i++) register_swift(batch[i]);
     for (int i = 0; i < n; i++)
-        if (batch[i]->ns) keep_own_categories(batch[i]);
+        if (batch[i]->ns && !g_no_objc[ns]) keep_own_categories(batch[i]);
     const struct mach_header *mhs[512];
     const char *paths[512];
     int nobjc = 0;
     for (int i = n - 1; i >= 0; i--) /* libraries first, as dyld hands them over */
-        if (has_objc(batch[i])) mhs[nobjc] = (const void *)batch[i]->base, paths[nobjc++] = batch[i]->path;
+        if (g_no_objc[ns]) own_selectors(batch[i]);
+        else if (has_objc(batch[i])) mhs[nobjc] = (const void *)batch[i]->base, paths[nobjc++] = batch[i]->path;
     if (nobjc) {
         void (*map)(unsigned, const char *const *, const struct mach_header *const *) = dlsym(RTLD_DEFAULT, "_objc_map_images");
         if (!map) { set_err(err, errlen, "this host's Objective-C runtime cannot take images (needs iOS 16 or macOS 13)"); pthread_mutex_unlock(&g_lock); return NULL; }
         map((unsigned)nobjc, paths, mhs);
     }
     pthread_mutex_unlock(&g_lock);
+    if (g_is_tool[ns]) {
+        for (int i = 0; i < n; i++) tool_snapshot(batch[i]);
+        if (!main_of(ns) || main_of(ns) == exe) return exe; /* the tool itself: initialized by each run */
+    }
     run_initializers(exe);
     return exe;
 }
@@ -1734,6 +1820,10 @@ static void *rt_dlsym(void *handle, const char *name) {
             if (found) return (void *)v;
         }
         if (handle == RTLD_MAIN_ONLY) return NULL;
+        if (ns > 0 && ns < TL_MAX_NS && g_is_tool[ns]) {
+            void *s = tool_lookup(sym, ns);
+            if (s) return s;
+        }
         if (g_host->shim_lookup) {
             void *s = g_host->shim_lookup("", sym);
             if (s) return s;
@@ -1758,7 +1848,9 @@ static void *rt_dlsym(void *handle, const char *name) {
         if (t0) tl_log("  ... %s in %.1f ms", v ? "found" : "not found", ((double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
         return v;
     }
-    return dlsym(handle, name);
+    int ns = ns_of(__builtin_return_address(0));
+    void *s = ns > 0 && ns < TL_MAX_NS && g_is_tool[ns] ? tool_lookup(sym, ns) : NULL; /* a tool opens the system's library */
+    return s ? s : dlsym(handle, name);
 }
 
 static int rt_dladdr(const void *addr, Dl_info *info) {
@@ -1976,6 +2068,35 @@ static TlProc *proc_load(const char *path, int parent_ns, char *const argv[], ch
     p->exe = exe;
     if (g_host->process_started) g_host->process_started(ns, path);
     return p;
+}
+
+#include "tl_tool.h"
+
+/* The address of a symbol of the image's own table, local ones included, and the room to the next symbol (its size
+   or a little more); NULL when it has none. */
+void *tl_image_local_symbol(TlImage *im, const char *sym, size_t *room) {
+    const struct load_command *lc = (const void *)(im->fmh + 1);
+    for (uint32_t i = 0; i < im->fmh->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SYMTAB) continue;
+        const struct symtab_command *st = (const void *)lc;
+        if ((uint64_t)st->symoff + (uint64_t)st->nsyms * sizeof(struct nlist_64) > im->slicelen ||
+            (uint64_t)st->stroff + st->strsize > im->slicelen)
+            return NULL;
+        const struct nlist_64 *syms = (const void *)(im->slice + st->symoff);
+        const char *strs = (const char *)im->slice + st->stroff;
+        uint64_t at = 0, next = UINT64_MAX;
+        for (uint32_t k = 0; k < st->nsyms && !at; k++)
+            if (!(syms[k].n_type & N_STAB) && (syms[k].n_type & N_TYPE) == N_SECT && syms[k].n_un.n_strx < st->strsize &&
+                !strcmp(strs + syms[k].n_un.n_strx, sym))
+                at = syms[k].n_value;
+        if (!at) return NULL;
+        for (uint32_t k = 0; k < st->nsyms; k++)
+            if (!(syms[k].n_type & N_STAB) && (syms[k].n_type & N_TYPE) == N_SECT && syms[k].n_value > at && syms[k].n_value < next)
+                next = syms[k].n_value;
+        if (room) *room = next == UINT64_MAX ? 0 : (size_t)(next - at);
+        return (void *)(uintptr_t)(at + (uint64_t)im->slide);
+    }
+    return NULL;
 }
 
 /* A Chromium helper's switches for running inside the app: its sandbox policy would come through an inherited file
@@ -2809,6 +2930,12 @@ static void *room_place_prot(size_t len, int prot) {
     if (len > ((size_t)4 << 30)) {
         size_t core = len + TL_PAGE - ((size_t)4 << 30);
         if (core >= ((size_t)64 << 20) && !(core & (core - 1))) slack = len - core, len = core; /* 4 GB alignment */
+    }
+    /* V8 asks for less and less until it gets some (8 GB will do). Bigger would take the second 32 GB-aligned block,
+       which Oilpan needs for its cage and cannot do without. */
+    if (slack && len > ((size_t)8 << 30)) {
+        tl_log("a %.0f GB reservation (V8's) is left for a smaller one", (double)len / (1 << 30));
+        return NULL;
     }
     /* The alignment its size implies (the largest power of two in it, at most 32 GB); 4 GB for V8's padded requests. */
     size_t align = TL_PAGE;
