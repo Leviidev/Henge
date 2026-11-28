@@ -79,10 +79,8 @@ enum Device {
     /// picks 2x there too; on that screen the panel is 2853 × 2007, and a Mac that leaves the side strip
     /// gets the panel less the strip.
     static func retinaScreen(fill: Bool = true) -> (width: Int, height: Int) {
-        let n = screen.nativeBounds.size
-        var long = max(n.width, n.height), short = min(n.width, n.height)
-        if !isPad, largeScreen, !fill { long -= sideStrip * screen.nativeScale }
-        return (Int(long) / 8 * 8, Int(short) / 8 * 8)
+        RetinaSize.panel(nativePixels: screen.nativeBounds.size, nativeScale: screen.nativeScale,
+                         strip: !isPad && largeScreen && !fill ? sideStrip : 0)
     }
     static func retinaMM(fill: Bool = true) -> (width: Int, height: Int) {
         let s = retinaScreen(fill: fill)

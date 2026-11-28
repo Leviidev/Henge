@@ -243,8 +243,7 @@ struct SessionView: View {
 
     /// The Mac's screen follows the space it has on this device: a rotation, a fold or unfold, a window resized.
     private func wantSize(_ space: CGSize?) {
-        let scale = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen.scale }.first ?? 2
-        display.want(space.flatMap { DisplayRouter.Size.fitting($0, scale: scale, retina: mac.isRetina) })
+        display.want(space.flatMap { DisplayRouter.Size.fitting($0, pixelsPerPoint: Device.screen.nativeScale, retina: mac.isRetina) })
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.

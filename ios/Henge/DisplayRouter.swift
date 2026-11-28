@@ -157,13 +157,15 @@ final class DisplayRouter: ObservableObject {
 }
 
 extension DisplayRouter.Size {
-    /// The Mac's screen for a space of this many points at this scale. Retina: every pixel. Otherwise what
+    /// The Mac's screen for a space of this many points. Retina: every pixel, so `pixelsPerPoint` is the panel's
+    /// (`UIScreen.nativeScale`, not `scale`, which does not follow an iPad's Display Zoom). Otherwise what
     /// Device.fittingScreen picks for a whole device, for any shape: 1920 wide and as tall as the shape asks, or for a
     /// space squarer than 4:3, 1440 tall and as wide as it asks.
-    static func fitting(_ points: CGSize, scale: CGFloat, retina: Bool) -> Self? {
+    static func fitting(_ points: CGSize, pixelsPerPoint: CGFloat, retina: Bool) -> Self? {
         guard points.width >= 100, points.height >= 100 else { return nil }
         if retina {
-            return Self(width: Int(points.width * scale) / 8 * 8, height: Int(points.height * scale) / 8 * 8)
+            let px = RetinaSize.live(points: points, nativeScale: pixelsPerPoint)
+            return Self(width: px.width, height: px.height)
         }
         let shape = points.width / points.height
         // Wider than 16:9 stays 1920 x 1080, beside bars, as a Mac set to fit always has on such a phone.

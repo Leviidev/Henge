@@ -134,8 +134,7 @@ enum Autopilot {
                 display.simulated = nil
                 HengeLog.log("autopilot", "screen: the device's own space again")
             } else if wh.count == 2 {
-                let scale = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen.scale }.first ?? 3
-                let size = DisplayRouter.Size.fitting(CGSize(width: wh[0], height: wh[1]), scale: scale, retina: display.isRetina)
+                let size = DisplayRouter.Size.fitting(CGSize(width: wh[0], height: wh[1]), pixelsPerPoint: Device.screen.nativeScale, retina: display.isRetina)
                 display.simulated = size
                 HengeLog.log("autopilot", "screen \(wh[0])x\(wh[1]) pt: asking for \(size.map { "\($0.width)x\($0.height)" } ?? "nothing")")
             } else {
