@@ -237,15 +237,22 @@ $(B)/test_display_targets: ios/Henge/DisplayTargetSelection.swift tests/test_dis
 	xcrun --sdk macosx swiftc $^ -o $@
 
 # The router's hand-off to the engine, with the engine call recorded instead of made.
-$(B)/test_display_router: ios/Henge/DisplayRouter.swift ios/Henge/DisplayTargetSelection.swift tests/test_display_router.swift tests/display_engine_stub.h | $(B)
+$(B)/test_display_router: ios/Henge/DisplayRouter.swift ios/Henge/RetinaSize.swift ios/Henge/DisplayTargetSelection.swift tests/test_display_router.swift tests/display_engine_stub.h | $(B)
 	xcrun --sdk macosx swiftc -import-objc-header tests/display_engine_stub.h $(filter %.swift,$^) -o $@
+
+# The Retina size a Mac gets from a panel's pixels and points: iPad (also Display Zoom), iPhone Duo, iPhone.
+$(B)/test_retina_size: ios/Henge/RetinaSize.swift tests/test_retina_size.swift | $(B)
+	xcrun --sdk macosx swiftc -parse-as-library $^ -o $@
+test-retina-size: $(B)/test_retina_size
+	$(B)/test_retina_size
+.PHONY: test-retina-size
 
 # Which external screen shows the Mac before iOS 27, for any order of session and plug events.
 $(B)/test_external_screen_plan: ios/Henge/ExternalScreenPlan.swift tests/test_external_screen_plan.swift | $(B)
 	xcrun --sdk macosx swiftc $^ -o $@
 
 # The glue: fake screens and a real router, to check what each screen is told and what the engine draws.
-$(B)/test_legacy_external_display: ios/Henge/LegacyExternalDisplay.swift ios/Henge/ExternalScreenPlan.swift ios/Henge/MacPresentation.swift ios/Henge/DisplayRouter.swift ios/Henge/DisplayTargetSelection.swift tests/test_legacy_external_display.swift tests/display_engine_stub.h | $(B)
+$(B)/test_legacy_external_display: ios/Henge/LegacyExternalDisplay.swift ios/Henge/ExternalScreenPlan.swift ios/Henge/MacPresentation.swift ios/Henge/DisplayRouter.swift ios/Henge/RetinaSize.swift ios/Henge/DisplayTargetSelection.swift tests/test_legacy_external_display.swift tests/display_engine_stub.h | $(B)
 	xcrun --sdk macosx swiftc -import-objc-header tests/display_engine_stub.h $(filter %.swift,$^) -o $@
 
 # Info.plist must declare the external display scene role with ExternalDisplaySceneDelegate, or iOS 17-26 never offer the display.
