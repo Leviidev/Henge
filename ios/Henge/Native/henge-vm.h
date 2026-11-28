@@ -83,6 +83,11 @@ void henge_vm_set_display(uint32_t width, uint32_t height);
 void henge_vm_set_display_live(uint32_t width, uint32_t height, float px_per_mm);
 /* The size macOS took last (it acked the mode list). 0, or -1 before it has taken one. */
 int henge_vm_display_size(uint32_t *width, uint32_t *height);
+/* What the guest's About This Mac says, for the next boot (NULL leaves the vmapple
+   identity): the chip's name, the product name, and — experimental — the model
+   identifier (hw.model). The chip goes through the config region; the other two
+   are fixed up in the guest's device tree while iBoot runs (host/dt_fixup.c). */
+void henge_vm_set_identity(const char *soc_name, const char *product_name, const char *model_id);
 /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
 void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
 void henge_vm_key(uint16_t code, int down);
