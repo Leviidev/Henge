@@ -1,21 +1,22 @@
 import Foundation
 
 /// Growing a stopped Mac's disk: which sizes are offered, when it is refused, and the partition table move that lets
-/// macOS use the new space. A disk only ever grows, and only as far as the largest size listed here.
+/// macOS use the new space. A disk only ever grows, and only as far as the largest size listed here. Sizes are in GiB
+/// (2^30 bytes), the same list the install-time picker offers.
 enum DiskGrowth {
-    static let sizesGB = [96, 128, 192, 256]
+    static let supportedGiB = [64, 128, 256, 512]
 
     /// What macOS has to do afterwards: it keeps using the old size until its APFS container is grown inside it.
     /// Henge has already moved the recovery partition to the end of the disk, so the free space sits right after the
     /// container and this one command is enough (APFS grows a mounted container in place).
     static let guestCommand = "sudo diskutil apfs resizeContainer disk0s2 0"
 
-    static func choices(currentBytes: Int64) -> [Int] { sizesGB.filter { Int64($0) << 30 > currentBytes } }
+    static func choices(currentBytes: Int64) -> [Int] { supportedGiB.filter { Int64($0) << 30 > currentBytes } }
 
     /// Why a disk cannot be grown now, or nil. `vmState` is henge_vm_state(): 1 running, 3 starting or stopping, 4 paused.
-    static func refusal(vmState: Int32, currentBytes: Int64, newGB: Int) -> String? {
+    static func refusal(vmState: Int32, currentBytes: Int64, newGiB: Int) -> String? {
         if [1, 3, 4].contains(vmState) { return "Stop the Mac first." }
-        if !choices(currentBytes: currentBytes).contains(newGB) { return "The disk can only grow to a larger size." }
+        if !choices(currentBytes: currentBytes).contains(newGiB) { return "The disk can only grow to a larger size." }
         return nil
     }
 

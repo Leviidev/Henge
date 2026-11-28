@@ -120,7 +120,7 @@ struct MacSettingsView: View {
                     let sizes = DiskGrowth.choices(currentBytes: mac.diskBytes)
                     if !sizes.isEmpty {
                         Menu {
-                            ForEach(sizes, id: \.self) { gb in Button("\(gb) GB") { growTo = gb } }
+                            ForEach(sizes, id: \.self) { gib in Button("\(gib) GiB") { growTo = gib } }
                         } label: {
                             Text("Make the Disk Larger…")
                                 .font(.system(size: 15, weight: .semibold)).foregroundStyle(Desk.accentLight)
@@ -150,10 +150,10 @@ struct MacSettingsView: View {
             case .failure(let error): machines.lastError = error.localizedDescription
             }
         }
-        .confirmationDialog("Make the disk \(growTo ?? 0) GB?", isPresented: Binding(get: { growTo != nil }, set: { if !$0 { growTo = nil } }), titleVisibility: .visible) {
+        .confirmationDialog("Make the disk \(growTo ?? 0) GiB?", isPresented: Binding(get: { growTo != nil }, set: { if !$0 { growTo = nil } }), titleVisibility: .visible) {
             Button("Make It Larger") {
-                if let gb = growTo {
-                    do { mac = try machines.growDisk(mac, toGB: gb) } catch { machines.lastError = error.localizedDescription }
+                if let gib = growTo {
+                    do { mac = try machines.growDisk(mac, toGiB: gib) } catch { machines.lastError = error.localizedDescription }
                 }
                 growTo = nil
             }

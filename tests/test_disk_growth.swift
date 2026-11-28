@@ -3,34 +3,39 @@ import Foundation
 @main
 struct DiskGrowthTests {
     static func main() {
-        // `test_disk_growth <image> <GB>` grows a real image (a copy!) for checking with hdiutil and diskutil.
-        if CommandLine.arguments.count == 3, let gb = Int64(CommandLine.arguments[2]) {
-            do { print(try DiskGrowth.grow(path: CommandLine.arguments[1], to: gb << 30)) } catch { print("failed: \(error)"); exit(1) }
+        // `test_disk_growth <image> <GiB>` grows a real image (a copy!) for checking with hdiutil and diskutil.
+        if CommandLine.arguments.count == 3, let gib = Int64(CommandLine.arguments[2]) {
+            do { print(try DiskGrowth.grow(path: CommandLine.arguments[1], to: gib << 30)) } catch { print("failed: \(error)"); exit(1) }
             return
         }
-        let gb: Int64 = 1 << 30
+        let gib: Int64 = 1 << 30
 
-        // A new 64 GB Mac is offered every size; a 128 GB one only the larger ones; a 256 GB one nothing.
-        precondition(DiskGrowth.choices(currentBytes: 64 * gb) == [96, 128, 192, 256])
-        precondition(DiskGrowth.choices(currentBytes: 128 * gb) == [192, 256])
-        precondition(DiskGrowth.choices(currentBytes: 256 * gb).isEmpty)
+        // The list matches the install-time picker (64/128/256/512 GiB). A 64 GiB Mac is offered the three larger sizes,
+        // a 128 GiB one the two above it, and a 512 GiB one nothing.
+        precondition(DiskGrowth.supportedGiB == [64, 128, 256, 512])
+        precondition(DiskGrowth.choices(currentBytes: 32 * gib) == [64, 128, 256, 512])
+        precondition(DiskGrowth.choices(currentBytes: 64 * gib) == [128, 256, 512])
+        precondition(DiskGrowth.choices(currentBytes: 128 * gib) == [256, 512])
+        precondition(DiskGrowth.choices(currentBytes: 256 * gib) == [512])
+        precondition(DiskGrowth.choices(currentBytes: 512 * gib).isEmpty)
 
         // A disk between two sizes (an imported one) is offered only what is bigger than it.
-        precondition(DiskGrowth.choices(currentBytes: 100 * gb) == [128, 192, 256])
+        precondition(DiskGrowth.choices(currentBytes: 100 * gib) == [128, 256, 512])
 
         // Allowed when stopped and larger.
-        precondition(DiskGrowth.refusal(vmState: 0, currentBytes: 64 * gb, newGB: 128) == nil)
-        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 64 * gb, newGB: 128) == nil)
+        precondition(DiskGrowth.refusal(vmState: 0, currentBytes: 64 * gib, newGiB: 128) == nil)
+        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 64 * gib, newGiB: 128) == nil)
 
         // Refused while the Mac is running, starting or stopping, or paused.
         for state: Int32 in [1, 3, 4] {
-            precondition(DiskGrowth.refusal(vmState: state, currentBytes: 64 * gb, newGB: 128) != nil)
+            precondition(DiskGrowth.refusal(vmState: state, currentBytes: 64 * gib, newGiB: 128) != nil)
         }
 
         // Refused for the same size, a smaller one, or one that is not on the list.
-        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 128 * gb, newGB: 128) != nil)
-        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 128 * gb, newGB: 96) != nil)
-        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 64 * gb, newGB: 1024) != nil)
+        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 128 * gib, newGiB: 128) != nil)
+        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 128 * gib, newGiB: 64) != nil)
+        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 64 * gib, newGiB: 1024) != nil)
+        precondition(DiskGrowth.refusal(vmState: 2, currentBytes: 64 * gib, newGiB: 96) != nil)  // not a step on the list
         gptMove()
         print("disk growth ok")
     }
