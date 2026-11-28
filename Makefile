@@ -268,6 +268,14 @@ test-jit-advice: $(B)/test_jit_advice
 	$(B)/test_jit_advice
 .PHONY: test-jit-advice
 
+# Which disk sizes a Mac is offered, and when growing is refused.
+$(B)/test_disk_growth: ios/Henge/DiskGrowth.swift tests/test_disk_growth.swift | $(B)
+	xcrun --sdk macosx swiftc $^ -o $@
+
+test-disk-growth: $(B)/test_disk_growth
+	$(B)/test_disk_growth
+.PHONY: test-disk-growth
+
 # The host identity table and the icon-snapping for the guest's About This Mac.
 $(B)/test_device_identity: ios/Henge/DeviceIdentity.swift tests/test_device_identity.swift | $(B)
 	xcrun --sdk macosx swiftc $^ -o $@
