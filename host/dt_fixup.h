@@ -31,9 +31,22 @@ void hv_dt_fixup_poll(void);
    Returns 1 if it took the address (a valid tree is there). */
 int hv_dt_fixup_tree(uint64_t offset, uint64_t len);
 /* The guest's GPU has drawn: the kernel has the tree in its registry now.
-   Logs what became of the rewrite. */
+   Logs what became of the rewrite. Does not wait for the scan thread, so it is
+   safe on a guest CPU thread. */
 void hv_dt_fixup_stop(void);
+/* Stops the scan and waits for its thread to exit. Call before guest RAM is
+   freed (machine teardown); hv_dt_fixup_start calls it too, so a new machine
+   never shares state with an old scan. */
+void hv_dt_fixup_join(void);
 /* Rewrites one blob in place; returns how many strings changed. (Also tests.) */
 int hv_dt_fixup_blob(uint8_t *blob, uint64_t avail);
+
+/* A validated FDT header, read once. The walk takes its bounds only from this
+   snapshot, so a guest changing the header mid-walk cannot move them. */
+typedef struct {
+    uint32_t total, off_struct, off_strings, size_struct, size_strings;
+} HvDtbHeader;
+int hv_dtb_header(const uint8_t *blob, uint64_t avail, HvDtbHeader *h);
+int hv_dt_fixup_walk(uint8_t *blob, const HvDtbHeader *h);
 
 #endif
