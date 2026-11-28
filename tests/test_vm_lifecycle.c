@@ -138,6 +138,25 @@ int main(void) {
         check("no CPU, disk or network worker leak", threads() == initial_threads);
         check("no leaked CPU thread ports", dead_ports() == initial_dead_ports);
     }
+    /* A Mac given an identity starts the device-tree scan thread, which reads
+       guest RAM. Stopped before its GPU ever draws, the scan must still be
+       joined before the RAM goes, so no thread outlives the machine. */
+    {
+        uint32_t spin[] = {0x14000000}; /* b . */
+        write_file(rom, spin, sizeof spin);
+        henge_vm_set_identity(NULL, "iPhone 17 Pro", "iPhone18,1");
+        int rc = henge_vm_boot(rom, disk, aux, 1, 0, 64, 2, error, sizeof error);
+        if (rc) fprintf(stderr, "identity boot: %s\n", error);
+        check("identity boot succeeds", rc == 0);
+        usleep(30000);
+        henge_vm_stop();
+        for (int n = 0; n < 3000 && henge_vm_state() != 2; n++) usleep(1000);
+        check("identity Mac stops", henge_vm_state() == 2);
+        check("identity Mac releases RAM", hv_vm_board()->ram == NULL);
+        for (int n = 0; n < 1000 && threads() > initial_threads; n++) usleep(1000);
+        check("no device-tree scan thread outlives the machine", threads() == initial_threads);
+        henge_vm_set_identity(NULL, NULL, NULL);
+    }
     /* Instant resume: a counter in RAM goes on from where it was saved, in this machine and in a new one. */
     {
         char snap[300];

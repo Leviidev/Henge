@@ -33,6 +33,8 @@ static uint64_t final_off, final_len; /* the tree boot_args names, once known */
 static int have_final, final_adt; /* final_adt: Apple's magic-less ADT, not an FDT blob */
 static uint64_t passes, magic_seen, magic_valid, string_hits; /* what the scan saw, for the stop summary */
 static int magic_logged, ba_logged;
+static pthread_t scan_tid; /* joinable, so teardown can wait for it */
+static int scan_running;
 
 static double now(void) {
     struct timespec ts;
@@ -48,15 +50,24 @@ static uint32_t le32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
-/* A flattened device tree (v17 header), whole within avail. */
-static int is_dtb(const uint8_t *b, uint64_t avail) {
-    if (avail < 40 || be32(b) != 0xd00dfeed) return 0;
-    uint32_t total = be32(b + 4), off_struct = be32(b + 8), off_strings = be32(b + 12);
+/* A flattened device tree (v17 header), whole within avail. The header is read
+   once into h: guest RAM can change while the host reads it (the guest keeps
+   running during the scan), so every later bound comes from this snapshot and
+   the header is never read again. */
+static int dtb_header(const uint8_t *b, uint64_t avail, HvDtbHeader *h) {
+    if (avail < 40) return 0;
+    uint32_t magic = be32(b), total = be32(b + 4), off_struct = be32(b + 8), off_strings = be32(b + 12);
     uint32_t version = be32(b + 20), size_strings = be32(b + 32), size_struct = be32(b + 36);
-    if (version < 16 || version > 18 || total < 40 || total > (1u << 20) || total > avail) return 0;
-    return off_struct < total && off_strings < total && size_struct <= total - off_struct &&
-           size_strings <= total - off_strings;
+    if (magic != 0xd00dfeed || version < 16 || version > 18 || total < 40 || total > (1u << 20) || total > avail) return 0;
+    if (!(off_struct < total && off_strings < total && size_struct <= total - off_struct &&
+          size_strings <= total - off_strings)) return 0;
+    if (h) *h = (HvDtbHeader){total, off_struct, off_strings, size_struct, size_strings};
+    return 1;
 }
+
+static int is_dtb(const uint8_t *b, uint64_t avail) { return dtb_header(b, avail, NULL); }
+
+int hv_dtb_header(const uint8_t *b, uint64_t avail, HvDtbHeader *h) { return dtb_header(b, avail, h); }
 
 /* A shorter string is NUL-padded to the property's length: the tree is edited
    in place, and device-tree strings are read as C strings. The slot may be
@@ -117,12 +128,15 @@ static uint64_t adt_walk(uint8_t *p, uint64_t avail, int depth, int *changed) {
     return off;
 }
 
-int hv_dt_fixup_blob(uint8_t *b, uint64_t avail) {
-    if (!is_dtb(b, avail)) return 0;
-    uint32_t off_struct = be32(b + 8), off_strings = be32(b + 12);
-    uint32_t size_strings = be32(b + 32), size_struct = be32(b + 36);
-    const uint8_t *strings = b + off_strings, *stop = b + off_struct + size_struct;
-    const uint8_t *p = b + off_struct;
+/* Walks the struct block within the bounds of a header snapshot. Every field is
+   read once, and every read and write stays inside [off_struct, off_struct +
+   size_struct) or [off_strings, off_strings + size_strings) of h, whatever the
+   guest writes meanwhile. Names are compared with bounded memcmp, never strcmp,
+   because a terminator checked a moment ago may be gone by the next read. */
+int hv_dt_fixup_walk(uint8_t *b, const HvDtbHeader *h) {
+    const uint32_t size_strings = h->size_strings;
+    const uint8_t *strings = b + h->off_strings, *stop = b + h->off_struct + h->size_struct;
+    const uint8_t *p = b + h->off_struct;
     int depth = 0, in_product = 0, changed = 0;
     while (p + 4 <= stop) {
         uint32_t tok = be32(p);
@@ -133,11 +147,12 @@ int hv_dt_fixup_blob(uint8_t *b, uint64_t avail) {
             const uint8_t *name = p;
             while (p < stop && *p) p++;
             if (p >= stop) break;
+            size_t nlen = (size_t)(p - name); /* bytes before the NUL this pass saw */
             p++;
             p += (4 - ((uintptr_t)p & 3)) & 3;
             if (p > stop) break;
             depth++;
-            if (depth == 2) in_product = !strcmp((const char *)name, "product");
+            if (depth == 2) in_product = nlen == 7 && memcmp(name, "product", 7) == 0;
             continue;
         }
         if (tok == 2) { /* FDT_END_NODE */
@@ -148,17 +163,17 @@ int hv_dt_fixup_blob(uint8_t *b, uint64_t avail) {
         if (tok != 3 || p + 8 > stop) break; /* FDT_PROP: {len, nameoff, data} */
         uint32_t len = be32(p), nameoff = be32(p + 4);
         p += 8;
-        if (len > (uint64_t)(stop - p) || nameoff >= size_strings ||
-            !memchr(strings + nameoff, 0, size_strings - nameoff)) break;
+        if (len > (uint64_t)(stop - p) || nameoff >= size_strings) break;
         uint8_t *data = (uint8_t *)p;
         p += (len + 3) & ~3u;
         if (p > stop) break;
-        const char *pname = (const char *)(strings + nameoff);
-        if (depth == 1 && want_model[0] && !strcmp(pname, "model")) {
+        const uint8_t *pname = strings + nameoff;
+        uint32_t room = size_strings - nameoff; /* bytes of the strings block from pname */
+        if (depth == 1 && want_model[0] && room >= 6 && memcmp(pname, "model", 6) == 0) {
             int r = replace(data, len, STOCK_MODEL, want_model);
             if (r) changed += r;
             else mismatch("model", data, len, STOCK_MODEL, want_model);
-        } else if (depth == 2 && in_product && want_name[0] && !strcmp(pname, "product-name")) {
+        } else if (depth == 2 && in_product && want_name[0] && room >= 13 && memcmp(pname, "product-name", 13) == 0) {
             int r = replace(data, len, STOCK_NAME, want_name);
             if (r) changed += r;
             else mismatch("product-name", data, len, STOCK_NAME, want_name);
@@ -167,7 +182,14 @@ int hv_dt_fixup_blob(uint8_t *b, uint64_t avail) {
     return changed;
 }
 
+int hv_dt_fixup_blob(uint8_t *b, uint64_t avail) {
+    HvDtbHeader h;
+    if (!dtb_header(b, avail, &h)) return 0;
+    return hv_dt_fixup_walk(b, &h);
+}
+
 int hv_dt_fixup_start(uint8_t *r, uint64_t size, uint64_t base, const char *product_name, const char *model_id) {
+    hv_dt_fixup_join(); /* an earlier machine's scan must be gone before its state is reset */
     ram = r;
     ram_size = size;
     ram_base = base;
@@ -271,6 +293,7 @@ static int looks_like_tree(const uint8_t *b, uint64_t avail) {
 static void find_boot_args_tree(void) {
     if (have_final) return;
     for (uint64_t off = 0; off + 0x1000 <= ram_size; off += 0x4000) {
+        if (!active) return;
         const uint64_t *q = (const uint64_t *)(ram + off);
         const uint16_t *h = (const uint16_t *)(ram + off);
         if (h[0] < 2 || h[0] > 3 || h[1] < 1 || h[1] > 3) continue; /* revision, version */
@@ -320,7 +343,7 @@ static void find_by_string(void) {
     size_t nlen = strlen(STOCK_NAME) + 1; /* the property value, NUL included */
     uint64_t pos = 0;
     int hits = 0;
-    while (pos + nlen <= ram_size) {
+    while (pos + nlen <= ram_size && active) {
         const uint8_t *hit = memmem(ram + pos, ram_size - pos, STOCK_NAME, nlen);
         if (!hit) break;
         uint64_t hoff = (uint64_t)(hit - ram);
@@ -366,6 +389,7 @@ static void scan_pass(void) {
     }
     /* Page-aligned trees anywhere in RAM: iBoot may load the tree high. */
     for (uint64_t off = 0; off + 40 <= ram_size; off += 0x1000) {
+        if (!active) return;
         const uint8_t *b = ram + off;
         if (b[0] != 0xd0 || b[1] != 0x0d || b[2] != 0xfe || b[3] != 0xed) continue;
         magic_seen++;
@@ -383,11 +407,12 @@ static void scan_pass(void) {
     /* Finer: iBoot's heap allocations are 16-byte aligned, not always page-aligned. */
     uint64_t limit = ram_size < SCAN_WINDOW ? ram_size : SCAN_WINDOW;
     for (uint64_t off = 0; off + 40 <= limit; off += 16) {
+        if ((off & 0xffff) == 0 && !active) return;
         const uint8_t *b = ram + off;
         if (b[0] == 0xd0 && b[1] == 0x0d && b[2] == 0xfe && b[3] == 0xed) consider(off, limit - off);
     }
-    find_boot_args_tree();
-    find_by_string();
+    if (active) find_boot_args_tree();
+    if (active) find_by_string();
 }
 
 void hv_dt_fixup_poll(void) {
@@ -423,8 +448,8 @@ static void *scan_thread(void *arg) {
 }
 
 void hv_dt_fixup_run(void) {
-    pthread_t t;
-    if (pthread_create(&t, NULL, scan_thread, NULL) == 0) pthread_detach(t);
+    if (scan_running || !active) return;
+    if (pthread_create(&scan_tid, NULL, scan_thread, NULL) == 0) scan_running = 1;
 }
 
 void hv_dt_fixup_stop(void) {
@@ -434,4 +459,11 @@ void hv_dt_fixup_stop(void) {
             (unsigned long long)string_hits, total_changed, total_changed == 1 ? "" : "s",
             total_changed ? "" : ", the guest keeps its own name");
     active = 0;
+}
+
+void hv_dt_fixup_join(void) {
+    active = 0; /* quietly: the scan thread checks it between steps, so it leaves within a step */
+    if (!scan_running) return;
+    if (!pthread_equal(scan_tid, pthread_self())) pthread_join(scan_tid, NULL);
+    scan_running = 0;
 }

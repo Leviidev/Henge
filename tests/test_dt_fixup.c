@@ -3,9 +3,13 @@
    /product/product-name, and neighbours that must not move. */
 #include "dt_fixup.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 static int failures;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); failures++; } } while (0)
@@ -272,6 +276,102 @@ static void test_adt(void) {
     (void)again;
 }
 
+/* The guest keeps running while the host walks its tree, so the header can
+   change after it was checked. The walk must take its bounds from the header it
+   validated, never from a second read: corrupt every bound in the buffer after
+   the snapshot and the walk still finds both strings inside the real tree. The
+   buffer is exactly the tree's size, so an address sanitizer run catches any
+   read past it. */
+static void test_header_snapshot(void) {
+    uint32_t len_off = 0;
+    b_vmapple("Apple Virtual Machine 1", &len_off);
+    uint32_t total = get32(blob + 4);
+    uint8_t *t = malloc(total);
+    CHECK(t != NULL);
+    if (!t) return;
+    memcpy(t, blob, total);
+    CHECK(hv_dt_fixup_start(t, total, 0, "iPhone 17 Pro", "iPhone18,1") == 1);
+    HvDtbHeader h;
+    CHECK(hv_dtb_header(t, total, &h) == 1);
+    put32(t + 4, 0xffffffff);  /* totalsize */
+    put32(t + 8, 0xfffffff0);  /* struct offset */
+    put32(t + 12, 0xfffffff0); /* strings offset */
+    put32(t + 32, 0xfffffff0); /* strings size */
+    put32(t + 36, 0xfffffff0); /* struct size */
+    CHECK(hv_dt_fixup_walk(t, &h) == 2);
+    CHECK(memcmp(t + len_off + 8, "iPhone 17 Pro\0", 14) == 0);
+    CHECK(memmem(t, total, "iPhone18,1", 10));
+    CHECK(hv_dt_fixup_blob(t, total) == 0); /* the corrupted header itself is refused */
+    free(t);
+}
+
+/* The same race with a real second thread: one thread keeps rewriting the
+   header's bounds while the other patches the tree over and over. */
+static uint8_t *race_tree;
+static atomic_int race_done;
+static void *race_flipper(void *arg) {
+    (void)arg;
+    uint32_t good_struct = get32(race_tree + 36), good_strings = get32(race_tree + 12);
+    for (unsigned i = 0; !atomic_load(&race_done); i++) {
+        put32(race_tree + 36, i & 1 ? 0xfffffff0 : good_struct);
+        put32(race_tree + 12, i & 2 ? 0xfffffff0 : good_strings);
+    }
+    put32(race_tree + 36, good_struct);
+    put32(race_tree + 12, good_strings);
+    return NULL;
+}
+static void test_header_race(void) {
+    b_vmapple("Apple Virtual Machine 1", NULL);
+    uint32_t total = get32(blob + 4);
+    race_tree = malloc(total);
+    CHECK(race_tree != NULL);
+    if (!race_tree) return;
+    memcpy(race_tree, blob, total);
+    CHECK(hv_dt_fixup_start(race_tree, total, 0, "iPhone 17 Pro", "iPhone18,1") == 1);
+    atomic_store(&race_done, 0);
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, race_flipper, NULL) == 0);
+    for (int i = 0; i < 200000; i++) (void)hv_dt_fixup_blob(race_tree, total);
+    atomic_store(&race_done, 1);
+    pthread_join(t, NULL);
+    CHECK(memmem(race_tree, total, "iPhone 17 Pro", 13)); /* it still did its job between flips */
+    free(race_tree);
+}
+
+static double secs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* The scan thread reads guest RAM, so it has to be gone before that RAM is
+   freed, even when no GPU frame ever arrived to stop it. A machine with no tree
+   in its RAM keeps the scan busy; joining must still return promptly, and a new
+   start must wait for the old scan before it reuses the state. */
+static void test_scan_thread_lifetime(void) {
+    uint64_t size = 64ull << 20;
+    uint8_t *ram1 = calloc(1, size), *ram2 = calloc(1, size);
+    CHECK(ram1 && ram2);
+    if (!ram1 || !ram2) { free(ram1); free(ram2); return; }
+    CHECK(hv_dt_fixup_start(ram1, size, 0, "iPhone 17 Pro", "iPhone18,1") == 1);
+    hv_dt_fixup_run();
+    usleep(30000);
+    double t0 = secs();
+    hv_dt_fixup_join();
+    CHECK(secs() - t0 < 1.0);
+    free(ram1); /* safe now: nothing reads it */
+    CHECK(hv_dt_fixup_start(ram2, size, 0, "iPhone 17 Pro", "iPhone18,1") == 1);
+    hv_dt_fixup_run();
+    usleep(10000);
+    /* A second start while the scan runs joins it before resetting anything. */
+    CHECK(hv_dt_fixup_start(ram2, size, 0, "iPhone 17 Pro", NULL) == 1);
+    hv_dt_fixup_run();
+    hv_dt_fixup_stop(); /* the GPU-drew path: does not wait */
+    hv_dt_fixup_join();
+    hv_dt_fixup_join(); /* twice is harmless */
+    free(ram2);
+}
+
 int main(void) {
     test_both();
     test_name_only();
@@ -284,6 +384,9 @@ int main(void) {
     test_string_fallback();
     test_string_tree();
     test_adt();
+    test_header_snapshot();
+    test_header_race();
+    test_scan_thread_lifetime();
     if (failures) fprintf(stderr, "test_dt_fixup: %d failure%s\n", failures, failures == 1 ? "" : "s");
     else printf("test_dt_fixup: all pass\n");
     return failures ? 1 : 0;

@@ -329,6 +329,10 @@ void hv_vm_destroy(void) {
     hv_net_detach();
     net_on = 0;
     hv_audio_detach();
+    /* The identity scan reads guest RAM from its own thread: it must be gone
+       before the RAM is, even when the guest never drew a frame to stop it. */
+    hv_dt_fixup_join();
+    dt_fixup_on = 0;
     hv_vmapple_destroy(&board);
     hv_disk_close(&disk);
     hv_disk_close(&aux);
